@@ -1,0 +1,73 @@
+NMS: 1
+SEED: 10            # random seed
+
+DEBUG: 1            # turns on debugging mode
+
+
+
+
+
+LR: 0.0001                    # learning rate
+D2G_LR: 0.1                   # discriminator/generator learning rate ratio
+BETA1: 0.0                    # adam optimizer beta1
+BETA2: 0.9                    # adam optimizer beta2
+
+INPUT_SIZE: 512               # input image size for training 0 for original size
+MAX_ITERS: 4e4            # maximum number of iterations to train the model
+
+L1_LOSS_WEIGHT: 1             # l1 loss weight
+FM_LOSS_WEIGHT: 10            # feature-matching loss weight
+STYLE_LOSS_WEIGHT: 250        # style loss weight
+CONTENT_LOSS_WEIGHT: 0.1      # perceptual loss weight
+INPAINT_ADV_LOSS_WEIGHT: 0.1  # adversarial loss weight
+
+GAN_LOSS: nsgan               # nsgan | lsgan | hinge
+GAN_POOL_SIZE: 0              # fake images pool size
+
+
+SAMPLE_INTERVAL: 10         # how many iterations to wait before sampling (0: never)
+SAMPLE_SIZE: 5               # number of images to sample
+LOG_INTERVAL: 100000              # how many iterations to wait before logging training status (0: never)
+
+
+MASK_REVERSE: 0                 # 1 reverse dunhuang, 0 no
+MASK_THRESHOLD: 0               # 100 dunhuang
+
+
+
+GPU: [0]            # list of gpu ids
+
+
+SAVE_INTERVAL: 20000          # how many iterations to wait before saving model (0: never)
+EVAL_INTERVAL: 20000          # how many iterations to wait before model evaluation (0: never)
+
+TRAIN_SAMPLE_INTERVAL: 1000    #  iterations period of saving training sample
+EVAL_SAMPLE_INTERVAL: 2000     #  iterations period of saving validation sample
+
+
+modelpath: ./checkpoints/para/                    # model para save path
+
+TRAIN_SAMPLE_SAVE: ./result/train_sample/         # training sample save path
+
+EVAL_SAMPLE_SAVE: ./result/eval_sample/           # validation sample save path
+
+Data_path: './data'                               # path of the training data and the validation data,
+
+
+# parameter of the data
+batch_size : 4
+# batch_szie of dataloader
+line_num: 10
+# number of stripes
+line_wide: 10
+# width of adding stripes
+wide_rand: True
+# if True the line_wide will vary in range [1,line_wide], if False, the line_wide will be fixed
+step_size: [256,256,16]
+# the step size when cropping  the input HSI to ensure the model can be fed HSIs with different bands
+kernel_size: [3,7,3,11]
+# the kernel size of the two spatial-spectral filtering kernel, the first two number is the kernel size of the first and the rest two are the size of the second
+
+in_chs: 32    # the input channels
+mode: ss
+#  if 's'        ('spatial kernel will be use') and if 'ss'  ('SSIF kernel will be use')
