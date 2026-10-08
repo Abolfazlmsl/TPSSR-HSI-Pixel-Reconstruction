@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Aggregate Final TPSSR test metrics and export representative visuals."""
+"""Aggregate Final TPSSR metrics for one or many held-out acquisitions.
+
+The same trained model is evaluated separately on every configured test core.
+A combined cross-core summary is then written under results/<experiment>/combined/.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,44 +12,38 @@ import csv
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 CORE = ROOT / "core"
-SUPPORTED = [*(f"SWIR{i}" for i in range(1, 6)), *(f"VNIR{i}" for i in range(1, 6))]
+
+from _launcher_common import env_for
+from experiment_config import (
+    add_experiment_args,
+    describe,
+    experiment_cli_args,
+    resolve_experiment,
+)
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate Final TPSSR test outputs.")
-    p.add_argument("--dataset", required=True, help="SWIR1..SWIR5 or VNIR1..VNIR5")
-    p.add_argument("--visuals", type=int, default=3, choices=[0, 1, 2, 3])
+    add_experiment_args(p)
+    p.add_argument(
+        "--visuals",
+        type=int,
+        default=3,
+        help="Total representative visuals across the configured test acquisitions.",
+    )
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--deep-batch", type=int, default=16)
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--crop-size", type=int, default=128)
+    p.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
-
-
-ARGS = parse_args()
-DATASET = ARGS.dataset.upper()
-if DATASET not in SUPPORTED:
-    raise SystemExit(f"Dataset must be one of: {', '.join(SUPPORTED)}")
-
-os.environ["TPSSR_PROJECT_DIR"] = str(ROOT)
-os.environ["HSI_TEST_DATASET"] = DATASET
-if str(CORE) not in sys.path:
-    sys.path.insert(0, str(CORE))
-
-import torch
-import config
-from src.evaluation_utils import load_dataset, split_blocks, list_mask_files, load_test_mask
-from src.final_pipeline import load_pipeline, predict_mask
-
-OUTDIR = Path(config.RESULTS_DIR) / "final_tpssr"
-METRICS = OUTDIR / "test_metrics.csv"
-VISDIR = OUTDIR / "visuals"
 
 
 def read_csv(path):
@@ -57,7 +55,13 @@ def write_csv(path, rows):
     rows = list(rows)
     if not rows:
         return
-    keys = list(rows[0].keys())
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    keys, seen = [], set()
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
     with Path(path).open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
@@ -76,26 +80,164 @@ def fmean(rows, key):
     return float(np.mean(values)) if values else float("nan")
 
 
+def distribute_visuals(total, n_tests):
+    total = max(0, int(total))
+    result = [0] * max(1, int(n_tests))
+    for i in range(total):
+        result[i % len(result)] += 1
+    return result
+
+
+def combined_summary(spec):
+    all_rows = []
+    dataset_rows = []
+    for test_name in spec.tests:
+        test_dir = ROOT / "results" / spec.experiment_name / test_name / "final_tpssr"
+        metrics = test_dir / "test_metrics.csv"
+        summary_path = test_dir / "summary.json"
+        if not metrics.exists():
+            raise FileNotFoundError(
+                f"Missing Final TPSSR metrics for {test_name}: {metrics}"
+            )
+        rows = read_csv(metrics)
+        ok = [r for r in rows if r.get("status") == "ok"]
+        for row in ok:
+            row = dict(row)
+            row.setdefault("dataset", test_name)
+            all_rows.append(row)
+        if summary_path.exists():
+            s = json.loads(summary_path.read_text(encoding="utf-8"))
+            dataset_rows.append({
+                "dataset": test_name,
+                "masks": int(s.get("n_ok", len(ok))),
+                "rmse": s.get("mean_rmse"),
+                "mae": s.get("mean_mae"),
+                "r2": s.get("mean_r2"),
+                "sam_deg": s.get("mean_sam_deg"),
+                "ssim": s.get("mean_ssim"),
+                "coverage": s.get("mean_coverage"),
+                "spectral_fraction": s.get("mean_final_spectral_fraction"),
+                "deep_fraction": s.get("mean_final_deep_fraction"),
+                "region_fraction": s.get("mean_final_region_fraction"),
+            })
+
+    outdir = ROOT / "results" / spec.experiment_name / "combined" / "final_tpssr"
+    outdir.mkdir(parents=True, exist_ok=True)
+    write_csv(outdir / "all_test_metrics.csv", all_rows)
+    write_csv(outdir / "dataset_summary.csv", dataset_rows)
+
+    summary = {
+        "experiment": spec.experiment_name,
+        "train_datasets": list(spec.train),
+        "test_datasets": list(spec.tests),
+        "n_test_datasets": len(spec.tests),
+        "n_ok_masks": len(all_rows),
+        "mean_rmse": fmean(all_rows, "rmse"),
+        "mean_mae": fmean(all_rows, "mae"),
+        "mean_r2": fmean(all_rows, "r2"),
+        "mean_sam_deg": fmean(all_rows, "sam_deg"),
+        "mean_ssim": fmean(all_rows, "ssim"),
+        "mean_coverage": fmean(all_rows, "coverage"),
+        "mean_final_spectral_fraction": fmean(all_rows, "final_spectral_fraction"),
+        "mean_final_deep_fraction": fmean(all_rows, "final_deep_fraction"),
+        "mean_final_region_fraction": fmean(all_rows, "final_region_fraction"),
+    }
+    (outdir / "combined_summary.json").write_text(
+        json.dumps(summary, indent=2, allow_nan=True), encoding="utf-8"
+    )
+    lines = [
+        "FINAL TPSSR COMBINED HELD-OUT EVALUATION",
+        "=" * 76,
+        f"Experiment: {spec.experiment_name}",
+        f"Train: {', '.join(spec.train)}",
+        f"Test: {', '.join(spec.tests)}",
+        f"Successful masks across all test acquisitions: {len(all_rows)}",
+        f"RMSE={summary['mean_rmse']:.6f}",
+        f"MAE={summary['mean_mae']:.6f}",
+        f"R2={summary['mean_r2']:.6f}",
+        f"SAM={summary['mean_sam_deg']:.4f} deg",
+        f"SSIM={summary['mean_ssim']:.4f}",
+        f"Coverage={summary['mean_coverage']:.4f}",
+    ]
+    (outdir / "COMBINED_SUMMARY.txt").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+    print("\n" + "\n".join(lines))
+    print("Saved combined results:", outdir)
+
+
+def run_all_tests(args, spec):
+    print(describe(spec))
+    allocations = distribute_visuals(args.visuals, len(spec.tests))
+    for i, (test_name, n_visuals) in enumerate(zip(spec.tests, allocations), start=1):
+        print(
+            f"\n{'='*90}\nEVALUATE TEST DATASET {i}/{len(spec.tests)}: {test_name}\n{'='*90}"
+        )
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *experiment_cli_args(spec, active_test=test_name),
+            "--visuals",
+            str(n_visuals),
+            "--gpu",
+            str(args.gpu),
+            "--deep-batch",
+            str(args.deep_batch),
+            "--region-batch",
+            str(args.region_batch),
+            "--crop-size",
+            str(args.crop_size),
+            "--single",
+        ]
+        print("RUN:", " ".join(map(str, cmd)), flush=True)
+        subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            env=env_for(spec, test_name),
+            check=True,
+        )
+    combined_summary(spec)
+
+
+ARGS = parse_args()
+SPEC = resolve_experiment(ARGS)
+if not ARGS.single:
+    run_all_tests(ARGS, SPEC)
+    raise SystemExit(0)
+
+DATASET = SPEC.active_test
+os.environ.update(env_for(SPEC, DATASET))
+if str(CORE) not in sys.path:
+    sys.path.insert(0, str(CORE))
+
+import torch
+import config
+from src.evaluation_utils import load_dataset, split_blocks, list_mask_files, load_test_mask
+from src.final_pipeline import load_pipeline, predict_mask
+
+OUTDIR = Path(config.RESULTS_DIR) / "final_tpssr"
+METRICS = OUTDIR / "test_metrics.csv"
+VISDIR = OUTDIR / "visuals"
+
+
 def aggregate(rows, key_name):
     out = []
     keys = sorted({str(r[key_name]) for r in rows})
     for key in keys:
         rr = [r for r in rows if str(r[key_name]) == key]
-        out.append(
-            {
-                key_name: key,
-                "masks": len(rr),
-                "rmse": fmean(rr, "rmse"),
-                "mae": fmean(rr, "mae"),
-                "r2": fmean(rr, "r2"),
-                "sam_deg": fmean(rr, "sam_deg"),
-                "ssim": fmean(rr, "ssim"),
-                "coverage": fmean(rr, "coverage"),
-                "spectral_fraction": fmean(rr, "final_spectral_fraction"),
-                "deep_fraction": fmean(rr, "final_deep_fraction"),
-                "region_fraction": fmean(rr, "final_region_fraction"),
-            }
-        )
+        out.append({
+            key_name: key,
+            "masks": len(rr),
+            "rmse": fmean(rr, "rmse"),
+            "mae": fmean(rr, "mae"),
+            "r2": fmean(rr, "r2"),
+            "sam_deg": fmean(rr, "sam_deg"),
+            "ssim": fmean(rr, "ssim"),
+            "coverage": fmean(rr, "coverage"),
+            "spectral_fraction": fmean(rr, "final_spectral_fraction"),
+            "deep_fraction": fmean(rr, "final_deep_fraction"),
+            "region_fraction": fmean(rr, "final_region_fraction"),
+        })
     return out
 
 
@@ -150,23 +292,25 @@ def export_visuals(n_visuals):
         region_batch=ARGS.region_batch,
         verify_region_batch=True,
     )
-    cube, _, split, wavelengths = load_dataset()
+    cube, _, split, wavelengths = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
     wavelengths = np.asarray(wavelengths)
     mask_files = list_mask_files()
     VISDIR.mkdir(parents=True, exist_ok=True)
 
-    requested = [
+    candidate_cases = [
         ("whole_spectrum_pixels", 5, 1),
         ("spatio_spectral_block", 5, 1),
         ("mixed_saturation", 5, 1),
-    ][:n_visuals]
+        ("consecutive_spectral_bands", 5, 1),
+        ("spatial_patch", 5, 1),
+    ]
+    requested = candidate_cases[: int(n_visuals)]
 
     saved = []
     for number, (scenario, severity, repeat) in enumerate(requested, start=1):
         path = find_case(mask_files, scenario, severity, repeat)
         if path is None:
-            print("Visual case not found, skipping:", scenario, severity, repeat)
             continue
         mask, meta = load_test_mask(path)
         mask = np.asarray(mask, dtype=bool)
@@ -175,27 +319,24 @@ def export_visuals(n_visuals):
         local = mask[y0:y1, x0:x1, band]
         yx = np.argwhere(local)
         if len(yx) == 0:
-            print("Visual case has no masked pixels in representative band, skipping:", path.name)
             continue
-        coords = np.column_stack(
-            [
-                yx[:, 0] + y0,
-                yx[:, 1] + x0,
-                np.full(len(yx), band, dtype=np.int64),
-            ]
-        ).astype(np.int64)
+        coords = np.column_stack([
+            yx[:, 0] + y0,
+            yx[:, 1] + x0,
+            np.full(len(yx), band, dtype=np.int64),
+        ]).astype(np.int64)
 
         print(
-            f"Visual {number}/{n_visuals}: {scenario} S{severity} R{repeat} | "
-            f"band {band} | {len(coords)} masked pixels"
+            f"[{DATASET}] Visual {number}/{n_visuals}: {scenario} "
+            f"S{severity} R{repeat} | band {band} | {len(coords)} masked pixels"
         )
         out = predict_mask(
             pipeline,
             test_cube,
             mask,
             coords,
-            preview_progress=f"Visual {number}/{n_visuals} previews",
-            region_progress=f"Visual {number}/{n_visuals} Region",
+            preview_progress=f"{DATASET} Visual {number}/{n_visuals} previews",
+            region_progress=f"{DATASET} Visual {number}/{n_visuals} Region",
         )
         original = np.asarray(test_cube[y0:y1, x0:x1, band], dtype=np.float32).copy()
         corrupted = original.copy()
@@ -226,33 +367,32 @@ def export_visuals(n_visuals):
         wl = float(wavelengths[band]) if band < len(wavelengths) else float("nan")
         route = out["final_route"]
         fig.suptitle(
-            f"{scenario} | Severity {severity} | Repeat {repeat} | "
+            f"{DATASET} | {scenario} | Severity {severity} | Repeat {repeat} | "
             f"band {band} ({wl:.1f} nm) | "
             f"routes S/D/R={np.mean(route==0):.2f}/{np.mean(route==1):.2f}/{np.mean(route==2):.2f}"
         )
         fig.tight_layout()
-        outpath = VISDIR / f"{number:02d}_{scenario}_S{severity}_R{repeat}_band{band}.png"
+        outpath = VISDIR / (
+            f"{number:02d}_{DATASET}_{scenario}_S{severity}_R{repeat}_band{band}.png"
+        )
         fig.savefig(outpath, dpi=180, bbox_inches="tight")
         plt.close(fig)
         saved.append(str(outpath))
     return saved
 
 
-def main():
+def main_single():
     if not METRICS.exists():
         raise SystemExit(
-            f"Test metrics not found: {METRICS}\n"
-            f"Run: python test.py --dataset {DATASET} --gpus 2 --max-masks 200"
+            f"Test metrics not found: {METRICS}\nRun test.py for {DATASET} first."
         )
     rows = read_csv(METRICS)
     ok = [r for r in rows if r.get("status") == "ok"]
     if not ok:
         raise RuntimeError("No successful test rows were found.")
 
-    scenario_rows = aggregate(ok, "scenario")
-    severity_rows = aggregate(ok, "severity")
-    write_csv(OUTDIR / "scenario_summary.csv", scenario_rows)
-    write_csv(OUTDIR / "severity_summary.csv", severity_rows)
+    write_csv(OUTDIR / "scenario_summary.csv", aggregate(ok, "scenario"))
+    write_csv(OUTDIR / "severity_summary.csv", aggregate(ok, "severity"))
 
     worker0 = {}
     p0 = OUTDIR / "worker.rank0.json"
@@ -260,7 +400,13 @@ def main():
         worker0 = json.loads(p0.read_text(encoding="utf-8"))
 
     summary = {
-        "architecture": "Stage1(Spectral vs Deep-v3.1) -> hard-case gate -> Frozen V27 Stage-A -> V13 TopologyFirst V1",
+        "architecture": (
+            "Stage1(Spectral vs Deep-v3.1) -> hard-case gate -> "
+            "Frozen V27 Stage-A -> V13 TopologyFirst V1"
+        ),
+        "experiment": config.EXPERIMENT_NAME,
+        "train_datasets": list(config.TRAIN_DATASET_FOLDERS),
+        "test_datasets": list(config.TEST_DATASET_FOLDERS),
         "dataset": DATASET,
         "n_requested": len(rows),
         "n_ok": len(ok),
@@ -288,6 +434,7 @@ def main():
         "FINAL TPSSR EVALUATION",
         "=" * 72,
         summary["architecture"],
+        f"Experiment: {config.EXPERIMENT_NAME}",
         f"Dataset: {DATASET}",
         f"Masks: {summary['n_ok']}/{summary['n_requested']} successful",
         f"RMSE={summary['mean_rmse']:.6f}",
@@ -303,19 +450,11 @@ def main():
         f"  Final Region={summary['mean_final_region_fraction']:.4f}",
         "",
         f"Gate threshold: {summary.get('gate_threshold', float('nan'))}",
-        f"Visuals exported: {len(visual_paths)}",
+        f"Visuals exported for this dataset: {len(visual_paths)}",
     ]
     (OUTDIR / "SUMMARY.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
     print("\n" + "\n".join(lines))
-    print("Saved:", OUTDIR / "summary.json")
-    print("Saved:", OUTDIR / "scenario_summary.csv")
-    print("Saved:", OUTDIR / "severity_summary.csv")
-    if visual_paths:
-        print("Visuals:")
-        for path in visual_paths:
-            print(" ", path)
 
 
 if __name__ == "__main__":
-    main()
+    main_single()

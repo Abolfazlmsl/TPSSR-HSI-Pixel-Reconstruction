@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
-"""Prepare one LOIO fold and its fixed 200-mask benchmark."""
-import argparse
-from _launcher_common import CORE, run
+"""Calibrate acquisitions and create fixed 200-mask benchmarks for all held-out tests."""
+from __future__ import annotations
 
-p = argparse.ArgumentParser(description="Prepare one complete TPSSR benchmark fold.")
-p.add_argument("--dataset", required=True, help="SWIR1..SWIR5 or VNIR1..VNIR5")
+import argparse
+
+from _launcher_common import CORE, run
+from experiment_config import add_experiment_args, describe, resolve_experiment
+
+p = argparse.ArgumentParser(
+    description="Prepare TPSSR data for an arbitrary 10-acquisition train/test split."
+)
+add_experiment_args(p)
 a = p.parse_args()
-run(CORE / "data_preparation" / "prepare_dataset.py", a.dataset)
+spec = resolve_experiment(a)
+
+print(describe(spec))
+for i, test_name in enumerate(spec.tests, start=1):
+    print(f"\n{'='*84}\nPREPARE TEST DATASET {i}/{len(spec.tests)}: {test_name}\n{'='*84}")
+    run(
+        CORE / "data_preparation" / "prepare_dataset.py",
+        spec,
+        active_test=test_name,
+    )
+
+print("\nPreparation complete for all configured held-out acquisitions.")

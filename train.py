@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""Train the FINAL TPSSR architecture for one LOIO fold.
+"""Train the FINAL TPSSR architecture once for an arbitrary train/test experiment.
 
-Order:
-  1) Deep-v3 teacher
-  2) Deep-v3.1 expert
-  3) V27 learned-correspondence model (Stage-A structure is used by Final TPSSR)
-  4) V13 TopologyFirst V1 region filler
-  5) Final hierarchical router:
-       Stage 1 = Spectral vs Deep-v3.1
-       Stage 2 = hard-case gate -> V27 Stage-A -> V13 TopologyFirst V1
-
-The held-out acquisition is never used for training.
+Training is performed ONLY on the configured training acquisitions. All configured
+held-out acquisitions share this one trained TPSSR model.
 """
 from __future__ import annotations
 
@@ -21,12 +13,13 @@ import subprocess
 import sys
 
 from _launcher_common import ROOT, CORE, env_for
+from experiment_config import add_experiment_args, describe, resolve_experiment
 
 METHOD = CORE / "reconstruction_methods" / "texture_restoration_router_rf_v2"
 
 
-def run_cmd(cmd, dataset, extra_env=None):
-    env = env_for(dataset)
+def run_cmd(cmd, spec, extra_env=None):
+    env = env_for(spec, spec.primary_test)
     env.setdefault("OMP_NUM_THREADS", "1")
     env.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     if extra_env:
@@ -35,18 +28,17 @@ def run_cmd(cmd, dataset, extra_env=None):
     subprocess.run([str(x) for x in cmd], cwd=str(CORE), env=env, check=True)
 
 
-def fold_model_root(dataset):
-    ds = dataset.upper()
-    trainset = [f"{ds[:-1]}{i}" for i in range(1, 6) if f"{ds[:-1]}{i}" != ds]
-    exp = "global_" + "_".join(trainset) + "__test_" + ds
-    return ROOT / "trained_models" / exp / "texture_restoration_router_rf_v2"
-
-
 def main():
-    p = argparse.ArgumentParser(description="Train Final TPSSR from scratch or resume.")
-    p.add_argument("--dataset", required=True, help="SWIR1..SWIR5 or VNIR1..VNIR5")
-    p.add_argument("--gpus", type=int, default=2, choices=[2], help="Final training currently uses exactly two GPUs.")
-    p.add_argument("--force", action="store_true", help="Run every stage even if its best checkpoint already exists.")
+    p = argparse.ArgumentParser(
+        description="Train Final TPSSR once for a custom 10-acquisition experiment."
+    )
+    add_experiment_args(p)
+    p.add_argument("--gpus", type=int, default=2, choices=[2])
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Run every stage even if its best checkpoint already exists.",
+    )
     p.add_argument("--topology-epochs", type=int, default=22)
     p.add_argument("--topology-min-epochs", type=int, default=14)
     p.add_argument("--topology-patience", type=int, default=5)
@@ -54,10 +46,17 @@ def main():
     p.add_argument("--topology-val-samples", type=int, default=900)
     p.add_argument("--router-epochs", type=int, default=24)
     a = p.parse_args()
+    spec = resolve_experiment(a)
 
-    ds = a.dataset.upper()
-    tag = ds.lower()
-    base = fold_model_root(ds)
+    # Existing TPSSR training scripts use the first held-out acquisition as a
+    # stable internal checkpoint tag. It is never used for training data.
+    tag = spec.model_tag
+    base = (
+        ROOT
+        / "trained_models"
+        / spec.experiment_name
+        / "texture_restoration_router_rf_v2"
+    )
 
     stages = [
         (
@@ -75,7 +74,12 @@ def main():
         (
             "3/5 V27 Stage-A / correspondence model",
             base / f"region_v27_original_{tag}_dev_2gpu" / "best_model.pt",
-            [sys.executable, METHOD / "train_swir1_v27_learned_correspondence.py", "--gpus", "2"],
+            [
+                sys.executable,
+                METHOD / "train_swir1_v27_learned_correspondence.py",
+                "--gpus",
+                "2",
+            ],
             {},
         ),
         (
@@ -108,15 +112,20 @@ def main():
                 "2",
                 "--epochs",
                 str(a.router_epochs),
-            ] + (["--force-cache"] if a.force else []),
+            ]
+            + (["--force-cache"] if a.force else []),
             {},
         ),
     ]
 
     print("=" * 94)
     print("FINAL TPSSR TRAINING")
-    print("Held-out dataset:", ds)
-    print("Architecture: Spectral/Deep-v3.1 -> hard-case gate -> V27 Stage-A -> V13 TopologyFirst")
+    print(describe(spec))
+    print(
+        "Architecture: Spectral/Deep-v3.1 -> hard-case gate -> "
+        "V27 Stage-A -> V13 TopologyFirst"
+    )
+    print("IMPORTANT: none of the configured test acquisitions are used for training.")
     print("=" * 94)
 
     for label, checkpoint, cmd, stage_env in stages:
@@ -124,14 +133,17 @@ def main():
         if checkpoint.exists() and not a.force:
             print("SKIP: checkpoint already exists ->", checkpoint)
             continue
-        run_cmd(cmd, ds, stage_env)
+        run_cmd(cmd, spec, stage_env)
         if not checkpoint.exists():
-            raise RuntimeError(f"Stage completed but checkpoint was not found: {checkpoint}")
+            raise RuntimeError(
+                f"Stage completed but checkpoint was not found: {checkpoint}"
+            )
         print("OK ->", checkpoint)
 
     print("\nFINAL TPSSR training complete.")
     print("Router checkpoint:", stages[-1][1])
-    print(f"Next: python test.py --dataset {ds} --gpus 2 --max-masks 200")
+    print("Test acquisitions:", ", ".join(spec.tests))
+    print("Next: python test.py --preset/--test-datasets ... --gpus 2 --max-masks 200")
 
 
 if __name__ == "__main__":

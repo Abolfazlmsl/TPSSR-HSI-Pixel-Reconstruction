@@ -15,74 +15,64 @@ def processed_dataset_dir(dataset_name):
     )
 
 
-def load_dataset(dataset_name=None):
-    if dataset_name is None:
-        dataset_name = config.TEST_DATASET_FOLDER
+def _dynamic_split(dataset_name, total_y):
+    """Return the experiment-specific split without storing role in processed_data.
 
-    dataset_dir = processed_dataset_dir(
-        dataset_name
-    )
+    This is important because the same acquisition can be training data in one
+    experiment and held-out test data in another (e.g. region A->B vs B->A).
+    """
+    dataset_name = str(dataset_name).upper()
+    total_y = int(total_y)
 
-    cube_path = (
-        dataset_dir
-        / "calibrated_reflectance.npy"
-    )
-    invalid_path = (
-        dataset_dir
-        / "invalid_mask.npy"
-    )
-    split_path = (
-        dataset_dir
-        / "split_info.npz"
-    )
-    wavelength_path = (
-        dataset_dir
-        / "wavelengths_nm.npy"
-    )
-
-    required = [
-        cube_path,
-        invalid_path,
-        split_path,
-        wavelength_path,
-    ]
-    missing = [
-        path
-        for path in required
-        if not path.exists()
-    ]
-
-    if missing:
-        raise FileNotFoundError(
-            "A calibrated dataset is missing. "
-            "Run data_preparation/prepare_dataset.py first.\n"
-            + "\n".join(
-                str(path)
-                for path in missing
-            )
+    if dataset_name in config.TRAIN_DATASET_FOLDERS:
+        train_end = int(round(total_y * config.TRAIN_IMAGE_TRAIN_FRACTION))
+        train_end = min(max(train_end, 1), max(total_y - 1, 1))
+        val_end = total_y
+        role = "train_validation"
+    elif dataset_name in config.TEST_DATASET_FOLDERS:
+        test_size = max(1, int(round(total_y * config.HELD_OUT_TEST_FRACTION)))
+        test_start = max(0, total_y - test_size)
+        train_end = 0
+        val_end = test_start
+        role = "held_out_test"
+    else:
+        raise ValueError(
+            f"Dataset {dataset_name} is not part of the current experiment. "
+            f"Train={config.TRAIN_DATASET_FOLDERS}; Test={config.TEST_DATASET_FOLDERS}"
         )
 
-    cube = np.load(
-        cube_path,
-        mmap_mode="r",
-    )
-    invalid = np.load(
-        invalid_path,
-        mmap_mode="r",
-    )
-    split = np.load(
-        split_path,
-    )
-    wavelengths = np.load(
-        wavelength_path,
-    )
+    return {
+        "train_end": np.asarray(train_end, dtype=np.int64),
+        "val_end": np.asarray(val_end, dtype=np.int64),
+        "role": np.asarray(role),
+        "dataset_name": np.asarray(dataset_name),
+    }
 
-    return (
-        cube,
-        invalid,
-        split,
-        wavelengths,
-    )
+
+def load_dataset(dataset_name=None):
+    if dataset_name is None:
+        dataset_name = config.ACTIVE_TEST_DATASET
+    dataset_name = str(dataset_name).upper()
+
+    dataset_dir = processed_dataset_dir(dataset_name)
+    cube_path = dataset_dir / "calibrated_reflectance.npy"
+    invalid_path = dataset_dir / "invalid_mask.npy"
+    wavelength_path = dataset_dir / "wavelengths_nm.npy"
+
+    required = [cube_path, invalid_path, wavelength_path]
+    missing = [path for path in required if not path.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "A calibrated dataset is missing. Run prepare_dataset.py first.\n"
+            + "\n".join(str(path) for path in missing)
+        )
+
+    cube = np.load(cube_path, mmap_mode="r")
+    invalid = np.load(invalid_path, mmap_mode="r")
+    wavelengths = np.load(wavelength_path)
+    split = _dynamic_split(dataset_name, cube.shape[0])
+
+    return cube, invalid, split, wavelengths
 
 
 def validate_wavelength_grid(

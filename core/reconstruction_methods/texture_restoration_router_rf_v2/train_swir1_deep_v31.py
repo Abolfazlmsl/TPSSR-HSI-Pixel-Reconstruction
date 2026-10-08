@@ -3292,9 +3292,9 @@ def launcher_main():
         if str(x).upper() != str(config.TEST_DATASET_FOLDER).upper()
     }
     actual_train = {str(x).upper() for x in config.TRAIN_DATASET_FOLDERS}
-    if len(expected_train) != 4 or actual_train != expected_train:
+    if not expected_train or actual_train != expected_train:
         raise RuntimeError(
-            f"Invalid LOIO fold: held-out={config.TEST_DATASET_FOLDER}, "
+            f"Invalid configured train/test split: held-out={config.TEST_DATASET_FOLDER}, "
             f"train={config.TRAIN_DATASET_FOLDERS}"
         )
 

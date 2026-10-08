@@ -227,7 +227,7 @@ def dataset_role(
 ):
     if (
         dataset_name
-        == config.TEST_DATASET_FOLDER
+        in config.TEST_DATASET_FOLDERS
     ):
         return "held_out_test"
 
@@ -476,7 +476,7 @@ def validate_all_datasets(
 def prepare_calibrated_datasets():
     missing_folders = [
         name
-        for name in config.ALL_SWIR_DATASETS
+        for name in config.PREPARE_DATASETS
         if not (
             config.INPUT_ROOT
             / name
@@ -490,7 +490,7 @@ def prepare_calibrated_datasets():
 
     if missing_folders:
         raise FileNotFoundError(
-            "The following SWIR dataset folders are missing from input_raw:\n"
+            "The following dataset folders are missing from input_raw:\n"
             + "\n".join(
                 missing_folders
             )
@@ -498,7 +498,7 @@ def prepare_calibrated_datasets():
 
     rows = []
 
-    for dataset_name in config.ALL_SWIR_DATASETS:
+    for dataset_name in config.PREPARE_DATASETS:
         (
             shape,
             wavelengths,
@@ -613,7 +613,7 @@ def main():
         split,
         wavelengths,
     ) = load_dataset(
-        config.TEST_DATASET_FOLDER
+        config.ACTIVE_TEST_DATASET
     )
 
     _, _, test = split_blocks(
@@ -638,11 +638,11 @@ def main():
         ),
     )
     print(
-        "Held-out test dataset:",
-        config.TEST_DATASET_FOLDER,
+        "Active held-out test dataset:",
+        config.ACTIVE_TEST_DATASET,
     )
     print(
-        "Held-out benchmark cube:",
+        "Active held-out benchmark cube:",
         test.shape,
     )
     print("")
@@ -933,8 +933,12 @@ def main():
             )
         ),
         (
-            "Held-out test dataset: "
-            + config.TEST_DATASET_FOLDER
+            "Active held-out test dataset: "
+            + config.ACTIVE_TEST_DATASET
+        ),
+        (
+            "All configured held-out datasets: "
+            + ", ".join(config.TEST_DATASET_FOLDERS)
         ),
         (
             "Training split per training acquisition: "

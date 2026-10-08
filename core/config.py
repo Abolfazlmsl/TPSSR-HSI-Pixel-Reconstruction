@@ -10,41 +10,111 @@ PROJECT_DIR = Path(
 ).resolve()
 
 SUPPORTED_DATASETS = [
-    *(f"SWIR{i}" for i in range(1, 6)),
-    *(f"VNIR{i}" for i in range(1, 6)),
+    *(f"SWIR{i}" for i in range(1, 11)),
+    *(f"VNIR{i}" for i in range(1, 11)),
 ]
 
-TEST_DATASET_FOLDER = os.environ.get("HSI_TEST_DATASET", "SWIR1").upper()
-if TEST_DATASET_FOLDER not in SUPPORTED_DATASETS:
-    raise ValueError(
-        f"Unsupported held-out dataset {TEST_DATASET_FOLDER!r}. "
-        f"Choose one of: {', '.join(SUPPORTED_DATASETS)}"
-    )
+
+def _parse_dataset_env(name, default=None):
+    raw = os.environ.get(name)
+    if raw is None:
+        return list(default or [])
+    values = []
+    for part in raw.replace(",", " ").split():
+        item = part.strip().upper()
+        if item and item not in values:
+            values.append(item)
+    return values
+
+
+# -----------------------------------------------------------------------------
+# Experiment split
+# -----------------------------------------------------------------------------
+# HSI_TEST_DATASET is deliberately the PRIMARY held-out acquisition and stays
+# fixed for one trained model. The original TPSSR training code uses this value
+# in checkpoint folder names. HSI_ACTIVE_TEST_DATASET can change when the same
+# trained model is evaluated on several held-out acquisitions.
+TEST_DATASET_FOLDERS = _parse_dataset_env("HSI_TEST_DATASETS")
+if not TEST_DATASET_FOLDERS:
+    TEST_DATASET_FOLDERS = [os.environ.get("HSI_TEST_DATASET", "SWIR1").upper()]
+
+TEST_DATASET_FOLDER = os.environ.get(
+    "HSI_TEST_DATASET", TEST_DATASET_FOLDERS[0]
+).upper()
+if TEST_DATASET_FOLDER not in TEST_DATASET_FOLDERS:
+    TEST_DATASET_FOLDERS = [TEST_DATASET_FOLDER, *TEST_DATASET_FOLDERS]
+
+ACTIVE_TEST_DATASET = os.environ.get(
+    "HSI_ACTIVE_TEST_DATASET", TEST_DATASET_FOLDERS[0]
+).upper()
+
+for _name in [*TEST_DATASET_FOLDERS, ACTIVE_TEST_DATASET]:
+    if _name not in SUPPORTED_DATASETS:
+        raise ValueError(
+            f"Unsupported dataset {_name!r}. Choose SWIR1..SWIR10 or VNIR1..VNIR10."
+        )
 
 SENSOR = "SWIR" if TEST_DATASET_FOLDER.startswith("SWIR") else "VNIR"
-ALL_SENSOR_DATASETS = [f"{SENSOR}{i}" for i in range(1, 6)]
-# Backward-compatible name used by the original preparation code.
-ALL_SWIR_DATASETS = ALL_SENSOR_DATASETS
+if any(("SWIR" if x.startswith("SWIR") else "VNIR") != SENSOR for x in TEST_DATASET_FOLDERS):
+    raise ValueError("One experiment cannot mix SWIR and VNIR test acquisitions.")
 
-TRAIN_DATASET_FOLDERS = [
-    name for name in ALL_SENSOR_DATASETS if name != TEST_DATASET_FOLDER
-]
+TRAIN_DATASET_FOLDERS = _parse_dataset_env("HSI_TRAIN_DATASETS")
+if not TRAIN_DATASET_FOLDERS:
+    # Backward-compatible original 5-acquisition LOIO default.
+    default_universe = [f"{SENSOR}{i}" for i in range(1, 6)]
+    if TEST_DATASET_FOLDER not in default_universe:
+        default_universe = [f"{SENSOR}{i}" for i in range(1, 11)]
+    TRAIN_DATASET_FOLDERS = [
+        x for x in default_universe if x != TEST_DATASET_FOLDER
+    ]
 
-EXPERIMENT_NAME = (
-    "global_" + "_".join(TRAIN_DATASET_FOLDERS) + "__test_" + TEST_DATASET_FOLDER
+for _name in TRAIN_DATASET_FOLDERS:
+    if _name not in SUPPORTED_DATASETS:
+        raise ValueError(f"Unsupported training dataset {_name!r}.")
+    if ("SWIR" if _name.startswith("SWIR") else "VNIR") != SENSOR:
+        raise ValueError("One experiment cannot mix SWIR and VNIR training acquisitions.")
+
+_overlap = set(TRAIN_DATASET_FOLDERS) & set(TEST_DATASET_FOLDERS)
+if _overlap:
+    raise ValueError(
+        "Training and test datasets overlap: " + ", ".join(sorted(_overlap))
+    )
+if ACTIVE_TEST_DATASET not in TEST_DATASET_FOLDERS:
+    raise ValueError(
+        f"ACTIVE_TEST_DATASET={ACTIVE_TEST_DATASET} is not in TEST_DATASET_FOLDERS."
+    )
+
+# The legacy deep/V27 training scripts validate that ALL_SENSOR_DATASETS minus
+# TEST_DATASET_FOLDER equals the training set. Keep this compatibility universe
+# intentionally limited to training acquisitions + the primary held-out tag.
+ALL_SENSOR_DATASETS = list(TRAIN_DATASET_FOLDERS) + [TEST_DATASET_FOLDER]
+ALL_SWIR_DATASETS = ALL_SENSOR_DATASETS  # backward-compatible historical name
+
+# Data preparation only needs all training acquisitions and the currently active
+# held-out acquisition. Re-running prepare_dataset.py for the next held-out core
+# reuses calibrated training files and creates a separate benchmark mask folder.
+PREPARE_DATASETS = list(TRAIN_DATASET_FOLDERS) + [ACTIVE_TEST_DATASET]
+
+EXPERIMENT_NAME = os.environ.get(
+    "HSI_EXPERIMENT_NAME",
+    "global_" + "_".join(TRAIN_DATASET_FOLDERS) + "__test_" + "_".join(TEST_DATASET_FOLDERS),
 )
 
 INPUT_ROOT = PROJECT_DIR / "input_raw"
 PROCESSED_DATA_ROOT = PROJECT_DIR / "processed_data"
-DATASET_FOLDER = TEST_DATASET_FOLDER
-INPUT_DIR = INPUT_ROOT / TEST_DATASET_FOLDER
-PROCESSED_DATA_DIR = PROCESSED_DATA_ROOT / TEST_DATASET_FOLDER
+DATASET_FOLDER = ACTIVE_TEST_DATASET
+INPUT_DIR = INPUT_ROOT / ACTIVE_TEST_DATASET
+PROCESSED_DATA_DIR = PROCESSED_DATA_ROOT / ACTIVE_TEST_DATASET
 BASE_DATASET_DIR = PROCESSED_DATA_DIR
 
-SATURATION_DATA_DIR = PROJECT_DIR / "simulated_saturation" / EXPERIMENT_NAME
-BENCHMARK_DIR = SATURATION_DATA_DIR
+# One model family is shared by all held-out acquisitions in the experiment.
 MODELS_DIR = PROJECT_DIR / "trained_models" / EXPERIMENT_NAME
-RESULTS_DIR = PROJECT_DIR / "results" / EXPERIMENT_NAME
+# Masks/results are separate for each held-out acquisition.
+SATURATION_DATA_DIR = (
+    PROJECT_DIR / "simulated_saturation" / EXPERIMENT_NAME / ACTIVE_TEST_DATASET
+)
+BENCHMARK_DIR = SATURATION_DATA_DIR
+RESULTS_DIR = PROJECT_DIR / "results" / EXPERIMENT_NAME / ACTIVE_TEST_DATASET
 
 # Each training acquisition is split spatially along y.
 TRAIN_IMAGE_TRAIN_FRACTION = 0.80

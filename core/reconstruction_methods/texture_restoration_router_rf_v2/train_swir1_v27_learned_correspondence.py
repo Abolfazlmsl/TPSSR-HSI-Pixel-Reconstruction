@@ -4851,9 +4851,9 @@ def worker_main():
             if str(x).upper() != str(config.TEST_DATASET_FOLDER).upper()
         }
         current_train = {str(item).upper() for item in config.TRAIN_DATASET_FOLDERS}
-        if len(expected_train) != 4 or current_train != expected_train:
+        if not expected_train or current_train != expected_train:
             raise RuntimeError(
-                f"Invalid LOIO fold for V27: held-out={config.TEST_DATASET_FOLDER}, "
+                f"Invalid configured train/test split for V27: held-out={config.TEST_DATASET_FOLDER}, "
                 f"train={config.TRAIN_DATASET_FOLDERS}"
             )
 

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Run the FINAL TPSSR end-to-end benchmark.
+"""Run FINAL TPSSR on every configured held-out acquisition.
 
-The progress output explicitly reports the GLOBAL benchmark mask number, e.g.
-  [GPU 0] Mask 37/200 (18.5%) | spatio_spectral_block S4 R1
-so a two-GPU run is easy to follow.
+Progress explicitly reports the active acquisition and GLOBAL mask number, e.g.
+  [SWIR5][GPU 0] Mask 37/200 (18.5%) | spatio_spectral_block S4 R1
 """
 from __future__ import annotations
 
@@ -21,13 +20,21 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 CORE = ROOT / "core"
-SUPPORTED = [*(f"SWIR{i}" for i in range(1, 6)), *(f"VNIR{i}" for i in range(1, 6))]
+
+from _launcher_common import env_for
+from experiment_config import (
+    add_experiment_args,
+    describe,
+    experiment_cli_args,
+    resolve_experiment,
+)
+
 EVAL_PROTOCOL = "historical_sampled_spatial_v2_hierarchical_end_to_end"
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Test FINAL TPSSR end-to-end")
-    p.add_argument("--dataset", required=True, help="SWIR1..SWIR5 or VNIR1..VNIR5")
+    add_experiment_args(p)
     p.add_argument("--gpus", type=int, default=2, choices=[1, 2])
     p.add_argument("--max-masks", type=int, default=200, help="0 = all benchmark masks")
     p.add_argument("--deep-batch", type=int, default=16)
@@ -38,47 +45,62 @@ def parse_args():
     return p.parse_args()
 
 
-def launch_if_needed(args):
-    if args.worker or args.gpus == 1 or "RANK" in os.environ:
-        return False
-    cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        f"--nproc_per_node={args.gpus}",
-        str(Path(__file__).resolve()),
-        "--dataset",
-        args.dataset,
-        "--gpus",
-        "1",
-        "--max-masks",
-        str(args.max_masks),
-        "--deep-batch",
-        str(args.deep_batch),
-        "--region-batch",
-        str(args.region_batch),
-        "--worker",
-    ]
-    if args.no_verify_region_batch:
-        cmd.append("--no-verify-region-batch")
-    if args.force:
-        cmd.append("--force")
-    print("Launching Final TPSSR test on two GPUs:")
-    print(" ".join(cmd), flush=True)
-    subprocess.run(cmd, cwd=str(ROOT), check=True)
-    return True
+def launch_all_tests(args, spec):
+    print(describe(spec))
+    for i, test_name in enumerate(spec.tests, start=1):
+        print(
+            f"\n{'='*94}\nFINAL TPSSR TEST DATASET {i}/{len(spec.tests)}: {test_name}\n{'='*94}",
+            flush=True,
+        )
+        common = [
+            str(Path(__file__).resolve()),
+            *experiment_cli_args(spec, active_test=test_name),
+            "--gpus",
+            "1",
+            "--max-masks",
+            str(args.max_masks),
+            "--deep-batch",
+            str(args.deep_batch),
+            "--region-batch",
+            str(args.region_batch),
+            "--worker",
+        ]
+        if args.no_verify_region_batch:
+            common.append("--no-verify-region-batch")
+        if args.force:
+            common.append("--force")
+
+        if args.gpus == 2:
+            cmd = [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nproc_per_node=2",
+                *common,
+            ]
+        else:
+            cmd = [sys.executable, *common]
+        print("RUN:", " ".join(map(str, cmd)), flush=True)
+        subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            env=env_for(spec, test_name),
+            check=True,
+        )
+    print("\nFinal TPSSR testing complete for:", ", ".join(spec.tests))
 
 
 ARGS = parse_args()
-DATASET = str(ARGS.dataset).upper()
-if DATASET not in SUPPORTED:
-    raise SystemExit(f"Dataset must be one of: {', '.join(SUPPORTED)}")
-if launch_if_needed(ARGS):
+SPEC = resolve_experiment(ARGS)
+if not ARGS.worker:
+    launch_all_tests(ARGS, SPEC)
     raise SystemExit(0)
 
-os.environ["TPSSR_PROJECT_DIR"] = str(ROOT)
-os.environ["HSI_TEST_DATASET"] = DATASET
+DATASET = SPEC.active_test
+# Worker environment is already populated by the parent, but these assignments
+# keep direct worker use deterministic as well.
+os.environ.update(env_for(SPEC, DATASET))
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 
@@ -141,7 +163,7 @@ def evaluate_worker(mask_files):
         region_batch=ARGS.region_batch,
         verify_region_batch=not ARGS.no_verify_region_batch,
     )
-    cube, _, split, _ = load_dataset()
+    cube, _, split, _ = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
 
     assigned = [
@@ -154,7 +176,10 @@ def evaluate_worker(mask_files):
     completed = {}
     if shard.exists() and not ARGS.force:
         for row in read_csv(shard):
-            if row.get("status") == "ok" and float(row.get("coverage", 0.0)) >= 0.999999:
+            if (
+                row.get("status") == "ok"
+                and float(row.get("coverage", 0.0)) >= 0.999999
+            ):
                 completed[str(row["mask_file"])] = row
 
     rows = list(completed.values())
@@ -163,7 +188,7 @@ def evaluate_worker(mask_files):
         pending,
         total=len(assigned),
         initial=len(completed),
-        desc=f"GPU{RANK} masks",
+        desc=f"{DATASET} GPU{RANK} masks",
         unit="mask",
         dynamic_ncols=True,
         position=RANK,
@@ -177,8 +202,9 @@ def evaluate_worker(mask_files):
             mask, meta = load_test_mask(mask_path)
             pct = 100.0 * float(mask_index) / max(total_global, 1)
             print(
-                f"[GPU {RANK}] Mask {mask_index}/{total_global} ({pct:5.1f}%) | "
-                f"{meta['scenario']} S{meta['severity']} R{meta['repeat']}",
+                f"[{DATASET}][GPU {RANK}] Mask {mask_index}/{total_global} "
+                f"({pct:5.1f}%) | {meta['scenario']} "
+                f"S{meta['severity']} R{meta['repeat']}",
                 flush=True,
             )
             mask = np.asarray(mask, dtype=bool)
@@ -194,8 +220,12 @@ def evaluate_worker(mask_files):
                 test_cube,
                 mask,
                 coords,
-                preview_progress=f"GPU{RANK} Mask {mask_index}/{total_global} previews",
-                region_progress=f"GPU{RANK} Mask {mask_index}/{total_global} Region",
+                preview_progress=(
+                    f"{DATASET} GPU{RANK} Mask {mask_index}/{total_global} previews"
+                ),
+                region_progress=(
+                    f"{DATASET} GPU{RANK} Mask {mask_index}/{total_global} Region"
+                ),
             )
             pred = out["prediction"]
             band_predictions = sparse_band_predictions(coords, pred)
@@ -214,6 +244,7 @@ def evaluate_worker(mask_files):
             row = {
                 "_case_index": int(mask_index),
                 "dataset": DATASET,
+                "experiment": config.EXPERIMENT_NAME,
                 "eval_protocol": EVAL_PROTOCOL,
                 "mask_file": mask_path.name,
                 "scenario": str(meta["scenario"]),
@@ -242,6 +273,7 @@ def evaluate_worker(mask_files):
             row = {
                 "_case_index": int(mask_index),
                 "dataset": DATASET,
+                "experiment": config.EXPERIMENT_NAME,
                 "eval_protocol": EVAL_PROTOCOL,
                 "mask_file": mask_path.name,
                 "scenario": "",
@@ -271,6 +303,10 @@ def evaluate_worker(mask_files):
             bar.set_postfix(global_mask=f"{mask_index}/{total_global}", status="ERROR")
 
     worker_meta = {
+        "dataset": DATASET,
+        "experiment": config.EXPERIMENT_NAME,
+        "train_datasets": list(config.TRAIN_DATASET_FOLDERS),
+        "test_datasets": list(config.TEST_DATASET_FOLDERS),
         "rank": RANK,
         "device": str(DEVICE),
         "deep_checkpoint": str(pipeline.deep_path),
@@ -298,7 +334,9 @@ def merge(mask_files):
         if expected.issubset(seen):
             break
         if time.monotonic() > deadline:
-            raise TimeoutError(f"Timed out waiting for {len(expected-seen)} mask results.")
+            raise TimeoutError(
+                f"Timed out waiting for {len(expected-seen)} mask results."
+            )
         time.sleep(3)
 
     order = {p.name: i for i, p in enumerate(mask_files)}
@@ -311,12 +349,11 @@ def merge(mask_files):
     path = OUTDIR / "test_metrics.csv"
     write_csv(path, rows)
     ok = sum(r.get("status") == "ok" for r in rows)
-    print(f"\nTest complete: {ok}/{len(mask_files)} masks successful")
+    print(f"\n{DATASET} test complete: {ok}/{len(mask_files)} masks successful")
     print("Saved:", path)
-    print(f"Next: python evaluate.py --dataset {DATASET} --visuals 3")
 
 
-def main():
+def main_worker():
     mask_files = list_mask_files()
     if ARGS.max_masks and ARGS.max_masks > 0:
         mask_files = mask_files[: int(ARGS.max_masks)]
@@ -325,6 +362,9 @@ def main():
     if RANK == 0:
         print("=" * 94)
         print("FINAL TPSSR TEST")
+        print("Experiment:", config.EXPERIMENT_NAME)
+        print("Active held-out dataset:", DATASET)
+        print("Training datasets:", ", ".join(config.TRAIN_DATASET_FOLDERS))
         print("Stage 1: Spectral vs Deep-v3.1")
         print("Stage 2: hard-case gate -> Frozen V27 Stage-A -> V13 TopologyFirst V1")
         print("Masks:", len(mask_files), "| GPUs:", WORLD_SIZE)
@@ -335,4 +375,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main_worker()
