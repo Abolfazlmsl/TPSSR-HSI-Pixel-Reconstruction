@@ -7,6 +7,7 @@ All five methods are then tested independently on every held-out acquisition.
 from __future__ import annotations
 
 import argparse
+import os
 
 from _launcher_common import CORE, run
 from experiment_config import add_experiment_args, describe, resolve_experiment
@@ -38,8 +39,15 @@ p = argparse.ArgumentParser(description="Run Final TPSSR benchmark methods.")
 add_experiment_args(p)
 p.add_argument("--method", required=True, choices=[*sorted(METHODS), "all"])
 p.add_argument("--stage", choices=["train", "test", "both"], default="both")
+p.add_argument("--max-masks", type=int, default=200, help="TOTAL benchmark masks across all held-out acquisitions; 0 = all per acquisition")
 a = p.parse_args()
 spec = resolve_experiment(a)
+
+def _planned_counts(total_budget, n_tests):
+    if int(total_budget) <= 0:
+        return [None] * int(n_tests)
+    base, remainder = divmod(int(total_budget), int(n_tests))
+    return [base + (1 if i < remainder else 0) for i in range(int(n_tests))]
 
 print(describe(spec))
 names = sorted(METHODS) if a.method == "all" else [a.method]
@@ -47,6 +55,10 @@ for name in names:
     train_script, test_script = METHODS[name]
     print(f"\n{'='*84}\nBENCHMARK: {name}\n{'='*84}")
     if a.stage in ("train", "both"):
+        # Mask budgeting is a testing-only concern; do not leak it into model training.
+        os.environ.pop("HSI_TOTAL_TEST_MASKS", None)
+        os.environ.pop("HSI_EXPERIMENT_MASK_OFFSET", None)
+        os.environ.pop("HSI_EXPERIMENT_MASK_TOTAL", None)
         if train_script is None:
             print("No separate training stage; analytical method.")
         else:
@@ -54,8 +66,24 @@ for name in names:
             run(train_script, spec, active_test=spec.primary_test)
 
     if a.stage in ("test", "both"):
+        counts = _planned_counts(a.max_masks, len(spec.tests))
+        offset = 0
         for i, test_name in enumerate(spec.tests, start=1):
             print(
                 f"\n--- {name}: test acquisition {i}/{len(spec.tests)} = {test_name} ---"
             )
+            if int(a.max_masks) > 0:
+                os.environ["HSI_TOTAL_TEST_MASKS"] = str(int(a.max_masks))
+                os.environ["HSI_EXPERIMENT_MASK_OFFSET"] = str(int(offset))
+                os.environ["HSI_EXPERIMENT_MASK_TOTAL"] = str(int(a.max_masks))
+                print(
+                    f"Global benchmark budget: {a.max_masks} | "
+                    f"planned share for {test_name}: {counts[i-1]}"
+                )
+            else:
+                os.environ.pop("HSI_TOTAL_TEST_MASKS", None)
+                os.environ.pop("HSI_EXPERIMENT_MASK_OFFSET", None)
+                os.environ.pop("HSI_EXPERIMENT_MASK_TOTAL", None)
             run(test_script, spec, active_test=test_name)
+            if counts[i - 1] is not None:
+                offset += int(counts[i - 1])

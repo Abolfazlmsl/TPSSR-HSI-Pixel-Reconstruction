@@ -74,6 +74,8 @@ if a.everything or a.benchmarks:
         "all",
         "--stage",
         "both",
+        "--max-masks",
+        str(a.max_masks),
     )
 
 if a.everything or a.external:
@@ -84,4 +86,6 @@ if a.everything or a.external:
         "all",
         "--stage",
         "both",
+        "--max-masks",
+        str(a.max_masks),
     )

@@ -226,3 +226,5 @@ processed_data/
 simulated_saturation/
 
 trained_models/
+
+results/

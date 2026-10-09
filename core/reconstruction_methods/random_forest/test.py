@@ -23,6 +23,8 @@ from src.evaluation_utils import (
     regression_metrics,
     spectral_angle_metrics,
     save_method_metrics,
+    benchmark_case_index,
+    experiment_progress,
 )
 from src.ml_common import (
     extract_patch,
@@ -107,10 +109,18 @@ def main():
         start=1,
     ):
         mask, meta = load_test_mask(mask_file)
-        print(f"[RF] Mask {mask_index}/{total_masks} ({100.0*mask_index/max(total_masks,1):5.1f}%) | {meta['scenario']} S{meta['severity']} R{meta['repeat']}", flush=True)
+        global_index, global_total = experiment_progress(mask_index, total_masks)
+        print(
+            f"[RF] Experiment Mask {global_index}/{global_total} "
+            f"({100.0*global_index/max(global_total,1):5.1f}%) | "
+            f"local {mask_index}/{total_masks} | {meta['scenario']} "
+            f"S{meta['severity']} R{meta['repeat']}",
+            flush=True,
+        )
+        stable_case_index = benchmark_case_index(mask_file)
         coords = select_eval_coords(
             mask,
-            config.SEED + mask_index,
+            config.SEED + stable_case_index,
         )
 
         if len(coords) == 0:

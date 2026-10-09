@@ -27,6 +27,8 @@ from src.evaluation_utils import (
     regression_metrics,
     spectral_angle_metrics,
     save_method_metrics,
+    benchmark_case_index,
+    experiment_progress,
 )
 
 
@@ -376,7 +378,9 @@ def main():
     _, _, test = split_blocks(cube, split)
 
     mask_files = list_mask_files()
-    if config.DDS2M_MAX_MASKS is not None:
+    # list_mask_files() enforces the shared GLOBAL experiment budget.  The old
+    # DDS2M_MAX_MASKS knob is used only for legacy/debug single runs.
+    if os.environ.get("HSI_TOTAL_TEST_MASKS") is None and config.DDS2M_MAX_MASKS is not None:
         mask_files = mask_files[: int(config.DDS2M_MAX_MASKS)]
 
     method_name = getattr(config, "DDS2M_METHOD_NAME", "dds2m")
@@ -387,8 +391,16 @@ def main():
     rows = []
     for mask_index, mask_file in enumerate(tqdm(mask_files, desc="DDS2M masks"), start=1):
         mask, meta = load_test_mask(mask_file)
-        print(f"[DDS2M] Mask {mask_index}/{len(mask_files)} ({100.0*mask_index/max(len(mask_files),1):5.1f}%) | {meta['scenario']} S{meta['severity']} R{meta['repeat']}", flush=True)
-        coords = select_eval_coords(mask, config.SEED + mask_index)
+        global_index, global_total = experiment_progress(mask_index, len(mask_files))
+        print(
+            f"[DDS2M] Experiment Mask {global_index}/{global_total} "
+            f"({100.0*global_index/max(global_total,1):5.1f}%) | "
+            f"local {mask_index}/{len(mask_files)} | {meta['scenario']} "
+            f"S{meta['severity']} R{meta['repeat']}",
+            flush=True,
+        )
+        stable_case_index = benchmark_case_index(mask_file)
+        coords = select_eval_coords(mask, config.SEED + stable_case_index)
         if len(coords) == 0:
             continue
 
@@ -411,8 +423,8 @@ def main():
     output = save_method_metrics(method_name, rows)
     print("\nCompleted.")
     print(output)
-    if config.DDS2M_MAX_MASKS is not None:
-        print("WARNING: DDS2M_MAX_MASKS is set. Set it to None for all 200 masks.")
+    if os.environ.get("HSI_TOTAL_TEST_MASKS") is None and config.DDS2M_MAX_MASKS is not None:
+        print("WARNING: DDS2M_MAX_MASKS is applying an additional legacy debug cap.")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 import csv
 import math
+import os
+import re
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -182,7 +185,141 @@ def split_blocks(array, split):
     return array[:train_end], array[train_end:val_end], array[val_end:]
 
 
+_MASK_NAME_RE = re.compile(r"^(?P<scenario>.+)__s(?P<severity>\d+)__r(?P<repeat>\d+)\.npz$")
+
+
+def _mask_case_key(path):
+    """Return (scenario, severity, repeat) without loading the full mask."""
+    match = _MASK_NAME_RE.match(Path(path).name)
+    if match:
+        return (
+            str(match.group("scenario")),
+            int(match.group("severity")),
+            int(match.group("repeat")),
+        )
+
+    # Fallback for non-standard filenames.
+    with np.load(path, allow_pickle=False) as data:
+        return (
+            str(data["scenario"]),
+            int(data["severity"]),
+            int(data["repeat"]),
+        )
+
+
+def _experiment_total_mask_budget():
+    raw = os.environ.get("HSI_TOTAL_TEST_MASKS")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"HSI_TOTAL_TEST_MASKS must be an integer, got {raw!r}."
+        ) from exc
+    return value
+
+
+def _balanced_experiment_mask_keys(files, total_budget):
+    """Select this acquisition's share of one GLOBAL experiment mask budget.
+
+    The benchmark catalogue is stratified by (scenario, severity).  Candidate
+    masks within a stratum are the repeat IDs.  A global budget (normally 200)
+    is distributed across *all* configured held-out acquisitions, not applied
+    independently to each acquisition.
+
+    The allocation is deterministic and coordinated across acquisitions:
+      * 2 test acquisitions + budget 200 -> 100 + 100
+      * 5 test acquisitions + budget 200 -> 40 each
+
+    For the standard 10 scenarios x 5 severities x 4 repeats catalogue, budget
+    200 keeps exactly four cases per scenario/severity stratum across the whole
+    experiment.  Which acquisition receives a stratum/repeat rotates so no test
+    core is systematically favoured.
+    """
+    files = list(files)
+    tests = [str(x).upper() for x in config.TEST_DATASET_FOLDERS]
+    active = str(config.ACTIVE_TEST_DATASET).upper()
+    if active not in tests:
+        raise ValueError(
+            f"ACTIVE_TEST_DATASET={active} is not in TEST_DATASET_FOLDERS={tests}."
+        )
+    if total_budget is None or int(total_budget) <= 0:
+        return files
+    by_stratum = {}
+    path_by_key = {}
+    for path in files:
+        scenario, severity, repeat = _mask_case_key(path)
+        by_stratum.setdefault((scenario, severity), set()).add(int(repeat))
+        path_by_key[(scenario, severity, int(repeat))] = path
+
+    strata = sorted(by_stratum)
+    if not strata:
+        return []
+
+    # Maximum number of distinct experiment cases available across all held-out
+    # acquisitions.  Each acquisition has its own physical mask realization.
+    total_available = len(tests) * len(files)
+    budget = min(int(total_budget), int(total_available))
+    if budget >= total_available:
+        return files
+
+    # Build a deterministic candidate order for each stratum.  The first R
+    # candidates (R = number of repeats) rotate over test acquisitions.  Thus
+    # with 5 tests and 4 repeats, four different cores contribute one case each
+    # to every scenario/severity stratum; the omitted core rotates by stratum.
+    candidate_orders = []
+    for s_idx, stratum in enumerate(strata):
+        repeats = sorted(by_stratum[stratum])
+        candidates = []
+        seen = set()
+        for round_idx in range(len(tests)):
+            for rep_pos, repeat in enumerate(repeats):
+                dataset_idx = (s_idx + round_idx + rep_pos) % len(tests)
+                pair = (dataset_idx, int(repeat))
+                if pair not in seen:
+                    candidates.append(pair)
+                    seen.add(pair)
+        candidate_orders.append(candidates)
+
+    # Fill one candidate per stratum at a time.  This keeps scenario/severity
+    # representation as even as mathematically possible for any budget.
+    selected = [set() for _ in tests]
+    remaining = budget
+    layer = 0
+    while remaining > 0:
+        added = 0
+        for s_idx, stratum in enumerate(strata):
+            candidates = candidate_orders[s_idx]
+            if layer >= len(candidates):
+                continue
+            dataset_idx, repeat = candidates[layer]
+            key = (stratum[0], int(stratum[1]), int(repeat))
+            selected[dataset_idx].add(key)
+            remaining -= 1
+            added += 1
+            if remaining <= 0:
+                break
+        if added == 0:
+            break
+        layer += 1
+
+    active_idx = tests.index(active)
+    wanted = selected[active_idx]
+    chosen = [
+        path for path in files
+        if _mask_case_key(path) in wanted
+    ]
+    return chosen
+
+
 def list_mask_files():
+    """List benchmark masks for the active test acquisition.
+
+    If HSI_TOTAL_TEST_MASKS is set, its value is interpreted as the TOTAL mask
+    budget for the complete multi-acquisition experiment.  The returned list is
+    this acquisition's deterministic stratified share of that global budget.
+    """
     mask_dir = config.BENCHMARK_DIR / "masks"
     files = sorted(mask_dir.glob("*.npz"))
     if not files:
@@ -190,7 +327,45 @@ def list_mask_files():
             "No saturation simulation masks were found. "
             "Run data_preparation/prepare_dataset.py first."
         )
-    return files
+    return _balanced_experiment_mask_keys(
+        files,
+        _experiment_total_mask_budget(),
+    )
+
+
+@lru_cache(maxsize=32)
+def _full_mask_index_map(mask_dir_text):
+    mask_dir = Path(mask_dir_text)
+    return {
+        path.name: index
+        for index, path in enumerate(sorted(mask_dir.glob("*.npz")), start=1)
+    }
+
+
+def benchmark_case_index(mask_path):
+    """Stable 1-based index in the FULL local 200-mask catalogue.
+
+    Use this index for select_eval_coords so the sampled voxels for a particular
+    scenario/severity/repeat do not change when the experiment-wide mask budget
+    changes from 200-per-core to 200-total.
+    """
+    path = Path(mask_path)
+    mapping = _full_mask_index_map(str(path.parent))
+    if path.name not in mapping:
+        raise KeyError(f"Mask {path.name} was not found in {path.parent}.")
+    return int(mapping[path.name])
+
+
+def experiment_progress(local_mask_index, local_total):
+    """Return (global_index, global_total) for user-facing progress messages."""
+    offset = int(os.environ.get("HSI_EXPERIMENT_MASK_OFFSET", "0"))
+    total = int(
+        os.environ.get(
+            "HSI_EXPERIMENT_MASK_TOTAL",
+            str(local_total),
+        )
+    )
+    return offset + int(local_mask_index), total
 
 
 def save_mask_file(path, mask, metadata):

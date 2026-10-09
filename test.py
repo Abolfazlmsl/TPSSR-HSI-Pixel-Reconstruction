@@ -2,8 +2,11 @@
 # -*- coding: utf-8 -*-
 """Run FINAL TPSSR on every configured held-out acquisition.
 
-Progress explicitly reports the active acquisition and GLOBAL mask number, e.g.
-  [SWIR5][GPU 0] Mask 37/200 (18.5%) | spatio_spectral_block S4 R1
+The --max-masks value is a GLOBAL experiment budget, not a per-acquisition
+budget.  For example, 200 total masks means 100+100 for two held-out cores or
+40 each for five held-out cores.
+
+Progress reports both experiment-wide and local acquisition progress.
 """
 from __future__ import annotations
 
@@ -36,7 +39,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Test FINAL TPSSR end-to-end")
     add_experiment_args(p)
     p.add_argument("--gpus", type=int, default=2, choices=[1, 2])
-    p.add_argument("--max-masks", type=int, default=200, help="0 = all benchmark masks")
+    p.add_argument("--max-masks", type=int, default=200, help="TOTAL masks across all held-out acquisitions; 0 = all masks on every test acquisition")
     p.add_argument("--deep-batch", type=int, default=16)
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--no-verify-region-batch", action="store_true")
@@ -45,13 +48,29 @@ def parse_args():
     return p.parse_args()
 
 
+def _planned_counts(total_budget, n_tests):
+    if int(total_budget) <= 0:
+        return [None] * int(n_tests)
+    base, remainder = divmod(int(total_budget), int(n_tests))
+    return [base + (1 if i < remainder else 0) for i in range(int(n_tests))]
+
+
 def launch_all_tests(args, spec):
     print(describe(spec))
+    counts = _planned_counts(args.max_masks, len(spec.tests))
+    offset = 0
     for i, test_name in enumerate(spec.tests, start=1):
+        local_planned = counts[i - 1]
         print(
             f"\n{'='*94}\nFINAL TPSSR TEST DATASET {i}/{len(spec.tests)}: {test_name}\n{'='*94}",
             flush=True,
         )
+        if local_planned is not None:
+            print(
+                f"Global experiment budget: {args.max_masks} masks | "
+                f"planned share for {test_name}: {local_planned}",
+                flush=True,
+            )
         common = [
             str(Path(__file__).resolve()),
             *experiment_cli_args(spec, active_test=test_name),
@@ -81,13 +100,22 @@ def launch_all_tests(args, spec):
             ]
         else:
             cmd = [sys.executable, *common]
+
+        child_env = env_for(spec, test_name)
+        if int(args.max_masks) > 0:
+            child_env["HSI_TOTAL_TEST_MASKS"] = str(int(args.max_masks))
+            child_env["HSI_EXPERIMENT_MASK_OFFSET"] = str(int(offset))
+            child_env["HSI_EXPERIMENT_MASK_TOTAL"] = str(int(args.max_masks))
+
         print("RUN:", " ".join(map(str, cmd)), flush=True)
         subprocess.run(
             cmd,
             cwd=str(ROOT),
-            env=env_for(spec, test_name),
+            env=child_env,
             check=True,
         )
+        if local_planned is not None:
+            offset += int(local_planned)
     print("\nFinal TPSSR testing complete for:", ", ".join(spec.tests))
 
 
@@ -101,6 +129,8 @@ DATASET = SPEC.active_test
 # Worker environment is already populated by the parent, but these assignments
 # keep direct worker use deterministic as well.
 os.environ.update(env_for(SPEC, DATASET))
+if int(ARGS.max_masks) > 0:
+    os.environ["HSI_TOTAL_TEST_MASKS"] = str(int(ARGS.max_masks))
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 
@@ -113,6 +143,8 @@ from src.evaluation_utils import (
     list_mask_files,
     load_test_mask,
     select_eval_coords,
+    benchmark_case_index,
+    experiment_progress,
 )
 from src.final_pipeline import load_pipeline, predict_mask, sparse_band_predictions, subset_rmse
 from src.final_tpssr_runtime import evaluate_reconstruction
@@ -173,14 +205,17 @@ def evaluate_worker(mask_files):
     ]
     shard = OUTDIR / f"test_metrics.rank{RANK}.csv"
 
+    assigned_names = {p.name for _i, p in assigned}
     completed = {}
     if shard.exists() and not ARGS.force:
         for row in read_csv(shard):
+            name = str(row.get("mask_file", ""))
             if (
-                row.get("status") == "ok"
+                name in assigned_names
+                and row.get("status") == "ok"
                 and float(row.get("coverage", 0.0)) >= 0.999999
             ):
-                completed[str(row["mask_file"])] = row
+                completed[name] = row
 
     rows = list(completed.values())
     pending = [(i, p) for i, p in assigned if p.name not in completed]
@@ -198,18 +233,21 @@ def evaluate_worker(mask_files):
     total_global = len(mask_files)
     for mask_index, mask_path in bar:
         t0 = time.time()
+        global_index, global_total = experiment_progress(mask_index, total_global)
+        stable_case_index = benchmark_case_index(mask_path)
         try:
             mask, meta = load_test_mask(mask_path)
-            pct = 100.0 * float(mask_index) / max(total_global, 1)
+            pct = 100.0 * float(global_index) / max(global_total, 1)
             print(
-                f"[{DATASET}][GPU {RANK}] Mask {mask_index}/{total_global} "
-                f"({pct:5.1f}%) | {meta['scenario']} "
+                f"[{DATASET}][GPU {RANK}] Experiment Mask "
+                f"{global_index}/{global_total} ({pct:5.1f}%) | "
+                f"local {mask_index}/{total_global} | {meta['scenario']} "
                 f"S{meta['severity']} R{meta['repeat']}",
                 flush=True,
             )
             mask = np.asarray(mask, dtype=bool)
             coords = np.asarray(
-                select_eval_coords(mask, int(config.SEED) + int(mask_index)),
+                select_eval_coords(mask, int(config.SEED) + int(stable_case_index)),
                 dtype=np.int64,
             )
             if len(coords) == 0:
@@ -242,7 +280,9 @@ def evaluate_worker(mask_files):
             stage1 = out["stage1_route"]
             route = out["final_route"]
             row = {
-                "_case_index": int(mask_index),
+                "_case_index": int(stable_case_index),
+                "experiment_case_index": int(global_index),
+                "dataset_local_index": int(mask_index),
                 "dataset": DATASET,
                 "experiment": config.EXPERIMENT_NAME,
                 "eval_protocol": EVAL_PROTOCOL,
@@ -271,7 +311,9 @@ def evaluate_worker(mask_files):
             }
         except Exception as exc:
             row = {
-                "_case_index": int(mask_index),
+                "_case_index": int(stable_case_index),
+                "experiment_case_index": int(global_index),
+                "dataset_local_index": int(mask_index),
                 "dataset": DATASET,
                 "experiment": config.EXPERIMENT_NAME,
                 "eval_protocol": EVAL_PROTOCOL,
@@ -295,12 +337,13 @@ def evaluate_worker(mask_files):
         write_csv(shard, rows)
         if row["status"] == "ok":
             bar.set_postfix(
-                global_mask=f"{mask_index}/{total_global}",
+                global_mask=f"{experiment_progress(mask_index, total_global)[0]}/{experiment_progress(mask_index, total_global)[1]}",
                 rmse=f"{float(row['rmse']):.4g}",
                 R=f"{100.0*float(row['final_region_fraction']):.1f}%",
             )
         else:
-            bar.set_postfix(global_mask=f"{mask_index}/{total_global}", status="ERROR")
+            gi, gt = experiment_progress(mask_index, total_global)
+            bar.set_postfix(global_mask=f"{gi}/{gt}", status="ERROR")
 
     worker_meta = {
         "dataset": DATASET,
@@ -329,8 +372,11 @@ def merge(mask_files):
             p = OUTDIR / f"test_metrics.rank{rank}.csv"
             if p.exists():
                 for row in read_csv(p):
+                    name = str(row.get("mask_file", ""))
+                    if name not in expected:
+                        continue
                     merged.append(row)
-                    seen.add(str(row.get("mask_file")))
+                    seen.add(name)
         if expected.issubset(seen):
             break
         if time.monotonic() > deadline:
@@ -354,9 +400,9 @@ def merge(mask_files):
 
 
 def main_worker():
+    # list_mask_files() already applies --max-masks as a GLOBAL experiment
+    # budget through HSI_TOTAL_TEST_MASKS.  Do not slice again per acquisition.
     mask_files = list_mask_files()
-    if ARGS.max_masks and ARGS.max_masks > 0:
-        mask_files = mask_files[: int(ARGS.max_masks)]
     if not mask_files:
         raise RuntimeError("No benchmark masks found. Run prepare_dataset.py first.")
     if RANK == 0:
@@ -367,7 +413,9 @@ def main_worker():
         print("Training datasets:", ", ".join(config.TRAIN_DATASET_FOLDERS))
         print("Stage 1: Spectral vs Deep-v3.1")
         print("Stage 2: hard-case gate -> Frozen V27 Stage-A -> V13 TopologyFirst V1")
-        print("Masks:", len(mask_files), "| GPUs:", WORLD_SIZE)
+        print("Allocated masks for this acquisition:", len(mask_files), "| GPUs:", WORLD_SIZE)
+        if int(ARGS.max_masks) > 0:
+            print("GLOBAL experiment mask budget:", int(ARGS.max_masks))
         print("=" * 94)
     evaluate_worker(mask_files)
     if RANK == 0:
