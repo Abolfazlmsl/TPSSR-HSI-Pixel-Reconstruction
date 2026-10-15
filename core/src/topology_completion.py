@@ -142,7 +142,7 @@ class TopologyCompletionNetwork(nn.Module):
             nn.GroupNorm(_groups(spectral_width), spectral_width), nn.SiLU(),
             ResBlock(spectral_width, spectral_width, 1, 0.01),
         )
-        self.geometry_adapter = nn.Sequential(
+        self.v27_adapter = nn.Sequential(
             nn.Conv2d(structure_feature_channels + 4, base_width, 3, padding=1, bias=False),
             nn.GroupNorm(_groups(base_width), base_width), nn.SiLU(),
             ResBlock(base_width, base_width, 1, 0.01),
@@ -228,7 +228,7 @@ class TopologyCompletionNetwork(nn.Module):
         n, _, h, w = spec.shape
         band_map = band_position.view(n, 1, 1, 1).expand(-1, -1, h, w)
         smap = torch.cat([structure["edge_prob"], structure["orientation"], structure["contrast_hint"]], 1)
-        geometry = self.geometry_adapter(torch.cat([structure["feature"], smap], 1))
+        geometry = self.v27_adapter(torch.cat([structure["feature"], smap], 1))
         directional = self.directional(torch.cat([spec, observed_target, smap, mask, distance], 1))
 
         native = torch.cat([
