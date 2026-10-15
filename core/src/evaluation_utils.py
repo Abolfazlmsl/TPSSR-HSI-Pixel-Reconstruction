@@ -538,10 +538,117 @@ def spectral_angle_metrics(gt_cube, coords, preds):
     }
 
 
+
+def masked_ssim3_sparse(gt, coords_yx, pred_values, target_mask2d=None):
+    """Replicate TPSSR's masked 3x3 sparse-window SSIM exactly.
+
+    Only sampled, successfully reconstructed target voxels are substituted.
+    Windows containing other masked/unreconstructed pixels are excluded.
+    """
+    gt = np.asarray(gt, float)
+    coords_yx = np.asarray(coords_yx, dtype=np.int64)
+    pred_values = np.asarray(pred_values, float)
+    if len(coords_yx) == 0:
+        return float("nan")
+
+    finite = np.isfinite(pred_values)
+    finite &= np.isfinite(gt[coords_yx[:, 0], coords_yx[:, 1]])
+    coords_yx = coords_yx[finite]
+    pred_values = pred_values[finite]
+    if len(coords_yx) == 0:
+        return float("nan")
+
+    vals_gt = gt[coords_yx[:, 0], coords_yx[:, 1]]
+    dr = max(float(np.nanpercentile(vals_gt, 99) - np.nanpercentile(vals_gt, 1)), 1e-6)
+    c1, c2 = (.01 * dr) ** 2, (.03 * dr) ** 2
+    lookup = {(int(y), int(x)): float(v) for (y, x), v in zip(coords_yx, pred_values)}
+    target_mask2d = None if target_mask2d is None else np.asarray(target_mask2d, dtype=bool)
+    vals = []
+    h, w = gt.shape
+    for y, x in coords_yx:
+        y, x = int(y), int(x)
+        if y < 1 or x < 1 or y >= h - 1 or x >= w - 1:
+            continue
+        a = gt[y-1:y+2, x-1:x+2].astype(float, copy=False).ravel()
+        b = a.copy()
+        k = 0
+        window_valid = True
+        for yy in range(y - 1, y + 2):
+            for xx in range(x - 1, x + 2):
+                pv = lookup.get((yy, xx))
+                if pv is not None:
+                    b[k] = pv
+                elif target_mask2d is not None and bool(target_mask2d[yy, xx]):
+                    window_valid = False
+                    break
+                k += 1
+            if not window_valid:
+                break
+        if not window_valid or not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+            continue
+        ma, mb = a.mean(), b.mean()
+        va, vb = a.var(), b.var()
+        cov = np.mean((a-ma) * (b-mb))
+        den = (ma*ma + mb*mb + c1) * (va + vb + c2)
+        if den > 1e-20:
+            vals.append(((2*ma*mb+c1) * (2*cov+c2)) / den)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def sparse_ssim_metrics(gt_cube, mask3d, eval_coords, predictions):
+    """Evaluate baseline SSIM on precisely TPSSR's sparse sampled windows.
+
+    Bandwise SSIM is aggregated using the number of valid reconstructed
+    sampled voxels per band, matching final_tpssr_runtime.evaluate_reconstruction.
+    If no valid 3x3 windows exist, SSIM is NaN (never artificially zero).
+    """
+    coords = np.asarray(eval_coords, dtype=np.int64)
+    pred = np.asarray(predictions, dtype=np.float32)
+    if coords.ndim != 2 or coords.shape[1] != 3 or len(coords) != len(pred):
+        raise ValueError("eval_coords must be Nx3 and match predictions length")
+    if len(coords) == 0:
+        return {"ssim": float("nan"), "ssim_mean_band": float("nan")}
+
+    scores, weights = [], []
+    # Keep identical band ordering and weighting as the TPSSR evaluator.
+    for band in np.unique(coords[:, 2]):
+        band = int(band)
+        in_band = coords[:, 2] == band
+        c = coords[in_band, :2]
+        pv = pred[in_band]
+        truth = np.asarray(gt_cube[c[:, 0], c[:, 1], band])
+        valid = (np.asarray(mask3d[c[:, 0], c[:, 1], band], bool)
+                 & np.isfinite(truth) & np.isfinite(pv))
+        c = c[valid]
+        pv = pv[valid]
+        n = int(len(c))
+        if n == 0:
+            continue
+        score = masked_ssim3_sparse(
+            np.asarray(gt_cube[:, :, band]), c, pv,
+            target_mask2d=mask3d[:, :, band],
+        )
+        if np.isfinite(score):
+            scores.append(float(score))
+            weights.append(n)
+
+    return {
+        "ssim": float(np.average(scores, weights=weights)) if scores else float("nan"),
+        "ssim_mean_band": float(np.mean(scores)) if scores else float("nan"),
+    }
+
+
+
 def save_method_metrics(method_name, rows):
     output_dir = config.RESULTS_DIR / method_name
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "metrics.csv"
+
+    if rows and "ssim" in rows[0] and path.exists():
+        backup = output_dir / "metrics_before_ssim.csv"
+        if not backup.exists():
+            import shutil
+            shutil.copy2(path, backup)
 
     if not rows:
         return path

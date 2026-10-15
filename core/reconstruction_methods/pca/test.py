@@ -22,6 +22,7 @@ from src.evaluation_utils import (
     select_eval_coords,
     regression_metrics,
     spectral_angle_metrics,
+    sparse_ssim_metrics,
     save_method_metrics,
     benchmark_case_index,
     experiment_progress,
@@ -115,6 +116,7 @@ def main():
 
         reg = regression_metrics(truth, pred)
         sam = spectral_angle_metrics(test, coords, pred)
+        ssim = sparse_ssim_metrics(test, mask, coords, pred)
 
         rows.append({
             "scenario": meta["scenario"],
@@ -123,6 +125,7 @@ def main():
             "method": "pca",
             **reg,
             **sam,
+            **ssim,
         })
 
     output = save_method_metrics("pca", rows)
