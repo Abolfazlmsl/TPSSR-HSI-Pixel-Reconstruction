@@ -1,8 +1,8 @@
 data:
   dataset: "msi"
   training_dataset: "CelebA_HQ"
-  root: "/home/BIGRAID/ABOLFAZL/Messel Test/Saturated pixel/TPSSR-HSI-Pixel-Reconstruction/results/swir__train_1-2-3-4-6-7-8-9__test_5-10/SWIR5/dds2m_t3000_sp1500/cache/work/mixed_saturation__s5__r4__tile016__y192_x0/input"
-  filename: "mixed_saturation__s5__r4__tile016__y192_x0.mat"
+  root: "/home/BIGRAID/ABOLFAZL/Messel Test/Saturated pixel/TPSSR-HSI-Pixel-Reconstruction/results/swir__train_1-2-3-4-6-7-8-9__test_5-10/SWIR5/dds2m_t3000_sp1500/cache/work/multiple_detector_lines__s1__r1__tile003__y0_x192/input"
+  filename: "multiple_detector_lines__s1__r1__tile003__y0_x192.mat"
   category: ""
   image_size: 128
   channels: 272

@@ -28,7 +28,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler, Subset
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / 'core'
 for path in (str(ROOT), str(CORE)):
     if path not in sys.path: sys.path.insert(0, path)
@@ -302,7 +302,7 @@ def run_worker(args):
         if not set(val_cores).issubset(set(spec.train)): raise RuntimeError('Validation cores must be drawn from training acquisitions')
         training,tr_c,tr_i,va_c,va_i,wave=load_core_data(spec,val_cores)
         bands=len(wave)
-        output=Path(config.MODELS_DIR)/'texture_restoration_router_rf_v2'/'spectral_transformer_same_pixel_v1'
+        output=Path(config.MODELS_DIR)/'tpssr'/'spectral_dataset_experiments'
         if rank==0: output.mkdir(parents=True,exist_ok=True)
         if world>1: dist.barrier()
         stats_path=output/'TRAIN_ONLY_STATS.npz'

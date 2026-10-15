@@ -149,11 +149,9 @@ def choose_tpssr_csv(experiment_dir, explicitly_given):
     candidates = []
     if experiment_dir is not None:
         combined = experiment_dir / "combined"
-        for name in ("final_tpssr_stage1_rank_v4", "final_tpssr_spectral_safe_stage1_v2",
-                     "final_tpssr_joint_v3", "final_tpssr_spectral_safe", "final_tpssr"):
-            path = combined / name / "all_test_metrics.csv"
-            if path.is_file():
-                return path
+        path = combined / "tpssr" / "all_test_metrics.csv"
+        if path.is_file():
+            return path
         if combined.is_dir():
             candidates.extend(combined.glob("*/all_test_metrics.csv"))
 
@@ -173,7 +171,7 @@ def choose_tpssr_csv(experiment_dir, explicitly_given):
         )
     if len(candidates) > 1:
         print(f"[INFO] Selected TPSSR metrics: {candidates[0]}")
-        print("[INFO] Use --tpssr-csv to select a different Router version.")
+        print("[INFO] Use --tpssr-csv to select another result file.")
     return candidates[0]
 
 

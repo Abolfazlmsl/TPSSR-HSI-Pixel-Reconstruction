@@ -1,12 +1,13 @@
-"""TPSSR V2.3 observed-only geometric long-gap routing and local median fallback.
+"""Observed-only routing for spectral and geometry-guided reconstruction.
 
-Extracted verbatim from evaluated script evaluate_tpssr_two_expert_v23.py.
-Do not modify thresholds using SWIR5 or SWIR10 test outcomes.
+Long gaps may be assigned to spatial reconstruction when measured neighbors
+provide sufficient support. Local medians are accepted only for isolated,
+well-supported missing pixels. Do not tune thresholds on test outcomes.
 """
 from __future__ import annotations
 import numpy as np
 
-VERSION = 'v23_predeclared_geometry_and_neighbor_median_20261014'
+VERSION = 'policy_predeclared_geometry_and_neighbor_median_20261014'
 
 # Frozen engineering hypotheses: do NOT select values from SWIR5/10 outcomes.
 # Extra Region route for contiguous bands of a same-pixel true-mask gap, when

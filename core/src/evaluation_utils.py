@@ -599,7 +599,7 @@ def sparse_ssim_metrics(gt_cube, mask3d, eval_coords, predictions):
     """Evaluate baseline SSIM on precisely TPSSR's sparse sampled windows.
 
     Bandwise SSIM is aggregated using the number of valid reconstructed
-    sampled voxels per band, matching final_tpssr_runtime.evaluate_reconstruction.
+    sampled voxels per band, matching spatial_inference.evaluate_reconstruction.
     If no valid 3x3 windows exist, SSIM is NaN (never artificially zero).
     """
     coords = np.asarray(eval_coords, dtype=np.int64)

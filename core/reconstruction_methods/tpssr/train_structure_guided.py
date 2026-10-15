@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Train TPSSR New V13 with frozen Original-V27 Stage-A guidance.
+"""Train TPSSR New Topology with frozen Original-Geometry Stage-A guidance.
 
-The training is intentionally a SINGLE stage. Original V27 is loaded and frozen;
+The training is intentionally a SINGLE stage. Original Geometry is loaded and frozen;
 only the new filler is optimized. The filler explicitly separates radiometry/
 low-frequency reconstruction from native-resolution high-frequency texture.
 
 Use the project-root launcher instead of calling this file directly:
-    python run_new_v13.py --dataset SWIR1 --gpus 1 --no-resume
+    python run_new_topology.py --dataset SWIR1 --gpus 1 --no-resume
 or
-    python run_new_v13.py --dataset SWIR1 --gpus 2 --no-resume
+    python run_new_topology.py --dataset SWIR1 --gpus 2 --no-resume
 """
 
 from __future__ import annotations
@@ -40,10 +40,10 @@ from tqdm import tqdm
 
 import config
 from src.evaluation_utils import load_global_training_data
-from src.new_v13_structure_guided_filler import NewV13StructureGuidedFiller
+from src.structure_guided import StructureGuidedNetwork
 
-METHOD_DIR = CORE / "reconstruction_methods" / "texture_restoration_router_rf_v2"
-METHOD = "texture_restoration_router_rf_v2"
+METHOD_DIR = CORE / "reconstruction_methods" / "tpssr"
+METHOD = "tpssr"
 
 
 def import_file(name: str, path: Path):
@@ -54,21 +54,21 @@ def import_file(name: str, path: Path):
     return mod
 
 
-V27 = import_file("new_v13_v27_original_arch", METHOD_DIR / "train_swir1_v27_learned_correspondence.py")
+Geometry = import_file("new_topology_geometry_original_arch", METHOD_DIR / "train_geometry.py")
 
-# Quick-development defaults. All can be overridden by run_new_v13.py.
-EPOCHS = int(os.environ.get("NEWV13_EPOCHS", "12"))
-MIN_EPOCHS = int(os.environ.get("NEWV13_MIN_EPOCHS", "6"))
-PATIENCE = int(os.environ.get("NEWV13_PATIENCE", "4"))
-TRAIN_SAMPLES = int(os.environ.get("NEWV13_TRAIN_SAMPLES", "1800"))
-VAL_SAMPLES = int(os.environ.get("NEWV13_VAL_SAMPLES", "450"))
-BATCH_SIZE = int(os.environ.get("NEWV13_BATCH_SIZE", "1"))
-NUM_WORKERS = int(os.environ.get("NEWV13_NUM_WORKERS", "2"))
-LEARNING_RATE = float(os.environ.get("NEWV13_LR", "1.5e-4"))
-WEIGHT_DECAY = float(os.environ.get("NEWV13_WEIGHT_DECAY", "1.0e-5"))
-GRAD_CLIP = float(os.environ.get("NEWV13_GRAD_CLIP", "2.0"))
-EMA_DECAY = float(os.environ.get("NEWV13_EMA_DECAY", "0.995"))
-NO_RESUME = os.environ.get("NEWV13_NO_RESUME", "0") == "1"
+# Quick-development defaults. All can be overridden by run_new_topology.py.
+EPOCHS = int(os.environ.get("NEWTopology_EPOCHS", "12"))
+MIN_EPOCHS = int(os.environ.get("NEWTopology_MIN_EPOCHS", "6"))
+PATIENCE = int(os.environ.get("NEWTopology_PATIENCE", "4"))
+TRAIN_SAMPLES = int(os.environ.get("NEWTopology_TRAIN_SAMPLES", "1800"))
+VAL_SAMPLES = int(os.environ.get("NEWTopology_VAL_SAMPLES", "450"))
+BATCH_SIZE = int(os.environ.get("NEWTopology_BATCH_SIZE", "1"))
+NUM_WORKERS = int(os.environ.get("NEWTopology_NUM_WORKERS", "2"))
+LEARNING_RATE = float(os.environ.get("NEWTopology_LR", "1.5e-4"))
+WEIGHT_DECAY = float(os.environ.get("NEWTopology_WEIGHT_DECAY", "1.0e-5"))
+GRAD_CLIP = float(os.environ.get("NEWTopology_GRAD_CLIP", "2.0"))
+EMA_DECAY = float(os.environ.get("NEWTopology_EMA_DECAY", "0.995"))
+NO_RESUME = os.environ.get("NEWTopology_NO_RESUME", "0") == "1"
 
 # Extra losses dedicated to LF/HF separation and radiometry preservation.
 W_LOW = 0.40
@@ -110,7 +110,7 @@ def set_seed(seed: int):
 
 def setup_runtime():
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for New V13 training.")
+        raise RuntimeError("CUDA is required for New Topology training.")
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if distributed:
@@ -149,25 +149,24 @@ def torch_load(path: Path, map_location="cpu"):
         return torch.load(path, map_location=map_location)
 
 
-def v27_checkpoint_path() -> Path:
+def geometry_checkpoint_path() -> Path:
     tag = str(config.TEST_DATASET_FOLDER).lower()
     root = Path(config.MODELS_DIR) / METHOD
     candidates = [
-        root / f"region_v27_original_{tag}_dev_2gpu" / "best_model.pt",
-        root / f"region_v27_learned_correspondence_{tag}_dev_2gpu" / "best_model.pt",
+        root / f"geometry_{tag}" / "best_model.pt",
     ]
     for path in candidates:
         if path.exists():
             return path
     raise FileNotFoundError(
-        "Original V27 checkpoint not found. Expected one of:\n" + "\n".join(str(p) for p in candidates)
+        "Original Geometry checkpoint not found. Expected one of:\n" + "\n".join(str(p) for p in candidates)
     )
 
 
-def build_frozen_structure(v27_ck: dict, device: torch.device):
-    settings = v27_ck["settings"]
-    structure = V27.StructureCompletionNet(
-        n_bands=int(v27_ck["n_bands"]),
+def build_frozen_structure(geometry_ck: dict, device: torch.device):
+    settings = geometry_ck["settings"]
+    structure = Geometry.StructureCompletionNet(
+        n_bands=int(geometry_ck["n_bands"]),
         spectral_width=int(settings["spectral_width"]),
         base_width=int(settings["base_width"]),
         attention_heads=int(settings["attention_heads"]),
@@ -176,11 +175,11 @@ def build_frozen_structure(v27_ck: dict, device: torch.device):
     prefix = "structure_net."
     state = {
         key[len(prefix):]: value
-        for key, value in v27_ck["model_state_dict"].items()
+        for key, value in geometry_ck["model_state_dict"].items()
         if key.startswith(prefix)
     }
     if not state:
-        raise RuntimeError("V27 checkpoint does not contain structure_net.* weights")
+        raise RuntimeError("Geometry checkpoint does not contain structure_net.* weights")
     structure.load_state_dict(state, strict=True)
     structure.eval()
     for parameter in structure.parameters():
@@ -226,12 +225,12 @@ def local_stats(x: torch.Tensor, kernel: int):
     return mean, std
 
 
-def new_v13_loss(output: dict, batch: dict):
-    # Reuse the proven V27 structural/radiometric terms, but prevent V27's
+def new_topology_loss(output: dict, batch: dict):
+    # Reuse the proven Geometry structural/radiometric terms, but prevent Geometry's
     # "coarse" term from forcing our LF branch to contain high-frequency detail.
     base_output = dict(output)
     base_output["coarse_prediction"] = output["prediction"]
-    base_loss, base_parts = V27.reconstruction_loss(base_output, batch)
+    base_loss, base_parts = Geometry.reconstruction_loss(base_output, batch)
 
     target = batch["target"]
     mask = batch["mask"]
@@ -313,7 +312,7 @@ def evaluate(filler, structure, loader, device):
         with torch.amp.autocast("cuda", enabled=True):
             s = structure_forward(structure, batch)
             output = filler_forward(filler, batch, s)
-            loss, parts = new_v13_loss(output, batch)
+            loss, parts = new_topology_loss(output, batch)
         total += float(loss.item())
         count += 1
         for key in sums:
@@ -331,20 +330,20 @@ def save_checkpoint(
     scheduler,
     epoch: int,
     best_val: float,
-    v27_ck: dict,
-    v27_path: Path,
+    geometry_ck: dict,
+    geometry_path: Path,
     history: list[dict],
 ):
     payload = {
-        "architecture": NewV13StructureGuidedFiller.ARCHITECTURE_VERSION,
+        "architecture": StructureGuidedNetwork.ARCHITECTURE_VERSION,
         "epoch": int(epoch),
         "best_val": float(best_val),
-        "patch_size": int(v27_ck.get("patch_size", 65)),
-        "n_bands": int(v27_ck["n_bands"]),
-        "band_mean": np.asarray(v27_ck["band_mean"], dtype=np.float32),
-        "band_std": np.asarray(v27_ck["band_std"], dtype=np.float32),
-        "wavelengths_nm": np.asarray(v27_ck["wavelengths_nm"], dtype=np.float32),
-        "source_v27_checkpoint": str(v27_path),
+        "patch_size": int(geometry_ck.get("patch_size", 65)),
+        "n_bands": int(geometry_ck["n_bands"]),
+        "band_mean": np.asarray(geometry_ck["band_mean"], dtype=np.float32),
+        "band_std": np.asarray(geometry_ck["band_std"], dtype=np.float32),
+        "wavelengths_nm": np.asarray(geometry_ck["wavelengths_nm"], dtype=np.float32),
+        "source_geometry_checkpoint": str(geometry_path),
         "model_state_dict": ema_filler.state_dict(),
         "train_model_state_dict": raw_filler.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -361,7 +360,7 @@ def save_checkpoint(
             "epochs": int(EPOCHS),
             "train_samples": int(TRAIN_SAMPLES),
             "val_samples": int(VAL_SAMPLES),
-            "v27_frozen": True,
+            "geometry_frozen": True,
             "native_resolution_texture_path": True,
             "lf_hf_decomposition": True,
         },
@@ -376,21 +375,21 @@ def main():
         set_seed(SEED + rank)
         train_cubes, val_cubes, wavelengths = load_global_training_data()
 
-        source_v27 = v27_checkpoint_path()
-        v27_ck = torch_load(source_v27, "cpu")
-        if int(v27_ck["n_bands"]) != int(train_cubes[0].shape[-1]):
-            raise RuntimeError("V27 spectral dimension differs from current training fold")
-        if not np.allclose(np.asarray(v27_ck["wavelengths_nm"]), np.asarray(wavelengths), atol=1e-3, rtol=0.0):
-            raise RuntimeError("V27 wavelength grid differs from current training fold")
+        source_geometry = geometry_checkpoint_path()
+        geometry_ck = torch_load(source_geometry, "cpu")
+        if int(geometry_ck["n_bands"]) != int(train_cubes[0].shape[-1]):
+            raise RuntimeError("Geometry spectral dimension differs from current training fold")
+        if not np.allclose(np.asarray(geometry_ck["wavelengths_nm"]), np.asarray(wavelengths), atol=1e-3, rtol=0.0):
+            raise RuntimeError("Geometry wavelength grid differs from current training fold")
 
-        structure, structure_feature_channels = build_frozen_structure(v27_ck, device)
+        structure, structure_feature_channels = build_frozen_structure(geometry_ck, device)
 
-        band_mean = np.asarray(v27_ck["band_mean"], dtype=np.float32)
-        band_std = np.asarray(v27_ck["band_std"], dtype=np.float32)
-        train_ds = V27.V27LearnedCorrespondenceDataset(
+        band_mean = np.asarray(geometry_ck["band_mean"], dtype=np.float32)
+        band_std = np.asarray(geometry_ck["band_std"], dtype=np.float32)
+        train_ds = Geometry.GeometryLearnedCorrespondenceDataset(
             train_cubes, band_mean, band_std, TRAIN_SAMPLES, SEED + 101, True
         )
-        val_ds = V27.V27LearnedCorrespondenceDataset(
+        val_ds = Geometry.GeometryLearnedCorrespondenceDataset(
             val_cubes, band_mean, band_std, VAL_SAMPLES, SEED + 202, False
         ) if main_process else None
 
@@ -410,8 +409,8 @@ def main():
             val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True
         ) if main_process else None
 
-        base_filler = NewV13StructureGuidedFiller(
-            n_bands=int(v27_ck["n_bands"]),
+        base_filler = StructureGuidedNetwork(
+            n_bands=int(geometry_ck["n_bands"]),
             structure_feature_channels=structure_feature_channels,
         ).to(device)
         ema = EMA(base_filler, EMA_DECAY)
@@ -425,7 +424,7 @@ def main():
         scaler = torch.amp.GradScaler("cuda", enabled=True)
 
         tag = str(config.TEST_DATASET_FOLDER).lower()
-        outdir = Path(config.MODELS_DIR) / METHOD / f"new_v13_v27_guided_{tag}"
+        outdir = Path(config.MODELS_DIR) / METHOD / f"structure_guided_{tag}"
         if main_process:
             outdir.mkdir(parents=True, exist_ok=True)
         if distributed:
@@ -457,16 +456,16 @@ def main():
             best_val = float(resume.get("best_val", float("inf")))
             history = list(resume.get("history", []))
             if main_process:
-                print(f"Resuming New V13 from epoch {start_epoch}")
+                print(f"Resuming New Topology from epoch {start_epoch}")
 
         if main_process:
             trainable = sum(p.numel() for p in base_filler.parameters() if p.requires_grad)
             frozen = sum(p.numel() for p in structure.parameters())
-            print("NEW V13 — V27-guided texture-preserving filler")
-            print("Source V27:", source_v27)
-            print(f"Frozen V27 Stage-A: {frozen/1e6:.3f} M parameters")
-            print(f"Trainable New V13: {trainable/1e6:.3f} M parameters")
-            print("Single training stage; V27 remains frozen.")
+            print("NEW Topology — Geometry-guided texture-preserving filler")
+            print("Source Geometry:", source_geometry)
+            print(f"Frozen Geometry Stage-A: {frozen/1e6:.3f} M parameters")
+            print(f"Trainable New Topology: {trainable/1e6:.3f} M parameters")
+            print("Single training stage; Geometry remains frozen.")
             print("Texture path: native resolution, no pooling/downsampling/interpolation.")
             print(f"Epochs={EPOCHS} train_samples={TRAIN_SAMPLES} val_samples={VAL_SAMPLES} world_size={world_size}")
 
@@ -480,7 +479,7 @@ def main():
             seen = 0.0
             progress = tqdm(
                 train_loader,
-                desc=f"New V13 epoch {epoch}/{EPOCHS}",
+                desc=f"New Topology epoch {epoch}/{EPOCHS}",
                 disable=not main_process,
                 dynamic_ncols=True,
             )
@@ -490,11 +489,11 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad(), torch.amp.autocast("cuda", enabled=True):
                     structure_output = structure_forward(structure, batch)
-                # Explicit detach guarantees no accidental gradient enters V27.
+                # Explicit detach guarantees no accidental gradient enters Geometry.
                 structure_output = {key: value.detach() for key, value in structure_output.items()}
                 with torch.amp.autocast("cuda", enabled=True):
                     output = filler_forward(filler, batch, structure_output)
-                    loss, parts = new_v13_loss(output, batch)
+                    loss, parts = new_topology_loss(output, batch)
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(filler.parameters(), GRAD_CLIP)
@@ -552,12 +551,12 @@ def main():
                 raw = filler.module if isinstance(filler, DDP) else filler
                 save_checkpoint(
                     last_path, raw, ema.model, optimizer, scheduler, epoch, best_val,
-                    v27_ck, source_v27, history,
+                    geometry_ck, source_geometry, history,
                 )
                 if improved:
                     save_checkpoint(
                         best_path, raw, ema.model, optimizer, scheduler, epoch, best_val,
-                        v27_ck, source_v27, history,
+                        geometry_ck, source_geometry, history,
                     )
 
                 with history_path.open("w", newline="", encoding="utf-8") as handle:
@@ -581,7 +580,7 @@ def main():
                 break
 
         if main_process:
-            print("New V13 training complete:", best_path)
+            print("New Topology training complete:", best_path)
     finally:
         cleanup(distributed)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Train TPSSR V13 Topology-First from scratch.
+"""Train the TPSSR topology-completion model.
 
 Topology-First makes a skeleton/centerline the primary hidden representation.
 Support is derived from skeleton + width, polarity is a single signed variable,
@@ -31,10 +31,10 @@ from tqdm import tqdm
 
 import config
 from src.evaluation_utils import load_global_training_data
-from src.new_v13_topology_first_filler import TopologyFirstV13Filler
+from src.topology_completion import TopologyCompletionNetwork
 
-METHOD_DIR = CORE / "reconstruction_methods" / "texture_restoration_router_rf_v2"
-METHOD = "texture_restoration_router_rf_v2"
+METHOD_DIR = CORE / "reconstruction_methods" / "tpssr"
+METHOD = "tpssr"
 
 
 def import_file(name: str, path: Path):
@@ -45,22 +45,22 @@ def import_file(name: str, path: Path):
     return mod
 
 
-SF = import_file("topology_sf_training_helpers", METHOD_DIR / "train_new_v13_structure_first.py")
+SF = import_file("topology_sf_training_helpers", METHOD_DIR / "train_structure_first.py")
 BASE = SF.BASE
-V27 = SF.V27
+Geometry = SF.Geometry
 
-EPOCHS = int(os.environ.get("V13TF_EPOCHS", "22"))
-MIN_EPOCHS = int(os.environ.get("V13TF_MIN_EPOCHS", "14"))
-PATIENCE = int(os.environ.get("V13TF_PATIENCE", "5"))
-TRAIN_SAMPLES = int(os.environ.get("V13TF_TRAIN_SAMPLES", "4200"))
-VAL_SAMPLES = int(os.environ.get("V13TF_VAL_SAMPLES", "900"))
-BATCH_SIZE = int(os.environ.get("V13TF_BATCH_SIZE", "1"))
-NUM_WORKERS = int(os.environ.get("V13TF_NUM_WORKERS", "2"))
-LEARNING_RATE = float(os.environ.get("V13TF_LR", "9.0e-5"))
-WEIGHT_DECAY = float(os.environ.get("V13TF_WEIGHT_DECAY", "1.0e-5"))
-GRAD_CLIP = float(os.environ.get("V13TF_GRAD_CLIP", "2.0"))
-EMA_DECAY = float(os.environ.get("V13TF_EMA_DECAY", "0.995"))
-NO_RESUME = os.environ.get("V13TF_NO_RESUME", "0") == "1"
+EPOCHS = int(os.environ.get("TPSSR_TOPOLOGY_EPOCHS", "22"))
+MIN_EPOCHS = int(os.environ.get("TPSSR_TOPOLOGY_MIN_EPOCHS", "14"))
+PATIENCE = int(os.environ.get("TPSSR_TOPOLOGY_PATIENCE", "5"))
+TRAIN_SAMPLES = int(os.environ.get("TPSSR_TOPOLOGY_TRAIN_SAMPLES", "4200"))
+VAL_SAMPLES = int(os.environ.get("TPSSR_TOPOLOGY_VAL_SAMPLES", "900"))
+BATCH_SIZE = int(os.environ.get("TPSSR_TOPOLOGY_BATCH_SIZE", "1"))
+NUM_WORKERS = int(os.environ.get("TPSSR_TOPOLOGY_NUM_WORKERS", "2"))
+LEARNING_RATE = float(os.environ.get("TPSSR_TOPOLOGY_LR", "9.0e-5"))
+WEIGHT_DECAY = float(os.environ.get("TPSSR_TOPOLOGY_WEIGHT_DECAY", "1.0e-5"))
+GRAD_CLIP = float(os.environ.get("TPSSR_TOPOLOGY_GRAD_CLIP", "2.0"))
+EMA_DECAY = float(os.environ.get("TPSSR_TOPOLOGY_EMA_DECAY", "0.995"))
+NO_RESUME = os.environ.get("TPSSR_TOPOLOGY_NO_RESUME", "0") == "1"
 
 # Topology supervision deliberately dominates the representation stage.
 W_PIXEL = 0.62
@@ -171,7 +171,7 @@ def topology_targets(batch: dict) -> dict[str, torch.Tensor]:
     pol_strength = torch.sigmoid((contrast.abs() - 0.30 * std) / (0.10 * std + 0.020))
 
     edge = batch.get("edge_target")
-    gx, gy = V27.sobel_xy(target)
+    gx, gy = Geometry.sobel_xy(target)
     if edge is None:
         mag = torch.sqrt(gx.square() + gy.square() + 1e-8)
         lm = F.avg_pool2d(mag, 9, 1, 4)
@@ -251,9 +251,9 @@ def final_signed_polarity_loss(pred: torch.Tensor, t: dict, mask: torch.Tensor) 
         return masked_mean(reg + 0.75 * sign_hinge, w)
 
 
-def topology_first_loss(output: dict, batch: dict, v27_structure: dict):
+def topology_first_loss(output: dict, batch: dict, geometry_structure: dict):
     base_out = {"prediction": output["prediction"], "coarse_prediction": output["prediction"]}
-    base_loss, base_parts = V27.reconstruction_loss(base_out, batch)
+    base_loss, base_parts = Geometry.reconstruction_loss(base_out, batch)
 
     target = batch["target"]; mask = batch["mask"]
     t = topology_targets(batch); inner = inner_mask(mask)
@@ -304,13 +304,13 @@ def topology_first_loss(output: dict, batch: dict, v27_structure: dict):
         + masked_mean((high_pass(output["prediction"], 7) - high_pass(target, 7)).abs(), grad_mask)
     )
 
-    gx, gy = V27.sobel_xy(output["prediction"])
+    gx, gy = Geometry.sobel_xy(output["prediction"])
     den = gx.square() + gy.square() + 1e-6
     cos2 = (gx.square() - gy.square()) / den
     sin2 = (2.0 * gx * gy) / den
-    guide = v27_structure["orientation"].detach()
+    guide = geometry_structure["orientation"].detach()
     guide_dot = (cos2 * guide[:, 0:1] + sin2 * guide[:, 1:2]).clamp(-1.0, 1.0)
-    guide_orient = masked_mean(1.0 - guide_dot, mask * (0.15 + v27_structure["edge_prob"].detach()))
+    guide_orient = masked_mean(1.0 - guide_dot, mask * (0.15 + geometry_structure["edge_prob"].detach()))
 
     total = (
         base_loss + W_PIXEL * pixel
@@ -381,18 +381,18 @@ def evaluate(model, structure_net, loader, device):
     return result
 
 
-def save_checkpoint(path, raw, ema, opt, sched, epoch, best_val, v27_ck, v27_path, history):
+def save_checkpoint(path, raw, ema, opt, sched, epoch, best_val, geometry_ck, geometry_path, history):
     torch.save({
-        "architecture": TopologyFirstV13Filler.ARCHITECTURE_VERSION,
+        "architecture": TopologyCompletionNetwork.ARCHITECTURE_VERSION,
         "epoch": int(epoch), "best_val": float(best_val),
-        "patch_size": int(v27_ck.get("patch_size", 65)),
-        "n_bands": int(v27_ck["n_bands"]),
-        "band_mean": np.asarray(v27_ck["band_mean"], np.float32),
-        "band_std": np.asarray(v27_ck["band_std"], np.float32),
-        "wavelengths_nm": np.asarray(v27_ck["wavelengths_nm"], np.float32),
-        "source_v27_checkpoint": str(v27_path),
-        "uses_v27_final_reconstruction": False,
-        "warm_started_from_previous_v13": False,
+        "patch_size": int(geometry_ck.get("patch_size", 65)),
+        "n_bands": int(geometry_ck["n_bands"]),
+        "band_mean": np.asarray(geometry_ck["band_mean"], np.float32),
+        "band_std": np.asarray(geometry_ck["band_std"], np.float32),
+        "wavelengths_nm": np.asarray(geometry_ck["wavelengths_nm"], np.float32),
+        "source_geometry_checkpoint": str(geometry_path),
+        "uses_geometry_final_reconstruction": False,
+        "warm_started_from_previous_topology": False,
         "model_state_dict": ema.state_dict(),
         "train_model_state_dict": raw.state_dict(),
         "optimizer_state_dict": opt.state_dict(), "scheduler_state_dict": sched.state_dict(),
@@ -405,7 +405,7 @@ def save_checkpoint(path, raw, ema, opt, sched, epoch, best_val, v27_ck, v27_pat
             "transport_temperature": float(raw.transport_temperature),
             "radiometry_delta_scale": float(raw.radiometry_delta_scale), "detail_scale": float(raw.detail_scale),
             "epochs": int(EPOCHS), "train_samples": int(TRAIN_SAMPLES), "val_samples": int(VAL_SAMPLES),
-            "v27_stage_a_frozen": True, "v27_final_output_used": False, "v16_used": False,
+            "geometry_frozen": True, "geometry_final_output_used": False, "detail_refinement_used": False,
             "bridge_used": False, "selector_used": False, "topology_decoder_native_resolution": True,
             "topology_first": True, "support_derived_from_skeleton_width": True,
             "single_signed_polarity": True, "cldice_supervision": True,
@@ -419,22 +419,22 @@ def main():
     try:
         BASE.set_seed(SEED + rank)
         train_cubes, val_cubes, wavelengths = load_global_training_data()
-        v27_path = BASE.v27_checkpoint_path(); v27_ck = BASE.torch_load(v27_path, "cpu")
-        if int(v27_ck["n_bands"]) != int(train_cubes[0].shape[-1]):
-            raise RuntimeError("V27 spectral dimension differs from current fold")
-        if not np.allclose(np.asarray(v27_ck["wavelengths_nm"]), np.asarray(wavelengths), atol=1e-3, rtol=0):
-            raise RuntimeError("V27 wavelength grid differs from current fold")
+        geometry_path = BASE.geometry_checkpoint_path(); geometry_ck = BASE.torch_load(geometry_path, "cpu")
+        if int(geometry_ck["n_bands"]) != int(train_cubes[0].shape[-1]):
+            raise RuntimeError("Geometry spectral dimension differs from current fold")
+        if not np.allclose(np.asarray(geometry_ck["wavelengths_nm"]), np.asarray(wavelengths), atol=1e-3, rtol=0):
+            raise RuntimeError("Geometry wavelength grid differs from current fold")
 
-        structure_net, structure_ch = BASE.build_frozen_structure(v27_ck, device)
-        mean = np.asarray(v27_ck["band_mean"], np.float32); std = np.asarray(v27_ck["band_std"], np.float32)
-        train_ds = V27.V27LearnedCorrespondenceDataset(train_cubes, mean, std, TRAIN_SAMPLES, SEED + 101, True)
-        val_ds = V27.V27LearnedCorrespondenceDataset(val_cubes, mean, std, VAL_SAMPLES, SEED + 202, False) if main_process else None
+        structure_net, structure_ch = BASE.build_frozen_structure(geometry_ck, device)
+        mean = np.asarray(geometry_ck["band_mean"], np.float32); std = np.asarray(geometry_ck["band_std"], np.float32)
+        train_ds = Geometry.GeometryLearnedCorrespondenceDataset(train_cubes, mean, std, TRAIN_SAMPLES, SEED + 101, True)
+        val_ds = Geometry.GeometryLearnedCorrespondenceDataset(val_cubes, mean, std, VAL_SAMPLES, SEED + 202, False) if main_process else None
         sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=SEED) if distributed else None
         train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=sampler is None, sampler=sampler,
                                   num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False)
         val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True) if main_process else None
 
-        raw = TopologyFirstV13Filler(int(v27_ck["n_bands"]), structure_ch).to(device)
+        raw = TopologyCompletionNetwork(int(geometry_ck["n_bands"]), structure_ch).to(device)
         ema = EMA(raw, EMA_DECAY)
         model = DDP(raw, device_ids=[local_rank], broadcast_buffers=False) if distributed else raw
         opt = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -442,7 +442,7 @@ def main():
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
         tag = str(config.TEST_DATASET_FOLDER).lower()
-        outdir = Path(config.MODELS_DIR) / METHOD / f"new_v13_topology_first_{tag}"
+        outdir = Path(config.MODELS_DIR) / METHOD / f"topology_{tag}"
         if main_process: outdir.mkdir(parents=True, exist_ok=True)
         if distributed: dist.barrier()
         last_path, best_path = outdir / "last_model.pt", outdir / "best_model.pt"
@@ -463,10 +463,10 @@ def main():
         if main_process:
             trainable = sum(p.numel() for p in raw.parameters() if p.requires_grad)
             frozen = sum(p.numel() for p in structure_net.parameters())
-            print("V13 TOPOLOGY-FIRST — SKELETON -> SIGNED POLARITY -> RADIOMETRY -> TEXTURE")
-            print(f"Frozen V27 Stage-A: {frozen/1e6:.3f} M | Trainable Topology-First V13: {trainable/1e6:.3f} M")
+            print("Topology TOPOLOGY-FIRST — SKELETON -> SIGNED POLARITY -> RADIOMETRY -> TEXTURE")
+            print(f"Frozen Geometry Stage-A: {frozen/1e6:.3f} M | Trainable Topology-First Topology: {trainable/1e6:.3f} M")
             print("Training FROM SCRATCH. Support is derived from skeleton+width; dark/bright are one signed polarity.")
-            print("No V27 final image, no V16, no bridge/trace/selector/post-fill.")
+            print("No Geometry final image, no Refinement, no bridge/trace/selector/post-fill.")
             print(f"Epochs={EPOCHS} train_samples={TRAIN_SAMPLES} val_samples={VAL_SAMPLES} world_size={world_size}")
 
         for epoch in range(start, EPOCHS + 1):
@@ -505,8 +505,8 @@ def main():
                 if improved: best, no_improve = val["loss"], 0
                 else: no_improve += 1
                 current = model.module if isinstance(model, DDP) else model
-                save_checkpoint(last_path, current, ema.model, opt, sched, epoch, best, v27_ck, v27_path, history)
-                if improved: save_checkpoint(best_path, current, ema.model, opt, sched, epoch, best, v27_ck, v27_path, history)
+                save_checkpoint(last_path, current, ema.model, opt, sched, epoch, best, geometry_ck, geometry_path, history)
+                if improved: save_checkpoint(best_path, current, ema.model, opt, sched, epoch, best, geometry_ck, geometry_path, history)
                 with hist_path.open("w", newline="", encoding="utf-8") as f:
                     wr = csv.DictWriter(f, fieldnames=list(row.keys())); wr.writeheader(); wr.writerows(history)
                 print(f"Epoch {epoch}: train={train_loss:.6f} val={val['loss']:.6f} pixel={val['pixel']:.4f} skelDiceLoss={val['skel_dice']:.4f} clDiceLoss={val['cldice']:.4f} polarity={val['final_polarity']:.4f}")
@@ -518,7 +518,7 @@ def main():
                 break
 
         if main_process:
-            print("Topology-First V13 training complete:", best_path)
+            print("Topology-First Topology training complete:", best_path)
     finally:
         BASE.cleanup(distributed)
 

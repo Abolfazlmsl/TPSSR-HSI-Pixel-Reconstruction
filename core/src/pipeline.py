@@ -1,9 +1,8 @@
-"""TPSSR final two-Expert runtime: Hybrid V2 + Region, V2.2/V2.3 policy.
+"""TPSSR reconstruction pipeline with spectral and spatial experts.
 
-No Deep-v3.1 or learned router is imported or instantiated.
-Region weights and Hybrid V2 weights are unchanged.
-V2.3 is the controlled routing/local-median postprocessing of the V2.2
-prediction, using only originally observable data.
+The confidence gate reconstructs spectrally supported pixels. A fixed,
+observed-only routing policy directs spatially difficult cases to the
+geometry-guided topology model. No additional learned router is required.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -13,47 +12,42 @@ import torch
 import config
 from src.component_routing_utils import connected_components_4
 from src.evaluation_utils import regression_metrics
-from src.final_tpssr_runtime import (
+from src.spatial_inference import (
     load_models as load_final_region_models,
     reconstruct_mask as reconstruct_final_region,
     torch_load,
 )
 
 @dataclass
-class FinalPipeline:
+class ModelBundle:
+    """Inference models and measured-spectra normalization parameters."""
+
     device: torch.device
-    deep_model: object
-    deep_checkpoint: dict
-    deep_path: Path
-    router_model: object
-    router_checkpoint: dict
-    router_path: Path
-    gate_threshold: float
     topology_model: torch.nn.Module
     topology_checkpoint: dict
     topology_path: Path
-    v27_model: torch.nn.Module
-    v27_path: Path
-    deep_batch: int = 16
+    geometry_model: torch.nn.Module
+    geometry_path: Path
+    hybrid_model: torch.nn.Module
+    hybrid_mean: np.ndarray
+    hybrid_std: np.ndarray
+    hybrid_wave_norm: np.ndarray
+    hybrid_gate_checkpoint_path: Path
+    hybrid_backbone_checkpoint_path: Path
     region_batch: int = 32
     verify_region_batch: bool = True
-    routing_mode: str = "hybrid_v2_region_2expert_v23"
-    hybrid_model: torch.nn.Module | None = None
-    hybrid_mean: np.ndarray | None = None
-    hybrid_std: np.ndarray | None = None
-    hybrid_wave_norm: np.ndarray | None = None
-    hybrid_gate_checkpoint_path: Path | None = None
-    hybrid_backbone_checkpoint_path: Path | None = None
     hybrid_batch: int = 32
+    routing_mode: str = "tpssr"
+
 
 def _load_accepted_spectral_hybrid_v2(device):
-    """Load exactly the validated BAND gate plus its SHA256-pinned V1 backbone."""
+    """Load the trained band-wise confidence gate and its pinned backbone."""
     # These are the same classes that produced the benchmarked 200-mask V2
     # ablation; no reimplementation or silent substitution of weights.
-    from train_spectral_hybrid_gate_v2 import FrozenHybridGated, TRAIN_CORES, VALID_CORES, sha
+    from training.spectral_gate import FrozenHybridGated, TRAIN_CORES, VALID_CORES, sha
 
-    parent = Path(config.MODELS_DIR) / 'texture_restoration_router_rf_v2'
-    gate_path = parent / 'spectral_hybrid_gate_v2' / 'band' / 'best_model.pt'
+    parent = Path(config.MODELS_DIR) / 'tpssr'
+    gate_path = parent / 'spectral_gate' / 'band' / 'best_model.pt'
     if not gate_path.is_file():
         raise FileNotFoundError('Accepted Hybrid V2 band checkpoint missing: ' + str(gate_path))
     gate = torch_load(gate_path, 'cpu')
@@ -62,7 +56,7 @@ def _load_accepted_spectral_hybrid_v2(device):
     if tuple(gate['run_config']['train_cores']) != tuple(TRAIN_CORES) or tuple(gate['run_config']['val_cores']) != tuple(VALID_CORES):
         raise RuntimeError('Hybrid checkpoint train/validation split mismatch.')
     # Validate both the V1 checkpoint and the resulting model wavelengths.
-    base_guess = parent / 'spectral_architecture_compare_v1' / 'hybrid' / 'diagnostic_best_val.pt'
+    base_guess = parent / 'spectral_backbone' / 'hybrid' / 'diagnostic_best_val.pt'
     candidates = [Path(gate.get('backbone_checkpoint') or base_guess), base_guess,
                   base_guess.with_name('best_model.pt')]
     backbone_path = next((p for p in candidates if p.is_file() and sha(p) == gate['backbone_sha256']), None)
@@ -97,7 +91,7 @@ def _load_accepted_spectral_hybrid_v2(device):
 
 @torch.inference_mode()
 def _hybrid_replace_spectral_only(pipeline, test_cube, mask, spectral_coords):
-    """Predict only V6 final route==Spectral voxels; NEVER use masked truths."""
+    """Predict only spectral route==Spectral voxels; NEVER use masked truths."""
     coords = np.asarray(spectral_coords,dtype=np.int64)
     n = len(coords)
     if n==0:
@@ -133,26 +127,29 @@ def _hybrid_replace_spectral_only(pipeline, test_cube, mask, spectral_coords):
     values=pixel_pred[inv,coords[:,2]]
     return values,np.isfinite(values)
 
-def load_pipeline(device, deep_batch=16, region_batch=32,
-                  verify_region_batch=True, routing_mode='hybrid_v2_region_2expert_v23',
-                  **unused_legacy_options):
-    if routing_mode not in ('hybrid_v2_region_2expert_v22',
-                            'hybrid_v2_region_2expert_v23'):
-        raise ValueError('Clean release supports only final V2.3 or V2.2 reference.')
-    hybrid,mean,std,wave,gate_path,backbone_path = _load_accepted_spectral_hybrid_v2(device)
-    topology,topology_ck,v27,_v27_ck,topology_path,v27_path = load_final_region_models(device)
-    return FinalPipeline(
-        device=device, deep_model=None,deep_checkpoint={},
-        deep_path=Path('not_used_2expert'),router_model=None,
-        router_checkpoint={},router_path=Path('not_used_2expert'),
-        gate_threshold=float('nan'),topology_model=topology,
-        topology_checkpoint=topology_ck,topology_path=Path(topology_path),
-        v27_model=v27,v27_path=Path(v27_path),deep_batch=int(deep_batch),
-        region_batch=int(region_batch),verify_region_batch=bool(verify_region_batch),
-        routing_mode=routing_mode,hybrid_model=hybrid,hybrid_mean=mean,
-        hybrid_std=std,hybrid_wave_norm=wave,
+def load_pipeline(device, region_batch=32, verify_region_batch=True):
+    """Load the spectral and topology-guided spatial experts."""
+    hybrid, mean, std, wave, gate_path, backbone_path = _load_accepted_spectral_hybrid_v2(device)
+    topology, checkpoint, geometry, _geometry_checkpoint, topology_path, geometry_path = (
+        load_final_region_models(device)
+    )
+    return ModelBundle(
+        device=device,
+        topology_model=topology,
+        topology_checkpoint=checkpoint,
+        topology_path=Path(topology_path),
+        geometry_model=geometry,
+        geometry_path=Path(geometry_path),
+        hybrid_model=hybrid,
+        hybrid_mean=mean,
+        hybrid_std=std,
+        hybrid_wave_norm=wave,
         hybrid_gate_checkpoint_path=gate_path,
-        hybrid_backbone_checkpoint_path=backbone_path)
+        hybrid_backbone_checkpoint_path=backbone_path,
+        region_batch=int(region_batch),
+        verify_region_batch=bool(verify_region_batch),
+    )
+
 
 def sparse_band_predictions(coords, pred):
     coords = np.asarray(coords, dtype=np.int64)
@@ -174,7 +171,7 @@ def subset_rmse(truth, pred, use):
     )
 
 @torch.inference_mode()
-def _predict_mask_hybrid_region_2expert(
+def _predict_base_routes(
     pipeline, test_cube, mask, eval_coords, region_progress=None
 ):
     """A *mask-feasibility* ablation with only frozen Hybrid and frozen Region.
@@ -206,16 +203,16 @@ def _predict_mask_hybrid_region_2expert(
 
     # v2.0 remains untouched; v2.1 uses a frozen mask-geometry policy.
     # The new policy never accesses truth inside the mask or outcome labels.
-    v21 = pipeline.routing_mode == "hybrid_v2_region_2expert_v21"
-    v22 = pipeline.routing_mode == "hybrid_v2_region_2expert_v22"
-    gap_policy = v21 or v22
+    support = pipeline.routing_mode == "reference"
+    guard = pipeline.routing_mode == "base"
+    gap_policy = support or guard
     spatial_mask = np.any(mask, axis=2)
     observed_counts = np.sum((~mask) & np.isfinite(test_cube), axis=2, dtype=np.int32)
     if gap_policy:
-        if v22:
-            from src.spectral_route_policy_v22 import expert_eligibility_maps
+        if guard:
+            from src.routing_guard import expert_eligibility_maps
         else:
-            from src.spectral_route_policy_v21 import expert_eligibility_maps
+            from src.routing_support import expert_eligibility_maps
         can_hybrid, no_anchor_region, gap_region, policy_audit = (
             expert_eligibility_maps(mask, test_cube)
         )
@@ -223,7 +220,7 @@ def _predict_mask_hybrid_region_2expert(
         eligibility_classes = (
             (0, can_hybrid, "hybrid_spectral_information_sufficient"),
             (2, no_anchor_region, "region_lt_2_observed_bands"),
-            (2, gap_region, "region_long_gap_with_local_support_and_true_mask_purity" if v22 else "region_long_gap_with_local_observed_neighbors"),
+            (2, gap_region, "region_long_gap_with_local_support_and_true_mask_purity" if guard else "region_long_gap_with_local_observed_neighbors"),
         )
     else:
         can_hybrid = spatial_mask & (observed_counts >= 2)
@@ -278,7 +275,7 @@ def _predict_mask_hybrid_region_2expert(
             "baseline_final": int(route_id),
             "spectral_safe_override": 0,
             "stage1_spectral_override": 0,
-            "stage1_decision_reason": "v22_true_mask_gap_purity_guard" if v22 else "v21_spectral_gap_spatial_support" if v21 else "observed_band_availability_only",
+            "stage1_decision_reason": "guard_true_mask_gap_purity_guard" if guard else "support_spectral_gap_spatial_support" if support else "observed_band_availability_only",
             "region_decision_reason": description,
             "guard_protected": 0,
             "guard_reason": "not_used_mask_feasibility_ablation",
@@ -307,7 +304,7 @@ def _predict_mask_hybrid_region_2expert(
         reconstructed, _ = reconstruct_final_region(
             pipeline.topology_model,
             pipeline.topology_checkpoint,
-            pipeline.v27_model,
+            pipeline.geometry_model,
             test_cube,
             mask,
             pipeline.device,
@@ -330,7 +327,7 @@ def _predict_mask_hybrid_region_2expert(
             "evaluation voxels unfilled."
         )
     if np.any(final_route == 1):
-        raise AssertionError("Deep-v3.1 was selected in Hybrid/Region ablation.")
+        raise AssertionError("disabled expert was selected in Hybrid/Region ablation.")
 
     return {
         "prediction": prediction,
@@ -346,23 +343,23 @@ def _predict_mask_hybrid_region_2expert(
         "hybrid_changed_voxels": int(len(hybrid_idx)),
         "hybrid_fallback_voxels": 0,
         "v6_fixed_reference_prediction": None,
-        "v21_policy_audit": policy_audit,
-        "v21_region_gap_eval_voxels": int(np.sum(gap_region[coords[:, 0], coords[:, 1]])) if gap_policy else 0,
-        "v22_policy_audit": policy_audit if v22 else {},
-        "v22_region_gap_eval_voxels": int(np.sum(gap_region[coords[:, 0], coords[:, 1]])) if v22 else 0,
+        "support_policy_audit": policy_audit,
+        "support_region_gap_eval_voxels": int(np.sum(gap_region[coords[:, 0], coords[:, 1]])) if gap_policy else 0,
+        "guard_policy_audit": policy_audit if guard else {},
+        "guard_region_gap_eval_voxels": int(np.sum(gap_region[coords[:, 0], coords[:, 1]])) if guard else 0,
     }
 
 
-def _v23_component_rows(mask,cube,coords,extra):
+def _policy_component_rows(mask,cube,coords,extra):
     """Regenerate consistent component audit after V2.3 extra-region routes."""
-    from src.spectral_route_policy_v22 import expert_eligibility_maps
+    from src.routing_guard import expert_eligibility_maps
     hybrid,_,region,_=expert_eligibility_maps(mask,cube)
     new_hybrid=hybrid & (~extra)
     new_region=(region | extra) | (np.any(mask,axis=2) & (~hybrid) & (~region))
     observed=np.sum((~mask) & np.isfinite(cube),axis=2,dtype=np.int32)
     rows=[];cid=0
-    for final,eligible,reason in ((0,new_hybrid,'v23_hybrid_observed_spectrum'),
-                                  (2,new_region,'v23_region_gap_or_no_anchors')):
+    for final,eligible,reason in ((0,new_hybrid,'policy_hybrid_observed_spectrum'),
+                                  (2,new_region,'policy_region_gap_or_no_anchors')):
         for pixels in connected_components_4(eligible):
             pixels=np.asarray(pixels,dtype=np.int64)
             if not len(pixels):continue
@@ -375,7 +372,7 @@ def _v23_component_rows(mask,cube,coords,extra):
             rows.append(dict(component=cid,area=int(len(pixels)),eval_voxels=n_eval,
                 stage1=final,final=final,gate_probability=float(final==2),
                 baseline_stage1=final,baseline_final=final,spectral_safe_override=0,
-                stage1_spectral_override=0,stage1_decision_reason='v23_mask_geometry',
+                stage1_spectral_override=0,stage1_decision_reason='policy_mask_geometry',
                 region_decision_reason=reason,guard_protected=0,
                 guard_reason='not_used',router_predicted_spectral_error=float('nan'),
                 router_predicted_deep_error=float('nan'),
@@ -388,24 +385,19 @@ def _v23_component_rows(mask,cube,coords,extra):
 @torch.inference_mode()
 def predict_mask(pipeline, test_cube, mask, eval_coords,
                  preview_progress=None, region_progress=None):
-    if pipeline.routing_mode == 'hybrid_v2_region_2expert_v22':
-        return _predict_mask_hybrid_region_2expert(
-            pipeline,test_cube,mask,eval_coords,region_progress=region_progress)
-    if pipeline.routing_mode != 'hybrid_v2_region_2expert_v23':
-        raise ValueError('Unknown two-Expert mode.')
-    from src.spectral_route_policy_v23 import route_extra_region,local_neighbor_median
-    from src.spectral_route_policy_v22 import expert_eligibility_maps
+    from src.routing_policy import route_extra_region,local_neighbor_median
+    from src.routing_guard import expert_eligibility_maps
     coords=np.asarray(eval_coords,np.int64)
     mask=np.asarray(mask,bool)
-    # Original V2.2 is computed with precisely the same frozen weights and
-    # original V2.2 decisions. This is required for controlled parity.
-    orig_mode=pipeline.routing_mode
+    # Compute the observed-only base routing before applying the local policy.
+    original_mode = pipeline.routing_mode
+    pipeline.routing_mode = 'base'
     try:
-        pipeline.routing_mode='hybrid_v2_region_2expert_v22'
-        out=_predict_mask_hybrid_region_2expert(
-            pipeline,test_cube,mask,coords,region_progress=region_progress)
+        out = _predict_base_routes(
+            pipeline, test_cube, mask, coords, region_progress=region_progress
+        )
     finally:
-        pipeline.routing_mode=orig_mode
+        pipeline.routing_mode = original_mode
     base=np.asarray(out['prediction'],np.float32)
     old_route=np.asarray(out['final_route'],np.int64)
     eligible_hybrid,_,_,_=expert_eligibility_maps(mask,test_cube)
@@ -415,7 +407,7 @@ def predict_mask(pipeline, test_cube, mask, eval_coords,
     if np.any(add):
         rebuilt,_=reconstruct_final_region(
             pipeline.topology_model,pipeline.topology_checkpoint,
-            pipeline.v27_model,test_cube,mask,pipeline.device,
+            pipeline.geometry_model,test_cube,mask,pipeline.device,
             eval_coords=coords[add],batch_size=pipeline.region_batch,
             verify_batch=pipeline.verify_region_batch,
             progress_desc=region_progress or 'V2.3 extra Region')
@@ -443,9 +435,9 @@ def predict_mask(pipeline, test_cube, mask, eval_coords,
     out['stage1_route']=new_route.copy()
     out['spectral_available']=new_route==0
     out['gate_probability']=(new_route==2).astype(np.float32)
-    out['component_records']=_v23_component_rows(mask,test_cube,coords,extra)
-    out['v23_policy_audit']=dict(**stats,**median_stats,
+    out['component_records']=_policy_component_rows(mask,test_cube,coords,extra)
+    out['routing_audit']=dict(**stats,**median_stats,
                additional_region_voxels=int(add.sum()),
                local_median_voxels=int(use.sum()))
-    out['v23_baseline_v22_prediction']=base
+    out['policy_baseline_guard_prediction']=base
     return out

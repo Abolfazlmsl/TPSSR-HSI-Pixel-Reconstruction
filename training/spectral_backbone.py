@@ -4,9 +4,9 @@
 
 One independent process per GPU (CNN GPU 0, Hybrid GPU 1); no NCCL or DDP.
 This file is standalone ADDITION to project root; it imports the EXISTING
-train_spectral_transformer.py's trusted data/mask helpers.
+training/spectral_data.py's trusted data/mask helpers.
 No access to SWIR5/SWIR10; cross-acquisition validation SWIR4/SWIR9.
-Run: python train_spectral_arch_compare.py --preset swir_8x2 --gpus 2 ...
+Run: python training/spectral_backbone.py --preset swir_8x2 --gpus 2 ...
 """
 from __future__ import annotations
 import argparse
@@ -27,7 +27,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / 'core'
 for p in (str(ROOT), str(CORE)):
     if p not in sys.path: sys.path.insert(0,p)
@@ -35,12 +35,12 @@ for p in (str(ROOT), str(CORE)):
 from experiment_config import add_experiment_args, resolve_experiment
 from _launcher_common import env_for
 try:
-    from train_spectral_transformer import (
+    from training.spectral_data import (
         SpectraDataset, load_core_data, make_stats, FAMILIES,
         band_mask, interpolate_raw
     )
 except ImportError as exc:
-    raise RuntimeError('Keep the existing train_spectral_transformer.py next to this file.') from exc
+    raise RuntimeError('Keep the existing training/spectral_data.py next to this file.') from exc
 
 MODEL_NAMES = ('cnn', 'hybrid')
 
@@ -259,8 +259,8 @@ def run_worker(args):
     val_cores=tuple(c.upper() for c in args.val_cores)
     train_names, train_c,tr_i,val_c,val_i,wave=load_core_data(spec,val_cores)
     model_name=args.worker_model
-    output=(Path(config.MODELS_DIR)/'texture_restoration_router_rf_v2'
-        /'spectral_architecture_compare_v1'/model_name)
+    output=(Path(config.MODELS_DIR)/'tpssr'
+        /'spectral_backbone'/model_name)
     output.mkdir(parents=True,exist_ok=True)
     last_path=output/'last_model.pt';best_path=output/'best_model.pt'
     candidate_path=output/'diagnostic_best_val.pt'
@@ -367,7 +367,7 @@ def run_worker(args):
 def combine(args):
     import config
     results=[]
-    parent=Path(config.MODELS_DIR)/'texture_restoration_router_rf_v2'/'spectral_architecture_compare_v1'
+    parent=Path(config.MODELS_DIR)/'tpssr'/'spectral_backbone'
     for name in MODEL_NAMES:
         folder=parent/name
         path=folder/'best_model.pt'

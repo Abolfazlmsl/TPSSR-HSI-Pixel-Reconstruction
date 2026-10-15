@@ -1,8 +1,7 @@
-"""Final TPSSR runtime: frozen V27 Stage-A + V13 TopologyFirst V1.
+"""Geometry-guided reconstruction of missing hyperspectral measurements.
 
-This module intentionally excludes all abandoned experimental branches.
-V27 contributes *only* Stage-A structural guidance. Its final reconstruction is
-never used. V13 TopologyFirst V1 produces the final reconstructed values.
+The geometry model provides structural features. The topology network
+produces reconstructed reflectance without accessing masked target values.
 """
 from __future__ import annotations
 
@@ -22,18 +21,16 @@ HERE = Path(__file__).resolve()
 CORE = next(p for p in HERE.parents if (p / "config.py").exists())
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
-METHOD_DIR = CORE / "reconstruction_methods" / "texture_restoration_router_rf_v2"
+METHOD_DIR = CORE / "reconstruction_methods" / "tpssr"
 if str(METHOD_DIR) not in sys.path:
     sys.path.insert(0, str(METHOD_DIR))
 
 import config
 from src.evaluation_utils import regression_metrics, spectral_angle_metrics
-from src.new_v13_topology_first_filler import TopologyFirstV13Filler
-from src.original_v13_v16_settings import apply_original_region_settings
+from src.topology_completion import TopologyCompletionNetwork
 
-apply_original_region_settings(config)
 
-METHOD = "texture_restoration_router_rf_v2"
+METHOD = "tpssr"
 
 
 def _import_file(name: str, path: Path):
@@ -44,9 +41,9 @@ def _import_file(name: str, path: Path):
     return mod
 
 
-V27_ARCH = _import_file(
-    "final_tpssr_v27_arch",
-    METHOD_DIR / "train_swir1_v27_learned_correspondence.py",
+GEOMETRY_ARCH = _import_file(
+    "final_tpssr_geometry_arch",
+    METHOD_DIR / "train_geometry.py",
 )
 
 
@@ -62,16 +59,16 @@ def _dataset_tag() -> str:
 
 
 def topology_checkpoint_path() -> Path:
-    return Path(config.MODELS_DIR) / METHOD / f"new_v13_topology_first_{_dataset_tag()}" / "best_model.pt"
+    return Path(config.MODELS_DIR) / METHOD / f"topology_{_dataset_tag()}" / "best_model.pt"
 
 
-def _candidate_v27_paths(topology_ck: dict | None = None) -> list[Path]:
+def _candidate_geometry_paths(topology_ck: dict | None = None) -> list[Path]:
     root = Path(config.MODELS_DIR) / METHOD
     tag = _dataset_tag()
     candidates: list[Path] = []
 
     if topology_ck is not None:
-        src = topology_ck.get("source_v27_checkpoint")
+        src = topology_ck.get("source_geometry_checkpoint")
         if src:
             p = Path(str(src))
             candidates.append(p)
@@ -80,8 +77,7 @@ def _candidate_v27_paths(topology_ck: dict | None = None) -> list[Path]:
                 candidates.append(root / p.parent.name / p.name)
 
     candidates += [
-        root / f"region_v27_original_{tag}_dev_2gpu" / "best_model.pt",
-        root / f"region_v27_learned_correspondence_{tag}_dev_2gpu" / "best_model.pt",
+        root / f"geometry_{tag}" / "best_model.pt",
     ]
 
     unique = []
@@ -97,21 +93,21 @@ def _candidate_v27_paths(topology_ck: dict | None = None) -> list[Path]:
 def load_models(device: torch.device):
     """Load the exact final architecture.
 
-    Returns: topology_model, topology_checkpoint, v27_model, v27_checkpoint,
-    topology_path, v27_path.
+    Returns: topology_model, topology_checkpoint, geometry_model, geometry_checkpoint,
+    topology_path, geometry_path.
     """
     tf_path = topology_checkpoint_path()
     if not tf_path.exists():
         raise FileNotFoundError(
-            f"TopologyFirst V1 checkpoint not found: {tf_path}\n"
-            "Train it with train_final_tpssr.py (or the legacy run_new_v13_topology_first.py)."
+            f"Topology completion checkpoint not found: {tf_path}\n"
+            "Run train.py before inference, or restore the trained checkpoints."
         )
     tf_ck = torch_load(tf_path, "cpu")
-    if bool(tf_ck.get("uses_v27_final_reconstruction", False)):
-        raise RuntimeError("Final TPSSR requires V27 Stage-A guidance only, not V27 final reconstruction.")
+    if bool(tf_ck.get("uses_geometry_final_reconstruction", False)):
+        raise RuntimeError("Final TPSSR requires Geometry Stage-A guidance only, not Geometry final reconstruction.")
 
     s = tf_ck["settings"]
-    tf_model = TopologyFirstV13Filler(
+    tf_model = TopologyCompletionNetwork(
         n_bands=int(tf_ck["n_bands"]),
         structure_feature_channels=int(s["structure_feature_channels"]),
         spectral_width=int(s["spectral_width"]),
@@ -127,25 +123,25 @@ def load_models(device: torch.device):
     tf_model.load_state_dict(tf_ck["model_state_dict"], strict=True)
     tf_model.eval()
 
-    v27_path = next((p for p in _candidate_v27_paths(tf_ck) if p.exists()), None)
-    if v27_path is None:
-        tried = "\n".join(str(p) for p in _candidate_v27_paths(tf_ck))
-        raise FileNotFoundError(f"V27 Stage-A checkpoint not found. Tried:\n{tried}")
-    v27_ck = torch_load(v27_path, "cpu")
-    vs = v27_ck["settings"]
-    v27_model = V27_ARCH.V27LearnedCorrespondenceRegionModel(
-        n_bands=int(v27_ck["n_bands"]),
+    geometry_path = next((p for p in _candidate_geometry_paths(tf_ck) if p.exists()), None)
+    if geometry_path is None:
+        tried = "\n".join(str(p) for p in _candidate_geometry_paths(tf_ck))
+        raise FileNotFoundError(f"Geometry Stage-A checkpoint not found. Tried:\n{tried}")
+    geometry_ck = torch_load(geometry_path, "cpu")
+    vs = geometry_ck["settings"]
+    geometry_model = GEOMETRY_ARCH.GeometryGuidanceModel(
+        n_bands=int(geometry_ck["n_bands"]),
         spectral_width=int(vs["spectral_width"]),
         base_width=int(vs["base_width"]),
         attention_heads=int(vs["attention_heads"]),
     ).to(device)
-    v27_model.load_state_dict(v27_ck["model_state_dict"], strict=True)
-    v27_model.eval()
+    geometry_model.load_state_dict(geometry_ck["model_state_dict"], strict=True)
+    geometry_model.eval()
 
-    if int(v27_ck["n_bands"]) != int(tf_ck["n_bands"]):
-        raise RuntimeError("V27 and TopologyFirst checkpoints have different spectral dimensions.")
+    if int(geometry_ck["n_bands"]) != int(tf_ck["n_bands"]):
+        raise RuntimeError("Geometry and TopologyFirst checkpoints have different spectral dimensions.")
 
-    return tf_model, tf_ck, v27_model, v27_ck, tf_path, v27_path
+    return tf_model, tf_ck, geometry_model, geometry_ck, tf_path, geometry_path
 
 
 def comps4(mask2d: np.ndarray) -> list[np.ndarray]:
@@ -258,7 +254,7 @@ def prepare_patch(test: np.ndarray, full_mask: np.ndarray, band: int, comp: np.n
 @torch.inference_mode()
 def _run_task_batch(
     tf_model,
-    v27_model,
+    geometry_model,
     tasks,
     device: torch.device,
     verify_state: dict | None = None,
@@ -282,7 +278,7 @@ def _run_task_batch(
 
     try:
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            structure = v27_model.structure_net(**batch)
+            structure = geometry_model.structure_net(**batch)
             out = tf_model(structure=structure, **batch)
         pred = out["prediction"][:, 0].float().cpu().numpy()
 
@@ -294,7 +290,7 @@ def _run_task_batch(
             else:
                 single = {k: tasks[0][3][k].to(device, non_blocking=True) for k in keys}
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    s1 = v27_model.structure_net(**single)
+                    s1 = geometry_model.structure_net(**single)
                     o1 = tf_model(structure=s1, **single)
                 ref = o1["prediction"][0, 0].float().cpu().numpy()
                 diff = float(np.max(np.abs(ref - pred[0])))
@@ -321,7 +317,7 @@ def _run_task_batch(
 
 def _flush_tasks_adaptive(
     tf_model,
-    v27_model,
+    geometry_model,
     tasks,
     device: torch.device,
     verify_state: dict | None,
@@ -336,13 +332,13 @@ def _flush_tasks_adaptive(
         for i in range(0, len(tasks), cap):
             out.extend(
                 _flush_tasks_adaptive(
-                    tf_model, v27_model, tasks[i:i+cap], device, verify_state
+                    tf_model, geometry_model, tasks[i:i+cap], device, verify_state
                 )
             )
         return out
 
     try:
-        return _run_task_batch(tf_model, v27_model, tasks, device, verify_state)
+        return _run_task_batch(tf_model, geometry_model, tasks, device, verify_state)
     except RuntimeError as exc:
         msg = str(exc)
         is_oom = "out of memory" in msg.lower() and device.type == "cuda"
@@ -368,7 +364,7 @@ def _flush_tasks_adaptive(
         for i in range(0, len(tasks), new_cap):
             out.extend(
                 _flush_tasks_adaptive(
-                    tf_model, v27_model, tasks[i:i+new_cap], device, verify_state
+                    tf_model, geometry_model, tasks[i:i+new_cap], device, verify_state
                 )
             )
         return out
@@ -512,7 +508,7 @@ def _selected_component_specs(mask3d: np.ndarray, eval_coords: np.ndarray, patch
 def reconstruct_mask(
     tf_model,
     tf_ck: dict,
-    v27_model,
+    geometry_model,
     test: np.ndarray,
     mask3d: np.ndarray,
     device: torch.device,
@@ -544,7 +540,7 @@ def reconstruct_mask(
     # Historical benchmark protocol: score only select_eval_coords(), but keep
     # the COMPLETE corruption mask as model context.  This is the key speed fix
     # for sparse scenarios such as isolated_voxels: unscored disconnected holes
-    # no longer trigger expensive V27+V13 forwards.
+    # no longer trigger expensive Geometry+Topology forwards.
     if eval_coords is not None:
         eval_coords = np.asarray(eval_coords, dtype=np.int64)
         if eval_coords.ndim != 2 or (eval_coords.size and eval_coords.shape[1] != 3):
@@ -613,7 +609,7 @@ def reconstruct_mask(
             pending.append((band, comp, selected_coords, tensors, meta))
             if len(pending) >= batch_size:
                 n_done = len(pending)
-                outputs = _flush_tasks_adaptive(tf_model, v27_model, pending, device, verify_state)
+                outputs = _flush_tasks_adaptive(tf_model, geometry_model, pending, device, verify_state)
                 consume(pending, outputs)
                 pending.clear()
                 if inner_bar is not None:
@@ -621,7 +617,7 @@ def reconstruct_mask(
 
         if pending:
             n_done = len(pending)
-            outputs = _flush_tasks_adaptive(tf_model, v27_model, pending, device, verify_state)
+            outputs = _flush_tasks_adaptive(tf_model, geometry_model, pending, device, verify_state)
             consume(pending, outputs)
             pending.clear()
             if inner_bar is not None:

@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parent
 CORE = ROOT / "core"
 
 from _launcher_common import env_for
+from mask_budget import planned_counts
 from experiment_config import (
     add_experiment_args,
     describe,
@@ -33,7 +34,7 @@ from experiment_config import (
     resolve_experiment,
 )
 
-EVAL_PROTOCOL = "historical_sampled_spatial_v2_hierarchical_end_to_end"
+EVAL_PROTOCOL = "sampled_masked_voxel_evaluation"
 
 
 def parse_args():
@@ -41,31 +42,18 @@ def parse_args():
     add_experiment_args(p)
     p.add_argument("--gpus", type=int, default=2, choices=[1, 2])
     p.add_argument("--max-masks", type=int, default=200, help="TOTAL masks across all held-out acquisitions; 0 = all masks on every test acquisition")
-    p.add_argument("--deep-batch", type=int, default=16)
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--no-verify-region-batch", action="store_true")
     p.add_argument("--force", action="store_true", help="Recompute completed masks")
-    p.add_argument("--routing-mode", choices=["hybrid_v2_region_2expert_v22", "hybrid_v2_region_2expert_v23"],
-                   default="hybrid_v2_region_2expert_v23", help="Keep baseline intact or test the spectral guard")
-    p.add_argument("--spectral-guard-mae", type=float, default=0.08,
-                   help="Maximum mean pseudo-gap error, in normalized units")
-    p.add_argument("--spectral-guard-q80", type=float, default=0.14,
-                   help="Maximum 80th-percentile pseudo-gap error, normalized")
-    p.add_argument("--spectral-guard-confidence", type=float, default=0.50)
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
 
-def _planned_counts(total_budget, n_tests):
-    if int(total_budget) <= 0:
-        return [None] * int(n_tests)
-    base, remainder = divmod(int(total_budget), int(n_tests))
-    return [base + (1 if i < remainder else 0) for i in range(int(n_tests))]
 
 
 def launch_all_tests(args, spec):
     print(describe(spec))
-    counts = _planned_counts(args.max_masks, len(spec.tests))
+    counts = planned_counts(args.max_masks, len(spec.tests))
     offset = 0
     for i, test_name in enumerate(spec.tests, start=1):
         local_planned = counts[i - 1]
@@ -86,14 +74,8 @@ def launch_all_tests(args, spec):
             "1",
             "--max-masks",
             str(args.max_masks),
-            "--deep-batch",
-            str(args.deep_batch),
             "--region-batch",
             str(args.region_batch),
-            "--routing-mode", args.routing_mode,
-            "--spectral-guard-mae", str(args.spectral_guard_mae),
-            "--spectral-guard-q80", str(args.spectral_guard_q80),
-            "--spectral-guard-confidence", str(args.spectral_guard_confidence),
             "--worker",
         ]
         if args.no_verify_region_batch:
@@ -158,8 +140,8 @@ from src.evaluation_utils import (
     benchmark_case_index,
     experiment_progress,
 )
-from src.final_pipeline import load_pipeline, predict_mask, sparse_band_predictions, subset_rmse
-from src.final_tpssr_runtime import evaluate_reconstruction
+from src.pipeline import load_pipeline, predict_mask, sparse_band_predictions, subset_rmse
+from src.spatial_inference import evaluate_reconstruction
 
 RANK = int(os.environ.get("RANK", "0"))
 LOCAL_RANK = int(os.environ.get("LOCAL_RANK", str(RANK)))
@@ -170,7 +152,7 @@ if torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-OUTDIR = Path(config.RESULTS_DIR) / {"baseline": "final_tpssr", "spectral_safe": "final_tpssr_spectral_safe_stage1_v2", "joint_v3": "final_tpssr_joint_v3", "stage1_rank_v4": "final_tpssr_stage1_rank_v4", "spectral_region": "final_tpssr_spectral_region", "hard60_v5": "final_tpssr_hard60_v5", "hard60_v6": "final_tpssr_hard60_v6", "hard60_v6_hybrid_v2_fixed": "final_tpssr_hard60_v6_hybrid_v2_fixed", "hybrid_v2_region_2expert": "final_tpssr_hybrid_v2_region_2expert", "hybrid_v2_region_2expert_v21": "final_tpssr_hybrid_v2_region_2expert_v21", "hybrid_v2_region_2expert_v22": "final_tpssr_hybrid_v2_region_2expert_v22", "hybrid_v2_region_2expert_v23": "final_tpssr_hybrid_v2_region_2expert_v23"}[ARGS.routing_mode]
+OUTDIR = Path(config.RESULTS_DIR) / 'tpssr'
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -203,13 +185,8 @@ def write_csv(path, rows):
 def evaluate_worker(mask_files):
     pipeline = load_pipeline(
         DEVICE,
-        deep_batch=ARGS.deep_batch,
         region_batch=ARGS.region_batch,
         verify_region_batch=not ARGS.no_verify_region_batch,
-        routing_mode=ARGS.routing_mode,
-        spectral_guard_mae=ARGS.spectral_guard_mae,
-        spectral_guard_q80=ARGS.spectral_guard_q80,
-        spectral_guard_confidence=ARGS.spectral_guard_confidence,
     )
     cube, _, split, _ = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
@@ -286,14 +263,6 @@ def evaluate_worker(mask_files):
                 ),
             )
             pred = out["prediction"]
-            reference_v6_metrics = None
-            if ARGS.routing_mode == "hard60_v6_hybrid_v2_fixed":
-                ref = out["v6_fixed_reference_prediction"]
-                if ref is None or not np.isfinite(ref).all():
-                    raise RuntimeError('Internal fixed-route V6 reference incomplete.')
-                reference_v6_metrics = evaluate_reconstruction(
-                    test_cube, sparse_band_predictions(coords, ref), mask, eval_coords=coords
-                )
             band_predictions = sparse_band_predictions(coords, pred)
             metrics = evaluate_reconstruction(
                 test_cube, band_predictions, mask, eval_coords=coords
@@ -304,7 +273,7 @@ def evaluate_worker(mask_files):
                     f"{metrics.get('target_voxels', 0)}"
                 )
 
-            if ARGS.routing_mode in ("hybrid_v2_region_2expert", "hybrid_v2_region_2expert_v21", "hybrid_v2_region_2expert_v22", "hybrid_v2_region_2expert_v23") and np.any(out["final_route"] == 1):
+            if np.any(out["final_route"] == 1):
                 raise RuntimeError("Deep Expert unexpectedly selected in two-Expert mode.")
 
             truth = np.asarray(test_cube)[coords[:, 0], coords[:, 1], coords[:, 2]]
@@ -330,15 +299,6 @@ def evaluate_worker(mask_files):
                 "severity": int(meta["severity"]),
                 "repeat": int(meta["repeat"]),
                 **metrics,
-                **({"reference_v6_rmse": float(reference_v6_metrics['rmse']),
-                    "reference_v6_mae": float(reference_v6_metrics['mae']),
-                    "reference_v6_r2": float(reference_v6_metrics['r2']),
-                    "reference_v6_sam_deg": float(reference_v6_metrics['sam_deg']),
-                    "reference_v6_ssim": float(reference_v6_metrics['ssim']),
-                    "delta_rmse_vs_fixed_v6": float(metrics['rmse'])-float(reference_v6_metrics['rmse']),
-                    "hybrid_changed_voxels": int(out['hybrid_changed_voxels']),
-                    "hybrid_fallback_voxels": int(out['hybrid_fallback_voxels'])}
-                   if reference_v6_metrics is not None else {}),
                 "stage1_spectral_fraction": float(np.mean(stage1 == 0)),
                 "stage1_deep_fraction": float(np.mean(stage1 == 1)),
                 "final_spectral_fraction": float(np.mean(route == 0)),
@@ -346,8 +306,8 @@ def evaluate_worker(mask_files):
                 "final_region_fraction": float(np.mean(route == 2)),
                 "mean_gate_probability": float(np.nanmean(out["gate_probability"])),
                 "component_count": int(len(out["component_records"])),
-                "routing_mode": ARGS.routing_mode,
-                "router_policy": {"baseline": "baseline", "spectral_safe": "spectral_safe_stage1_v2", "joint_v3": "joint_bandwise_v3", "stage1_rank_v4": "legacy_rank_stage1_v4", "spectral_region": "availability_only_two_expert_ablation", "hard60_v5": "legacy_v4_manual_hard60_region_gate", "hard60_v6": "legacy_v4_hard60_mask_geometry_exceptions", "hard60_v6_hybrid_v2_fixed": "hard60_v6_frozen_router_hybrid_v2_band_outputs", "hybrid_v2_region_2expert": "pure_two_expert_observed_band_availability", "hybrid_v2_region_2expert_v21": "v21_long_gap_neighbor_support_frozen_policy", "hybrid_v2_region_2expert_v22": "v22_true_mask_gap_purity_exploratory_policy", "hybrid_v2_region_2expert_v23": "v23_longgap_region_plus_local_median"}[ARGS.routing_mode],
+                "routing_mode": "tpssr",
+                "router_policy": "mask_geometry_and_local_consistency",
                 "stage1_spectral_override_components": int(sum(r["stage1_spectral_override"] for r in out["component_records"])),
                 "spectral_safe_override_components": int(safe_override_count),
                 "spectral_safe_override_component_fraction": float(safe_override_count / component_count),
@@ -358,22 +318,22 @@ def evaluate_worker(mask_files):
                 ),
                 "spectral_fallback_components": int(out["spectral_fallback_components"]),
                 "spectral_route_rmse": subset_rmse(truth, pred, route == 0),
-                "hybrid_route_rmse": subset_rmse(truth, pred, route == 0) if ARGS.routing_mode in ("hybrid_v2_region_2expert", "hybrid_v2_region_2expert_v21", "hybrid_v2_region_2expert_v22", "hybrid_v2_region_2expert_v23") else float("nan"),
-                "final_hybrid_fraction": float(np.mean(route == 0)) if ARGS.routing_mode in ("hybrid_v2_region_2expert", "hybrid_v2_region_2expert_v21", "hybrid_v2_region_2expert_v22", "hybrid_v2_region_2expert_v23") else float("nan"),
+                "hybrid_route_rmse": subset_rmse(truth, pred, route == 0),
+                "final_hybrid_fraction": float(np.mean(route == 0)),
                 "deep_route_rmse": subset_rmse(truth, pred, route == 1),
                 "region_route_rmse": subset_rmse(truth, pred, route == 2),
-                "v21_region_long_gap_eval_voxels": int(out.get("v21_region_gap_eval_voxels", 0)),
-                "v21_region_long_gap_pixels": int(out.get("v21_policy_audit", {}).get("region_long_gap_pixels", 0)),
-                "v21_region_no_anchor_pixels": int(out.get("v21_policy_audit", {}).get("region_no_anchor_pixels", 0)),
-                "v21_gap_candidates": int(out.get("v21_policy_audit", {}).get("long_gap_candidate_pixels", 0)),
-                "v22_longgap_region_eval_voxels": int(out.get("v22_region_gap_eval_voxels", 0)),
-                "v22_region_long_gap_pixels": int(out.get("v22_policy_audit", {}).get("region_long_gap_pixels", 0)),
-                "v22_region_returned_to_hybrid_pixels": int(out.get("v22_policy_audit", {}).get("v22_long_gap_returned_to_hybrid", 0)),
-                "v22_rejected_fragmented_pixels": int(out.get("v22_policy_audit", {}).get("v22_long_gap_rejected_incoherent", 0)),
-                "v22_rejected_non_dominant_pixels": int(out.get("v22_policy_audit", {}).get("v22_long_gap_rejected_non_dominant", 0)),
+                "support_region_long_gap_eval_voxels": int(out.get("support_region_gap_eval_voxels", 0)),
+                "support_region_long_gap_pixels": int(out.get("support_policy_audit", {}).get("region_long_gap_pixels", 0)),
+                "support_region_no_anchor_pixels": int(out.get("support_policy_audit", {}).get("region_no_anchor_pixels", 0)),
+                "support_gap_candidates": int(out.get("support_policy_audit", {}).get("long_gap_candidate_pixels", 0)),
+                "guard_longgap_region_eval_voxels": int(out.get("guard_region_gap_eval_voxels", 0)),
+                "guard_region_long_gap_pixels": int(out.get("guard_policy_audit", {}).get("region_long_gap_pixels", 0)),
+                "guard_region_returned_to_hybrid_pixels": int(out.get("guard_policy_audit", {}).get("guard_long_gap_returned_to_hybrid", 0)),
+                "guard_rejected_fragmented_pixels": int(out.get("guard_policy_audit", {}).get("guard_long_gap_rejected_incoherent", 0)),
+                "guard_rejected_non_dominant_pixels": int(out.get("guard_policy_audit", {}).get("guard_long_gap_rejected_non_dominant", 0)),
 
-                "v23_additional_region_eval_voxels": int(out.get("v23_policy_audit", {}).get("additional_region_voxels", 0)),
-                "v23_local_median_eval_voxels": int(out.get("v23_policy_audit", {}).get("local_median_voxels", 0)),
+                "policy_additional_region_eval_voxels": int(out.get("routing_audit", {}).get("additional_region_voxels", 0)),
+                "policy_local_median_eval_voxels": int(out.get("routing_audit", {}).get("local_median_voxels", 0)),
                 "runtime_sec": float(time.time() - t0),
                 "gpu": int(LOCAL_RANK) if DEVICE.type == "cuda" else -1,
                 "status": "ok",
@@ -430,18 +390,12 @@ def evaluate_worker(mask_files):
         "test_datasets": list(config.TEST_DATASET_FOLDERS),
         "rank": RANK,
         "device": str(DEVICE),
-        "deep_checkpoint": str(pipeline.deep_path),
-        "hierarchical_router_checkpoint": str(pipeline.router_path),
-        "gate_threshold": float(pipeline.gate_threshold),
-        "routing_mode": str(ARGS.routing_mode),
-        **({"v21_policy": __import__("src.spectral_route_policy_v21", fromlist=["policy_spec"]).policy_spec()} if ARGS.routing_mode == "hybrid_v2_region_2expert_v21" else {}),
-        **({"v22_policy": __import__("src.spectral_route_policy_v22", fromlist=["policy_spec"]).policy_spec()} if ARGS.routing_mode == "hybrid_v2_region_2expert_v22" else {}),
-        **({"v23_policy": __import__("src.spectral_route_policy_v23", fromlist=["policy_spec"]).policy_spec()} if ARGS.routing_mode == "hybrid_v2_region_2expert_v23" else {}),
-        "spectral_guard_mae_limit": float(ARGS.spectral_guard_mae),
-        "spectral_guard_q80_limit": float(ARGS.spectral_guard_q80),
-        "spectral_guard_confidence_limit": float(ARGS.spectral_guard_confidence),
+        "routing_mode": "tpssr",
+        "routing_parameters": __import__("src.routing_policy", fromlist=["policy_spec"]).policy_spec(),
+        "spectral_backbone_checkpoint": str(pipeline.hybrid_backbone_checkpoint_path),
+        "spectral_gate_checkpoint": str(pipeline.hybrid_gate_checkpoint_path),
         "topology_checkpoint": str(pipeline.topology_path),
-        "v27_stage_a_checkpoint": str(pipeline.v27_path),
+        "geometry_stage_a_checkpoint": str(pipeline.geometry_path),
     }
     (OUTDIR / f"worker.rank{RANK}.json").write_text(
         json.dumps(worker_meta, indent=2), encoding="utf-8"
@@ -504,21 +458,8 @@ def main_worker():
         print("Experiment:", config.EXPERIMENT_NAME)
         print("Active held-out dataset:", DATASET)
         print("Training datasets:", ", ".join(config.TRAIN_DATASET_FOLDERS))
-        if ARGS.routing_mode in ("hybrid_v2_region_2expert", "hybrid_v2_region_2expert_v21", "hybrid_v2_region_2expert_v22", "hybrid_v2_region_2expert_v23"):
-            print("TWO EXPERTS ONLY: Hybrid V2 BAND / Frozen Region (mask-only sufficiency policy)")
-            print("No Deep model or V6 Router is loaded or run.")
-        else:
-            print("Stage 1: V6 frozen Router / Deep-v3.1 (unchanged)")
-        if ARGS.routing_mode == "hybrid_v2_region_2expert_v21":
-            print("V2.1 FROZEN MASK GEOMETRY: >=2 observed + long-gap neighbor-support guard")
-        if ARGS.routing_mode == "hybrid_v2_region_2expert_v22":
-            print("V2.2 EXPLORATORY: V2.1 + true-target spectral gap purity guard")
-        if ARGS.routing_mode == "hard60_v6_hybrid_v2_fixed":
-            print("After routing: replace Spectral-selected predictions with Hybrid V2 BAND")
-        if ARGS.routing_mode == "hybrid_v2_region_2expert_v23":
-            print("V2.3 FINAL: frozen V2.2 + extra Region on supported long gaps + local median")
-        print("Routing mode:", ARGS.routing_mode)
-        print("Region: Frozen V27 Stage-A -> V13 TopologyFirst V1")
+        print("TPSSR: spectral backbone, geometry guidance, topology completion")
+        print("Routing: observed-only spectral-gap policy with local consistency checks")
         print("Allocated masks for this acquisition:", len(mask_files), "| GPUs:", WORLD_SIZE)
         if int(ARGS.max_masks) > 0:
             print("GLOBAL experiment mask budget:", int(ARGS.max_masks))

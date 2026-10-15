@@ -1,24 +1,24 @@
-"""TPSSR V13-E2E-Corr: direct V13 reconstruction with native-resolution correspondence transport.
+"""TPSSR Topology-E2E-Corr: direct Topology reconstruction with native-resolution correspondence transport.
 
-This is an internal V13 redesign, not a post-processing correction.
+This is an internal Topology redesign, not a post-processing correction.
 
-Key change from V13-E2E v1
+Key change from Topology-E2E v1
 --------------------------
-The old V13-E2E radiometric base was dominated by 9/17/33-pixel masked box
+The old Topology-E2E radiometric base was dominated by 9/17/33-pixel masked box
 means. That is a robust smooth fallback, but it can average away thin dark or
 bright laminae before the synthesis trunk sees them.
 
-V13-E2E-Corr keeps that branch only as a fallback. For missing pixels it also
+Topology-E2E-Corr keeps that branch only as a fallback. For missing pixels it also
 learns native-resolution correspondence to intact pixels around the hole and
 transports their *observed target-band radiometry* directly into the hole.
-A learned gate inside V13 decides where transport should dominate. The final
-reconstruction is still synthesized by V13 in one forward pass.
+A learned gate inside Topology decides where transport should dominate. The final
+reconstruction is still synthesized by Topology in one forward pass.
 
 Contract
 --------
-* Frozen Original-V27 Stage-A supplies structural guidance only.
-* V27 final reconstruction is never used.
-* No V16, bridge, selector, proposal bank, explicit trace, or post-fill overlay.
+* Frozen Original-Geometry Stage-A supplies structural guidance only.
+* Geometry final reconstruction is never used.
+* No Refinement, bridge, selector, proposal bank, explicit trace, or post-fill overlay.
 * Correspondence operates at native patch resolution; no down/up sampling in
   the transport branch.
 * Transport values come only from healthy observed target-band pixels.
@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.new_v13_e2e_structure_filler import (
+from src.structure_layers import (
     ResBlock,
     DirectionalBank,
     GeometryConditionedBlock,
@@ -44,7 +44,7 @@ class NativeCorrespondenceTransport(nn.Module):
 
     The candidate bank is a wide healthy ring around the synthetic hole. Each
     attention head retrieves observed target-band values from that bank. A
-    weak V27-orientation/distance bias only regularizes the learned similarity;
+    weak Geometry-orientation/distance bias only regularizes the learned similarity;
     it does not create an explicit path.
     """
 
@@ -88,7 +88,7 @@ class NativeCorrespondenceTransport(nn.Module):
         self.key = nn.Conv2d(embed_ch, embed_ch, 1, bias=False)
         self.head_mix = nn.Conv2d(embed_ch, self.heads, 1)
 
-        # Positive after softplus. Kept modest initially so V27 only nudges the
+        # Positive after softplus. Kept modest initially so Geometry only nudges the
         # learned correspondence rather than dictating a hand-written path.
         self.orientation_strength_raw = nn.Parameter(torch.tensor(-0.65))
         self.distance_strength_raw = nn.Parameter(torch.tensor(-1.10))
@@ -165,7 +165,7 @@ class NativeCorrespondenceTransport(nn.Module):
             scores = torch.einsum("qhd,shd->hqs", q, k) * scale
 
             # Weak geometry prior: favour nearby intact pixels lying along the
-            # V27 edge tangent. V27 orientation encodes gradient orientation as
+            # Geometry edge tangent. Geometry orientation encodes gradient orientation as
             # [cos(2theta), sin(2theta)], so the tangent has the negated pair.
             dy = (sy.to(q.dtype)[None, :] - qy.to(q.dtype)[:, None]) / max(float(h - 1), 1.0)
             dx = (sx.to(q.dtype)[None, :] - qx.to(q.dtype)[:, None]) / max(float(w - 1), 1.0)
@@ -263,10 +263,10 @@ class NativeCorrespondenceTransport(nn.Module):
         }
 
 
-class EndToEndCorrespondenceV13Filler(nn.Module):
-    """Direct V13 filler with learned native-resolution radiometry transport."""
+class EndToEndCorrespondenceTopologyFiller(nn.Module):
+    """Direct Topology filler with learned native-resolution radiometry transport."""
 
-    ARCHITECTURE_VERSION = "TPSSR_V13_E2E_NATIVE_CORRESPONDENCE_TRANSPORT_V2"
+    ARCHITECTURE_VERSION = "TPSSR_Topology_E2E_NATIVE_CORRESPONDENCE_TRANSPORT_V2"
 
     def __init__(
         self,
@@ -309,14 +309,14 @@ class EndToEndCorrespondenceV13Filler(nn.Module):
         self.mix_temperature = float(mix_temperature)
         self.hard_fraction = float(hard_fraction)
 
-        # Keep the proven V13-E2E backbone names/shapes so its checkpoint can be
+        # Keep the proven Topology-E2E backbone names/shapes so its checkpoint can be
         # used only as an initialization. Inference remains a single new model.
         self.spectral = nn.Sequential(
             nn.Conv2d(self.n_bands, spectral_width, 1, bias=False),
             nn.GroupNorm(_groups(spectral_width), spectral_width), nn.SiLU(),
             ResBlock(spectral_width, spectral_width, 1, 0.01),
         )
-        self.v27_adapter = nn.Sequential(
+        self.geometry_adapter = nn.Sequential(
             nn.Conv2d(structure_feature_channels + 4, base_width, 3, padding=1, bias=False),
             nn.GroupNorm(_groups(base_width), base_width), nn.SiLU(),
             ResBlock(base_width, base_width, 1, 0.01), ResBlock(base_width, base_width, 2, 0.01),
@@ -413,7 +413,7 @@ class EndToEndCorrespondenceV13Filler(nn.Module):
         n, _, h, w = spec.shape
         band_map = band_position.view(n, 1, 1, 1).expand(-1, -1, h, w)
         smap = torch.cat([structure["edge_prob"], structure["orientation"], structure["contrast_hint"]], 1)
-        v27 = self.v27_adapter(torch.cat([structure["feature"], smap], 1))
+        geometry = self.geometry_adapter(torch.cat([structure["feature"], smap], 1))
 
         valid = ((1.0 - mask) * spatial_valid).clamp(0.0, 1.0)
         observed_low = _masked_box_mean(observed_target, valid, 5)
@@ -427,17 +427,17 @@ class EndToEndCorrespondenceV13Filler(nn.Module):
         directional = self.directional(torch.cat([spec, observed_target, smap, mask, distance], 1))
         c0 = self.context0(torch.cat([
             spec, observed_target, spatial_valid, valid_fraction, mask, distance, band_map,
-            smap, v27, directional,
+            smap, geometry, directional,
         ], 1))
         c1 = self.down1(c0)
         cz = self.bottleneck(self.down2(c1))
         u1 = F.interpolate(cz, size=c1.shape[-2:], mode="bilinear", align_corners=False)
         u1 = self.up1(torch.cat([u1, c1], 1))
         u0 = F.interpolate(u1, size=c0.shape[-2:], mode="bilinear", align_corners=False)
-        u0 = self.up0(torch.cat([u0, c0, v27, directional], 1))
+        u0 = self.up0(torch.cat([u0, c0, geometry, directional], 1))
 
         geom = self.geometry_trunk(torch.cat([
-            u0, c0, v27, directional, smap, mask, distance, observed_target, observed_high,
+            u0, c0, geometry, directional, smap, mask, distance, observed_target, observed_high,
         ], 1))
         structure_logit = self.structure_head(geom)
         dark_logit = self.dark_head(geom)
@@ -449,14 +449,14 @@ class EndToEndCorrespondenceV13Filler(nn.Module):
 
         # Old averaging branch is now explicitly the fallback rather than the
         # primary radiometric estimate.
-        rad_features = torch.cat([u0, v27, directional, smap, anchors, geometry_probs], 1)
+        rad_features = torch.cat([u0, geometry, directional, smap, anchors, geometry_probs], 1)
         aw = torch.softmax(self.anchor_weights(rad_features), 1)
         anchor = (aw * anchors).sum(1, keepdim=True)
         fallback_delta = self.radiometry_delta_scale * torch.tanh(self.radiometry(rad_features))
         fallback_radiometry = anchor + fallback_delta
 
         transport_features = torch.cat([
-            spec, v27, directional, geom, smap, geometry_probs, mask, distance,
+            spec, geometry, directional, geom, smap, geometry_probs, mask, distance,
         ], 1)
         tr = self.transport(
             transport_features, observed_target, observed_low, mask, spatial_valid,
@@ -467,11 +467,11 @@ class EndToEndCorrespondenceV13Filler(nn.Module):
         transport_entropy = tr["entropy"]
 
         gate_logit = self.transport_gate(torch.cat([
-            geom, v27, directional, smap, geometry_probs, transport_conf, mask, distance,
+            geom, geometry, directional, smap, geometry_probs, transport_conf, mask, distance,
         ], 1))
         learned_gate = torch.sigmoid(gate_logit)
         # Structure probability and correspondence confidence are part of the
-        # gate *inside V13*. This prevents a flat-region transport from
+        # gate *inside Topology*. This prevents a flat-region transport from
         # overwhelming the stable fallback while allowing strong structures to
         # commit to observed donor radiometry.
         # The gate itself is supervised to be high on real structures and low
@@ -487,7 +487,7 @@ class EndToEndCorrespondenceV13Filler(nn.Module):
         radiometry = (1.0 - transport_gate) * fallback_radiometry + transport_gate * transported
 
         synth = self.synthesis_stem(torch.cat([
-            spec, u0, c0, v27, directional, geom, smap, geometry_probs,
+            spec, u0, c0, geometry, directional, geom, smap, geometry_probs,
             radiometry, observed_high, mask, distance,
         ], 1))
         for block in self.synthesis_blocks:

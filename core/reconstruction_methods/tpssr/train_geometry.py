@@ -1,79 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-TPSSR — SWIR1 V27 LEARNED-CORRESPONDENCE WHOLE-SPECTRUM RECONSTRUCTOR
-=====================================================================
+"""Train the geometry-guidance network used in TPSSR spatial completion.
 
-PURPOSE
--------
-V25.x and V26.x were useful diagnostics, but they exposed two limits:
-
-1) Explicit path / boundary / track pairing is brittle.
-2) Exemplar transfer can only copy a structure that already exists as a good
-   nearby donor.
-
-V27 removes those hand-engineered correspondence decisions from the actual
-reconstruction branch.
-
-The model learns correspondence directly from synthetic whole-spectrum holes:
-
-    raw corrupted HSI + missing mask
-                    ->
-    mask-aware multi-scale context encoder
-                    ->
-    learned intact-context cross-attention
-                    ->
-    structure + signed-contrast completion
-                    ->
-    structure-conditioned radiometric reconstruction/refinement
-
-The cross-attention keys/values are restricted to intact context tokens. Missing
-tokens act as queries and learn which intact regions around the hole are useful
-for reconstructing interrupted structures.
-
-IMPORTANT
----------
-Deep-v3.1 is NOT used as an input or prior for this branch.
-V13/V22/V27/V24/V25/V26 reconstructions are NOT used as inputs.
-No spatial-mean reconstruction is supplied to the model.
-
-Deep-v3.1 remains the normal TPSSR expert for corruption scenarios where it
-already performs well. V27 is a dedicated branch for hard
-whole_spectrum_pixels regions.
-
-LOIO POLICY
------------
-Held-out TEST: SWIR1
-TRAIN: SWIR2, SWIR3, SWIR4, SWIR5
-
-TRAINING
---------
-Phase A:
-    Learn intact-context correspondence and predict:
-      * edge probability,
-      * undirected orientation [cos(2theta), sin(2theta)],
-      * signed local-contrast hint.
-
-Phase B:
-    Initialize from the best Phase-A checkpoint and jointly fine-tune:
-      * learned correspondence,
-      * structure completion,
-      * radiometric reconstruction/refinement.
-
-The reconstruction objective additionally penalizes:
-      * local contrast collapse,
-      * wrong dark/bright polarity,
-      * cross-sectional profile mismatch,
-      * boundary/gradient/orientation/diagonal errors.
-
-RUN
----
-From the project root:
-
-    python reconstruction_methods/texture_restoration_router_rf_v2/train_swir1_v27_learned_correspondence.py --gpus 2
-
-No --prepare is needed if the SWIR LOIO fold is already prepared.
+The model learns correspondence and structural cues from measured context.
+Target reflectance is used for supervised loss only, never as an inference input.
+Training uses the configured training acquisitions and two CUDA devices.
 """
 
 from pathlib import Path
@@ -174,7 +106,7 @@ W_SSIM = 0.18
 W_BOUNDARY = 0.30
 W_LAPLACIAN = 0.06
 
-# V27-specific anti-blur / radiometric-structure terms.
+# Geometry-specific anti-blur / radiometric-structure terms.
 W_LOCAL_CONTRAST = 0.42
 W_POLARITY = 0.34
 W_PROFILE = 0.30
@@ -190,7 +122,7 @@ DETAIL_RESIDUAL_SCALE = 0.45
 # Keep the intermediate representation meaningful during joint training.
 W_STRUCTURE_DURING_JOINT = 0.50
 
-MODEL_SUBDIR = f"region_v27_original_{str(config.TEST_DATASET_FOLDER).lower()}_dev_2gpu"
+MODEL_SUBDIR = f"geometry_{str(config.TEST_DATASET_FOLDER).lower()}"
 
 BEST_STRUCTURE_MODEL = "best_structure_model.pt"
 BEST_MODEL = "best_model.pt"
@@ -200,10 +132,11 @@ STRUCTURE_HISTORY_CSV = "structure_history.csv"
 JOINT_HISTORY_CSV = "training_history.csv"
 SUMMARY_TXT = "TRAINING_SUMMARY.txt"
 
-# Only used to obtain the same normalization metadata used by Deep-v3.1.
-# Deep-v3.1 is never executed inside this training file.
-DEEP_V31_SUBDIR = f"deep_v31_{str(config.TEST_DATASET_FOLDER).lower()}_dev_2gpu"
-DEEP_V31_CHECKPOINT = "best_model.pt"
+# Normalization is now derived from the configured TRAIN acquisitions only.
+# The model architecture, losses and checkpoint schema are unchanged.
+TRAIN_ONLY_NORM = Path(config.MODELS_DIR) / "tpssr" / (
+    f"geometry_train_stats_{str(config.TEST_DATASET_FOLDER).lower()}.npz"
+)
 
 SEED = int(getattr(config, "SEED", 1234)) + 27001
 
@@ -237,7 +170,7 @@ def setup_ddp():
 
     if world_size != 2:
         raise RuntimeError(
-            f"V27 is configured for exactly two GPUs; WORLD_SIZE={world_size}."
+            f"Geometry is configured for exactly two GPUs; WORLD_SIZE={world_size}."
         )
 
     if torch.cuda.device_count() < 2:
@@ -294,47 +227,38 @@ def all_reduce_sum(value, device):
 # =============================================================================
 
 def load_normalization_metadata():
-    checkpoint_path = (
-        Path(config.MODELS_DIR)
-        / "texture_restoration_router_rf_v2"
-        / DEEP_V31_SUBDIR
-        / DEEP_V31_CHECKPOINT
-    )
+    """Read per-band statistics computed exclusively on training acquisitions.
 
-    if not checkpoint_path.exists():
+    Run the project-root ``python train.py --preset swir_8x2`` first; it writes
+    this small NPZ metadata file before invoking Geometry. No the previous experimental expert model or
+    checkpoint is required. Both DDP ranks only READ the precomputed NPZ.
+    """
+    path = Path(os.environ.get("TPSSR_GEOMETRY_TRAIN_STATS", str(TRAIN_ONLY_NORM)))
+    if not path.is_file():
         raise FileNotFoundError(
-            "Deep-v3.1 metadata checkpoint not found:\n"
-            f"{checkpoint_path}"
+            "Geometry TRAIN-only normalization metadata not found: " + str(path) +
+            ". Run the project-root train.py to create it; the previous experimental expert is not required."
         )
-
-    try:
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-            weights_only=False,
-        )
-    except TypeError:
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location="cpu",
-        )
-
-    required = (
-        "n_bands",
-        "band_mean",
-        "band_std",
-        "wavelengths_nm",
-    )
-
-    missing = [key for key in required if key not in checkpoint]
-
-    if missing:
-        raise RuntimeError(
-            "Deep-v3.1 checkpoint is missing normalization metadata: "
-            + ", ".join(missing)
-        )
-
-    return checkpoint, checkpoint_path
+    with np.load(path, allow_pickle=False) as stored:
+        required = ("n_bands", "band_mean", "band_std", "wavelengths_nm", "train_datasets")
+        missing = [name for name in required if name not in stored]
+        if missing:
+            raise RuntimeError("Missing TRAIN normalization fields: " + ", ".join(missing))
+        names = tuple(str(x) for x in stored["train_datasets"].tolist())
+        if names != tuple(config.TRAIN_DATASET_FOLDERS):
+            raise RuntimeError(f"Geometry normalization TRAIN SPLIT mismatch: {names}")
+        metadata = {
+            "n_bands": int(stored["n_bands"]),
+            "band_mean": np.asarray(stored["band_mean"], dtype=np.float32).copy(),
+            "band_std": np.asarray(stored["band_std"], dtype=np.float32).copy(),
+            "wavelengths_nm": np.asarray(stored["wavelengths_nm"], dtype=np.float32).copy(),
+        }
+    b = metadata["n_bands"]
+    if any(metadata[key].shape != (b,) for key in ("band_mean", "band_std", "wavelengths_nm")):
+        raise RuntimeError("Geometry normalization dimension mismatch")
+    if not np.isfinite(metadata["band_mean"]).all() or not np.isfinite(metadata["band_std"]).all() or (metadata["band_std"] <= 0).any():
+        raise RuntimeError("Geometry normalization statistics are invalid")
+    return metadata, path
 
 
 # =============================================================================
@@ -700,7 +624,7 @@ def structure_aware_mask(target_norm, full_valid, rng):
 # DATASET
 # =============================================================================
 
-class V27LearnedCorrespondenceDataset(Dataset):
+class GeometryLearnedCorrespondenceDataset(Dataset):
     def __init__(
         self,
         cubes,
@@ -1009,7 +933,7 @@ class V27LearnedCorrespondenceDataset(Dataset):
             }
 
         raise RuntimeError(
-            "Could not sample a valid V27 learned-correspondence patch after 120 attempts."
+            "Could not sample a valid Geometry learned-correspondence patch after 120 attempts."
         )
 
 
@@ -1311,7 +1235,7 @@ class IntactContextCrossAttention(nn.Module):
     """
     Missing-region queries attend to INTACT context tokens only.
 
-    This is the central V27 change. No explicit line pair, track, donor patch,
+    This is the central Geometry change. No explicit line pair, track, donor patch,
     or hand-written correspondence is supplied. The attention weights are
     learned from training examples.
     """
@@ -1566,7 +1490,7 @@ class IntactContextCrossAttention(nn.Module):
 
 class StructureCompletionNet(nn.Module):
     ARCHITECTURE_VERSION = (
-        "TPSSR_V27_LEARNED_CORRESPONDENCE_STRUCTURE"
+        "TPSSR_GEOMETRY_LEARNED_CORRESPONDENCE_STRUCTURE"
     )
 
     def __init__(
@@ -1842,7 +1766,7 @@ class StructureCompletionNet(nn.Module):
 
 class StructureConditionedReconNet(nn.Module):
     ARCHITECTURE_VERSION = (
-        "TPSSR_V27_STRUCTURE_CONDITIONED_RADIOMETRIC_REFINER"
+        "TPSSR_GEOMETRY_STRUCTURE_CONDITIONED_RADIOMETRIC_REFINER"
     )
 
     def __init__(
@@ -2232,9 +2156,9 @@ class StructureConditionedReconNet(nn.Module):
         }
 
 
-class V27LearnedCorrespondenceRegionModel(nn.Module):
+class GeometryGuidanceModel(nn.Module):
     ARCHITECTURE_VERSION = (
-        "TPSSR_V27_LEARNED_CORRESPONDENCE_STRUCTURE_RADIOMETRIC"
+        "TPSSR_GEOMETRY_LEARNED_CORRESPONDENCE_STRUCTURE_RADIOMETRIC"
     )
 
     def __init__(
@@ -3762,7 +3686,7 @@ def save_joint_checkpoint(
 
     checkpoint = {
         "architecture": (
-            V27LearnedCorrespondenceRegionModel.ARCHITECTURE_VERSION
+            GeometryGuidanceModel.ARCHITECTURE_VERSION
         ),
         "structure_architecture": (
             StructureCompletionNet.ARCHITECTURE_VERSION
@@ -3801,9 +3725,9 @@ def save_joint_checkpoint(
         "normalization_metadata_source": str(
             metadata_checkpoint_path
         ),
-        "uses_deep_v31_forward_during_training": False,
+        "uses_unused_expert_forward_during_training": False,
         "uses_spatial_mean_prior": False,
-        "uses_v13_prior": False,
+        "uses_topology_prior": False,
         "settings": {
             "spectral_width": int(
                 SPECTRAL_WIDTH
@@ -3818,7 +3742,7 @@ def save_joint_checkpoint(
             "stage_a_signed_contrast": True,
             "uses_explicit_path_pairing": False,
             "uses_exemplar_donor_input": False,
-            "uses_deep_v31_reconstruction_prior": False,
+            "uses_unused_expert_reconstruction_prior": False,
             "world_size": int(
                 world_size
             ),
@@ -4305,7 +4229,7 @@ def train_joint_phase(
             map_location="cpu",
         )
 
-    model = V27LearnedCorrespondenceRegionModel(
+    model = GeometryGuidanceModel(
         n_bands=int(
             metadata_checkpoint[
                 "n_bands"
@@ -4674,7 +4598,7 @@ def train_joint_phase(
                         "structure_loss"
                     ]
                 ),
-                "val_v27_rmse_norm": float(
+                "val_geometry_rmse_norm": float(
                     val[
                         "prediction_rmse"
                     ]
@@ -4801,7 +4725,7 @@ def train_joint_phase(
                 f"Joint epoch {epoch:02d} | "
                 f"train={row['train_total_loss']:.5f} | "
                 f"val={row['val_total_loss']:.5f} | "
-                f"RMSE={row['val_v27_rmse_norm']:.5f} | "
+                f"RMSE={row['val_geometry_rmse_norm']:.5f} | "
                 f"reconOri={row['val_recon_orientation']:.4f} | "
                 f"diag={row['val_diagonal']:.4f} | "
                 f"structOri={row['val_structure_orientation']:.4f}"
@@ -4809,7 +4733,7 @@ def train_joint_phase(
 
             if is_best:
                 print(
-                    "  -> NEW BEST V27 MODEL"
+                    "  -> NEW BEST Geometry MODEL"
                 )
 
             print("")
@@ -4853,7 +4777,7 @@ def worker_main():
         current_train = {str(item).upper() for item in config.TRAIN_DATASET_FOLDERS}
         if not expected_train or current_train != expected_train:
             raise RuntimeError(
-                f"Invalid configured train/test split for V27: held-out={config.TEST_DATASET_FOLDER}, "
+                f"Invalid configured train/test split for Geometry: held-out={config.TEST_DATASET_FOLDER}, "
                 f"train={config.TRAIN_DATASET_FOLDERS}"
             )
 
@@ -4922,7 +4846,7 @@ def worker_main():
 
         model_dir = (
             Path(config.MODELS_DIR)
-            / "texture_restoration_router_rf_v2"
+            / "tpssr"
             / MODEL_SUBDIR
         )
 
@@ -4935,7 +4859,7 @@ def worker_main():
             print("")
             print("=" * 108)
             print(
-                "TPSSR — V27 LEARNED-CORRESPONDENCE WHOLE-SPECTRUM RECONSTRUCTOR"
+                "TPSSR — Geometry LEARNED-CORRESPONDENCE WHOLE-SPECTRUM RECONSTRUCTOR"
             )
             print("=" * 108)
             print(
@@ -4979,7 +4903,7 @@ def worker_main():
             )
             print("")
             print(
-                "V27 fundamental change:"
+                "Geometry fundamental change:"
             )
             print(
                 "  raw context -> LEARNED INTACT-CONTEXT CORRESPONDENCE"
@@ -4989,17 +4913,17 @@ def worker_main():
                 "  Explicit path / track / donor correspondence: NO"
             )
             print(
-                "  Deep-v3.1 forward during training: 0"
+                "  the previous experimental expert forward during training: 0"
             )
             print(
                 "  Spatial-mean prior: NO"
             )
             print(
-                "  V13/V22 reconstruction prior: NO"
+                "  Topology/Guard reconstruction prior: NO"
             )
             print("")
 
-        train_ds = V27LearnedCorrespondenceDataset(
+        train_ds = GeometryLearnedCorrespondenceDataset(
             cubes=train_cubes,
             band_mean=band_mean,
             band_std=band_std,
@@ -5008,7 +4932,7 @@ def worker_main():
             training=True,
         )
 
-        val_ds = V27LearnedCorrespondenceDataset(
+        val_ds = GeometryLearnedCorrespondenceDataset(
             cubes=val_cubes,
             band_mean=band_mean,
             band_std=band_std,
@@ -5062,7 +4986,7 @@ def worker_main():
 
             summary = {
                 "architecture": (
-                    V27LearnedCorrespondenceRegionModel.ARCHITECTURE_VERSION
+                    GeometryGuidanceModel.ARCHITECTURE_VERSION
                 ),
                 "held_out_test": str(config.TEST_DATASET_FOLDER),
                 "training_datasets": list(
@@ -5084,9 +5008,9 @@ def worker_main():
                         "val_total_loss"
                     ]
                 ),
-                "val_v27_rmse_norm": float(
+                "val_geometry_rmse_norm": float(
                     best_row[
-                        "val_v27_rmse_norm"
+                        "val_geometry_rmse_norm"
                     ]
                 ),
                 "val_recon_orientation": float(
@@ -5137,17 +5061,17 @@ def worker_main():
             }
 
             lines = [
-                "TPSSR — V27 LEARNED-CORRESPONDENCE WHOLE-SPECTRUM RECONSTRUCTOR",
+                "TPSSR — Geometry LEARNED-CORRESPONDENCE WHOLE-SPECTRUM RECONSTRUCTOR",
                 "=" * 100,
                 "",
-                "WHY V27",
+                "WHY Geometry",
                 (
                     "  V25/V26 diagnostics showed that explicit paths and fixed "
                     "exemplar selection are too brittle for unique interrupted "
                     "sedimentary structures."
                 ),
                 (
-                    "  V27 therefore learns correspondence from synthetic "
+                    "  Geometry therefore learns correspondence from synthetic "
                     "whole-spectrum holes instead of receiving a hand-engineered "
                     "path, pair, or donor."
                 ),
@@ -5178,8 +5102,8 @@ def worker_main():
                 "  gradient/orientation/diagonal/boundary/SSIM losses",
                 "",
                 "IMPORTANT NEGATIVES",
-                "  Deep-v3.1 reconstruction as input: NO",
-                "  V13/V22/V23/V24/V25/V26 reconstruction as input: NO",
+                "  the previous experimental expert reconstruction as input: NO",
+                "  Topology/Guard/Policy/V24/V25/V26 reconstruction as input: NO",
                 "  explicit path/track matching: NO",
                 "  explicit exemplar donor input: NO",
                 "  spatial-mean reconstruction prior: NO",
@@ -5192,7 +5116,7 @@ def worker_main():
                     f"  Val total loss: {summary['best_val_total_loss']:.8f}"
                 ),
                 (
-                    f"  Normalized RMSE: {summary['val_v27_rmse_norm']:.6f}"
+                    f"  Normalized RMSE: {summary['val_geometry_rmse_norm']:.6f}"
                 ),
                 (
                     "  Reconstruction orientation loss: "
@@ -5219,7 +5143,7 @@ def worker_main():
                 "NEXT HELD-OUT TEST",
                 "  whole_spectrum_pixels S5 R1 and R4 on SWIR1",
                 "  Visualize Stage-A predicted edge/orientation inside every component.",
-                "  Compare Deep-v3.1 / V13 / Current HF / V22.1 / V27.",
+                "  Compare the previous experimental expert / Topology / Current HF / Guard.1 / Geometry.",
                 (
                     "  The key success criterion is real continuation of interrupted "
                     "diagonal/thin structures, not only lower pixel RMSE."
@@ -5251,7 +5175,7 @@ def worker_main():
 
             print("")
             print("=" * 108)
-            print("V27 TRAINING COMPLETE")
+            print("Geometry TRAINING COMPLETE")
             print("=" * 108)
             print(
                 "Best joint epoch:",
@@ -5261,7 +5185,7 @@ def worker_main():
             )
             print(
                 "Normalized RMSE:",
-                f"{summary['val_v27_rmse_norm']:.6f}",
+                f"{summary['val_geometry_rmse_norm']:.6f}",
             )
             print(
                 "Best checkpoint:",
@@ -5305,7 +5229,7 @@ def launcher_main():
 
     if int(args.gpus) != 2:
         raise RuntimeError(
-            "V27 is configured for exactly --gpus 2."
+            "Geometry is configured for exactly --gpus 2."
         )
 
     if not torch.cuda.is_available():
@@ -5333,7 +5257,7 @@ def launcher_main():
 
     print("")
     print(
-        "Launching TPSSR V27 on two GPUs:"
+        "Launching TPSSR Geometry on two GPUs:"
     )
     print(
         " ".join(

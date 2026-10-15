@@ -1,6 +1,6 @@
-"""TPSSR New V13: V27-guided texture-preserving region filler.
+"""TPSSR New Topology: Geometry-guided texture-preserving region filler.
 
-This module intentionally does NOT modify the frozen V27 structure predictor.
+This module intentionally does NOT modify the frozen Geometry structure predictor.
 It decomposes reconstruction into:
   1) low-frequency/radiometric reconstruction,
   2) native-resolution high-frequency texture reconstruction,
@@ -56,20 +56,20 @@ def _masked_box_mean(values: torch.Tensor, valid: torch.Tensor, kernel: int) -> 
     return torch.where(den > 1e-4, local, global_mean)
 
 
-class NewV13StructureGuidedFiller(nn.Module):
-    """One-band filler conditioned on frozen V27 Stage-A predictions.
+class StructureGuidedNetwork(nn.Module):
+    """One-band filler conditioned on frozen Geometry Stage-A predictions.
 
-    Inputs follow the original V27 convention. ``structure`` must contain:
+    Inputs follow the original Geometry convention. ``structure`` must contain:
       edge_prob:      [N,1,H,W]
       orientation:    [N,2,H,W]
       contrast_hint:  [N,1,H,W]
       feature:        [N,Cs,H,W]
 
-    The model predicts one normalized target band at a time, matching V27's
+    The model predicts one normalized target band at a time, matching Geometry's
     whole-spectrum-hole training/evaluation setup.
     """
 
-    ARCHITECTURE_VERSION = "TPSSR_NEW_V13_V27_GUIDED_LF_HF_NATIVE_TEXTURE_V1"
+    ARCHITECTURE_VERSION = "TPSSR_NEW_Topology_GEOMETRY_GUIDED_LF_HF_NATIVE_TEXTURE_V1"
 
     def __init__(
         self,
@@ -101,7 +101,7 @@ class NewV13StructureGuidedFiller(nn.Module):
             nn.SiLU(),
         )
 
-        # Keep V27's full-resolution correspondence feature available to both
+        # Keep Geometry's full-resolution correspondence feature available to both
         # branches. This is the structure path; it is not downsampled first.
         self.structure_adapter = nn.Sequential(
             nn.Conv2d(structure_feature_channels + 4, base_width, 3, padding=1, bias=False),
@@ -110,7 +110,7 @@ class NewV13StructureGuidedFiller(nn.Module):
             ResidualBlock(base_width, base_width, dilation=1, dropout=0.01),
         )
 
-        # Spectral context + observed target + geometry + V27 maps + three
+        # Spectral context + observed target + geometry + Geometry maps + three
         # leak-free radiometric anchors + observed high-pass + band position.
         global_in = spectral_width + 1 + 1 + 1 + 1 + 4 + 3 + 1 + 1
         self.global_stem = nn.Sequential(

@@ -1,16 +1,16 @@
-"""TPSSR V13-E2E: end-to-end structure-aware full reconstruction.
+"""TPSSR Topology-E2E: end-to-end structure-aware full reconstruction.
 
-This is a clean V13 redesign, not a post-processing head.
+This is a clean Topology redesign, not a post-processing head.
 
 Contract
 --------
-* Frozen Original-V27 Stage-A is used only as structural guidance
+* Frozen Original-Geometry Stage-A is used only as structural guidance
   (feature, edge probability, orientation, signed contrast).
-* V27 final reconstruction is never used as an input or baseline.
-* No V16, bridge, selector, trace, proposal bank, or post-fill correction is used.
-* V13 predicts internal structure/polarity/radiometry and synthesizes the final
+* Geometry final reconstruction is never used as an input or baseline.
+* No Refinement, bridge, selector, trace, proposal bank, or post-fill correction is used.
+* Topology predicts internal structure/polarity/radiometry and synthesizes the final
   missing pixels directly in one forward pass.
-* Thin dark/bright structures are represented explicitly inside V13 and are fed
+* Thin dark/bright structures are represented explicitly inside Topology and are fed
   into the synthesis trunk before the final pixel prediction.
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ class DirectionalBank(nn.Module):
 
 
 class GeometryConditionedBlock(nn.Module):
-    """Synthesis block modulated by V13's own learned geometry representation."""
+    """Synthesis block modulated by Topology's own learned geometry representation."""
     def __init__(self, channels: int, geometry_ch: int, dilation: int):
         super().__init__()
         self.c1 = nn.Conv2d(channels, channels, 3, padding=dilation, dilation=dilation, bias=False)
@@ -100,10 +100,10 @@ def _masked_box_mean(values: torch.Tensor, valid: torch.Tensor, kernel: int) -> 
     return torch.where(den > 1e-4, local, global_mean)
 
 
-class EndToEndV13Filler(nn.Module):
-    """V13 that learns structure + radiometry + texture jointly and fills directly."""
+class EndToEndTopologyFiller(nn.Module):
+    """Topology that learns structure + radiometry + texture jointly and fills directly."""
 
-    ARCHITECTURE_VERSION = "TPSSR_V13_E2E_STRUCTURE_AWARE_DIRECT_FILL_V1"
+    ARCHITECTURE_VERSION = "TPSSR_Topology_E2E_STRUCTURE_AWARE_DIRECT_FILL_V1"
 
     def __init__(
         self,
@@ -133,7 +133,7 @@ class EndToEndV13Filler(nn.Module):
             ResBlock(spectral_width, spectral_width, 1, 0.01),
         )
 
-        self.v27_adapter = nn.Sequential(
+        self.geometry_adapter = nn.Sequential(
             nn.Conv2d(structure_feature_channels + 4, base_width, 3, padding=1, bias=False),
             nn.GroupNorm(_groups(base_width), base_width),
             nn.SiLU(),
@@ -144,7 +144,7 @@ class EndToEndV13Filler(nn.Module):
         directional_in = spectral_width + 1 + 4 + 1 + 1
         self.directional = DirectionalBank(directional_in, base_width)
 
-        # Multi-scale context sees the corrupted HSI, healthy pixels, mask and V27 guidance.
+        # Multi-scale context sees the corrupted HSI, healthy pixels, mask and Geometry guidance.
         context_in = spectral_width + 1 + 1 + 1 + 1 + 1 + 1 + 4 + base_width + base_width
         self.context0 = nn.Sequential(
             nn.Conv2d(context_in, base_width, 3, padding=1, bias=False),
@@ -173,7 +173,7 @@ class EndToEndV13Filler(nn.Module):
         self.up1 = ResBlock(bottleneck_width + mid_width, mid_width, 1, 0.02)
         self.up0 = ResBlock(mid_width + base_width * 3, base_width, 1, 0.02)
 
-        # Internal geometry is part of V13 itself. These are auxiliary predictions,
+        # Internal geometry is part of Topology itself. These are auxiliary predictions,
         # not a post-processing head; the synthesis trunk consumes them directly.
         geometry_in = base_width * 4 + 4 + 1 + 1 + 1 + 1
         self.geometry_trunk = nn.Sequential(
@@ -233,7 +233,7 @@ class EndToEndV13Filler(nn.Module):
         n, _, h, w = spec.shape
         band_map = band_position.view(n, 1, 1, 1).expand(-1, -1, h, w)
         smap = torch.cat([structure["edge_prob"], structure["orientation"], structure["contrast_hint"]], 1)
-        v27 = self.v27_adapter(torch.cat([structure["feature"], smap], 1))
+        geometry = self.geometry_adapter(torch.cat([structure["feature"], smap], 1))
 
         valid = ((1.0 - mask) * spatial_valid).clamp(0.0, 1.0)
         observed_low = _masked_box_mean(observed_target, valid, 5)
@@ -247,17 +247,17 @@ class EndToEndV13Filler(nn.Module):
         directional = self.directional(torch.cat([spec, observed_target, smap, mask, distance], 1))
         c0 = self.context0(torch.cat([
             spec, observed_target, spatial_valid, valid_fraction, mask, distance, band_map,
-            smap, v27, directional,
+            smap, geometry, directional,
         ], 1))
         c1 = self.down1(c0)
         cz = self.bottleneck(self.down2(c1))
         u1 = F.interpolate(cz, size=c1.shape[-2:], mode="bilinear", align_corners=False)
         u1 = self.up1(torch.cat([u1, c1], 1))
         u0 = F.interpolate(u1, size=c0.shape[-2:], mode="bilinear", align_corners=False)
-        u0 = self.up0(torch.cat([u0, c0, v27, directional], 1))
+        u0 = self.up0(torch.cat([u0, c0, geometry, directional], 1))
 
         geom = self.geometry_trunk(torch.cat([
-            u0, c0, v27, directional, smap, mask, distance, observed_target, observed_high,
+            u0, c0, geometry, directional, smap, mask, distance, observed_target, observed_high,
         ], 1))
         structure_logit = self.structure_head(geom)
         dark_logit = self.dark_head(geom)
@@ -267,14 +267,14 @@ class EndToEndV13Filler(nn.Module):
         bright_prob = torch.sigmoid(bright_logit)
         geometry_probs = torch.cat([structure_prob, dark_prob, bright_prob], 1)
 
-        rad_features = torch.cat([u0, v27, directional, smap, anchors, geometry_probs], 1)
+        rad_features = torch.cat([u0, geometry, directional, smap, anchors, geometry_probs], 1)
         aw = torch.softmax(self.anchor_weights(rad_features), 1)
         anchor = (aw * anchors).sum(1, keepdim=True)
         radiometry_delta = self.radiometry_delta_scale * torch.tanh(self.radiometry(rad_features))
         radiometry = anchor + radiometry_delta
 
         synth = self.synthesis_stem(torch.cat([
-            spec, u0, c0, v27, directional, geom, smap, geometry_probs,
+            spec, u0, c0, geometry, directional, geom, smap, geometry_probs,
             radiometry, observed_high, mask, distance,
         ], 1))
         for block in self.synthesis_blocks:

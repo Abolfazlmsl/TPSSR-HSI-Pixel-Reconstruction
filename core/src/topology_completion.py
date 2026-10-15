@@ -1,10 +1,10 @@
-"""TPSSR V13 Topology-First: explicit skeleton topology before radiometry.
+"""TPSSR Topology Topology-First: explicit skeleton topology before radiometry.
 
 Design contract
 ---------------
-* Frozen Original-V27 Stage-A is structural guidance only.
-* V27 final reconstruction, V16, bridge/trace/selector/post-fill are not used.
-* V13 predicts a native-resolution topology representation before radiometry:
+* Frozen Original-Geometry Stage-A is structural guidance only.
+* Geometry final reconstruction, Refinement, bridge/trace/selector/post-fill are not used.
+* Topology predicts a native-resolution topology representation before radiometry:
   skeleton/centerline, topology-derived support, tangent orientation, width,
   a single signed polarity (- dark, + bright), and signed contrast.
 * Support is not an independent soft blob head. It is differentiably generated
@@ -20,10 +20,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.new_v13_e2e_structure_filler import (
+from src.structure_layers import (
     ResBlock, DirectionalBank, GeometryConditionedBlock, _groups, _masked_box_mean,
 )
-from src.new_v13_e2e_correspondence_filler import NativeCorrespondenceTransport
+from src.correspondence_layers import NativeCorrespondenceTransport
 
 
 class NativeTopologyDecoder(nn.Module):
@@ -107,8 +107,8 @@ class NativeTopologyDecoder(nn.Module):
         }
 
 
-class TopologyFirstV13Filler(nn.Module):
-    ARCHITECTURE_VERSION = "TPSSR_V13_TOPOLOGY_FIRST_SKELETON_POLARITY_V1"
+class TopologyCompletionNetwork(nn.Module):
+    ARCHITECTURE_VERSION = "TPSSR_Topology_TOPOLOGY_FIRST_SKELETON_POLARITY_V1"
 
     def __init__(
         self,
@@ -142,7 +142,7 @@ class TopologyFirstV13Filler(nn.Module):
             nn.GroupNorm(_groups(spectral_width), spectral_width), nn.SiLU(),
             ResBlock(spectral_width, spectral_width, 1, 0.01),
         )
-        self.v27_adapter = nn.Sequential(
+        self.geometry_adapter = nn.Sequential(
             nn.Conv2d(structure_feature_channels + 4, base_width, 3, padding=1, bias=False),
             nn.GroupNorm(_groups(base_width), base_width), nn.SiLU(),
             ResBlock(base_width, base_width, 1, 0.01),
@@ -154,7 +154,7 @@ class TopologyFirstV13Filler(nn.Module):
         native_in = spectral_width + 1 + 1 + 1 + 1 + 1 + 1 + 4 + base_width + base_width
         self.topology_decoder = NativeTopologyDecoder(native_in, base_width)
 
-        # spec + three learned contexts + V27 map + topology representation.
+        # spec + three learned contexts + Geometry map + topology representation.
         topology_extra = 4 + 1 + 1 + 1 + 2 + 1 + 1 + 4 + 1 + 1
         transport_in = spectral_width + base_width * 3 + topology_extra
         self.transport = NativeCorrespondenceTransport(
@@ -228,12 +228,12 @@ class TopologyFirstV13Filler(nn.Module):
         n, _, h, w = spec.shape
         band_map = band_position.view(n, 1, 1, 1).expand(-1, -1, h, w)
         smap = torch.cat([structure["edge_prob"], structure["orientation"], structure["contrast_hint"]], 1)
-        v27 = self.v27_adapter(torch.cat([structure["feature"], smap], 1))
+        geometry = self.geometry_adapter(torch.cat([structure["feature"], smap], 1))
         directional = self.directional(torch.cat([spec, observed_target, smap, mask, distance], 1))
 
         native = torch.cat([
             spec, observed_target, spatial_valid, valid_fraction, mask, distance, band_map,
-            smap, v27, directional,
+            smap, geometry, directional,
         ], 1)
         topo = self.topology_decoder(native)
 
@@ -258,7 +258,7 @@ class TopologyFirstV13Filler(nn.Module):
             support, skeleton, polarity, tangent, width_expected, signed_contrast, width_prob,
         ], 1)
         transport_features = torch.cat([
-            spec, topo["feature"], v27, directional, smap, topology_maps, mask, distance,
+            spec, topo["feature"], geometry, directional, smap, topology_maps, mask, distance,
         ], 1)
         tr = self.transport(
             transport_features, observed_target, observed_low, mask, spatial_valid,
@@ -270,7 +270,7 @@ class TopologyFirstV13Filler(nn.Module):
         tent = tr["entropy"]
 
         rad_features = torch.cat([
-            topo["feature"], v27, directional, smap, topology_maps,
+            topo["feature"], geometry, directional, smap, topology_maps,
             transported, anchors, tconf, tent, observed_low, mask, distance,
         ], 1)
         rf = self.radiometry_trunk(rad_features)
@@ -284,7 +284,7 @@ class TopologyFirstV13Filler(nn.Module):
 
         geometry_cond = self.geometry_adapter(torch.cat([topo["feature"], topology_maps], 1))
         synth = self.synthesis_stem(torch.cat([
-            spec, topo["feature"], rf, v27, directional, smap, topology_maps,
+            spec, topo["feature"], rf, geometry, directional, smap, topology_maps,
             radiometry, transported, observed_high, mask, distance,
         ], 1))
         for block in self.synthesis_blocks:

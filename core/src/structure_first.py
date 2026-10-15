@@ -1,17 +1,17 @@
-"""TPSSR V13 Structure-First: explicit native-resolution geometry before radiometry.
+"""TPSSR Topology Structure-First: explicit native-resolution geometry before radiometry.
 
-This is a clean redesign of the V13 hard-region filler.
+This is a clean redesign of the Topology hard-region filler.
 
 Design contract
 ---------------
-* Frozen Original-V27 Stage-A is structural guidance only.
-* V27 final reconstruction, V16, bridge/trace/selector and post-fill overlays are not used.
-* V13 first predicts an explicit native-resolution structure representation:
+* Frozen Original-Geometry Stage-A is structural guidance only.
+* Geometry final reconstruction, Refinement, bridge/trace/selector and post-fill overlays are not used.
+* Topology first predicts an explicit native-resolution structure representation:
   support, ridge/core, dark/bright polarity, tangent orientation, thickness and
   signed contrast.
 * Radiometry is predicted only after this structure representation exists.
 * Correspondence is conditioned by the predicted structure and remains an
-  internal V13 mechanism; healthy observed target-band pixels are the only
+  internal Topology mechanism; healthy observed target-band pixels are the only
   transported values.
 * The structure decoder itself never downsamples/upsamples. All thin-structure
   predictions are made at native patch resolution.
@@ -22,8 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.new_v13_e2e_structure_filler import ResBlock, DirectionalBank, GeometryConditionedBlock, _groups, _masked_box_mean
-from src.new_v13_e2e_correspondence_filler import NativeCorrespondenceTransport
+from src.structure_layers import ResBlock, DirectionalBank, GeometryConditionedBlock, _groups, _masked_box_mean
+from src.correspondence_layers import NativeCorrespondenceTransport
 
 
 class NativeStructureDecoder(nn.Module):
@@ -91,8 +91,8 @@ class NativeStructureDecoder(nn.Module):
         }
 
 
-class StructureFirstV13Filler(nn.Module):
-    ARCHITECTURE_VERSION = "TPSSR_V13_STRUCTURE_FIRST_NATIVE_GEOMETRY_V1"
+class StructureFirstNetwork(nn.Module):
+    ARCHITECTURE_VERSION = "TPSSR_Topology_STRUCTURE_FIRST_NATIVE_GEOMETRY_V1"
 
     def __init__(
         self,
@@ -126,7 +126,7 @@ class StructureFirstV13Filler(nn.Module):
             nn.GroupNorm(_groups(spectral_width), spectral_width), nn.SiLU(),
             ResBlock(spectral_width, spectral_width, 1, 0.01),
         )
-        self.v27_adapter = nn.Sequential(
+        self.geometry_adapter = nn.Sequential(
             nn.Conv2d(structure_feature_channels + 4, base_width, 3, padding=1, bias=False),
             nn.GroupNorm(_groups(base_width), base_width), nn.SiLU(),
             ResBlock(base_width, base_width, 1, 0.01),
@@ -209,12 +209,12 @@ class StructureFirstV13Filler(nn.Module):
         n, _, h, w = spec.shape
         band_map = band_position.view(n, 1, 1, 1).expand(-1, -1, h, w)
         smap = torch.cat([structure["edge_prob"], structure["orientation"], structure["contrast_hint"]], 1)
-        v27 = self.v27_adapter(torch.cat([structure["feature"], smap], 1))
+        geometry = self.geometry_adapter(torch.cat([structure["feature"], smap], 1))
         directional = self.directional(torch.cat([spec, observed_target, smap, mask, distance], 1))
 
         native = torch.cat([
             spec, observed_target, spatial_valid, valid_fraction, mask, distance, band_map,
-            smap, v27, directional,
+            smap, geometry, directional,
         ], 1)
         geom = self.structure_decoder(native)
 
@@ -236,7 +236,7 @@ class StructureFirstV13Filler(nn.Module):
         ], 1)
 
         transport_features = torch.cat([
-            spec, geom["feature"], v27, directional, smap,
+            spec, geom["feature"], geometry, directional, smap,
             support, core, dark, bright, tangent, thickness, signed_contrast,
             mask, distance,
         ], 1)
@@ -251,7 +251,7 @@ class StructureFirstV13Filler(nn.Module):
 
         pred_maps = torch.cat([support, core, dark, bright], 1)
         rad_features = torch.cat([
-            geom["feature"], v27, directional, smap, pred_maps, tangent,
+            geom["feature"], geometry, directional, smap, pred_maps, tangent,
             thickness, signed_contrast, transported, anchors, tconf, tent,
             observed_low, mask, distance,
         ], 1)
@@ -270,7 +270,7 @@ class StructureFirstV13Filler(nn.Module):
             geom["feature"], pred_maps, tangent, thickness, signed_contrast,
         ], 1))
         synth = self.synthesis_stem(torch.cat([
-            spec, geom["feature"], rf, v27, directional, smap, pred_maps, tangent,
+            spec, geom["feature"], rf, geometry, directional, smap, pred_maps, tangent,
             thickness, signed_contrast, radiometry, transported, observed_high, mask, distance,
         ], 1))
         for block in self.synthesis_blocks:

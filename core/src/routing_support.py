@@ -1,15 +1,13 @@
-"""Pre-registered, mask/observed-only Hybrid-V2 vs Region policy (v2.1).
+"""Determine expert eligibility using observed spectra and mask structure.
 
-No scenario names, severity, data-set IDs, masked target values or test metrics
-may influence routing. This is a RULE-BASED feasibility ablation, not a trained
-router or a fitted policy. Defaults are engineering hypotheses; do not tune them
-on SWIR5/SWIR10 and claim a held-out comparison.
+Routes depend on spectral support and measured neighboring pixels, not on
+scenario names, severity labels, masked targets or evaluation metrics.
 """
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
 
-# Frozen *before* comparing any v2.1 outcome with the test benchmark.
+# Fixed routing thresholds; do not calibrate on evaluation results.
 MIN_OBSERVED = 2
 MIN_LONG_GAP_BANDS = 24
 MIN_LONG_GAP_FRACTION = 0.10
@@ -22,7 +20,7 @@ MIN_AVAILABLE_NEIGHBORS = 4
 
 def policy_spec():
     return dict(
-        policy="v21_long_gap_with_local_observed_neighbors",
+        policy="support_long_gap_with_local_observed_neighbors",
         min_observed=MIN_OBSERVED,
         min_long_gap_bands=MIN_LONG_GAP_BANDS,
         min_long_gap_fraction=MIN_LONG_GAP_FRACTION,
@@ -98,7 +96,7 @@ def expert_eligibility_maps(mask, cube):
     if np.any(hybrid & forced_region) or np.any(long_gap_region & forced_region):
         raise AssertionError("Overlapping two-Expert pixel assignments")
     if not np.array_equal(spatial_mask, hybrid | forced_region | long_gap_region):
-        raise AssertionError("Missing pixel assignments in v2.1 policy")
+        raise AssertionError("Missing pixel assignments in routing policy")
     audit = dict(
         masked_pixels=int(spatial_mask.sum()),
         region_no_anchor_pixels=int(forced_region.sum()),

@@ -1,5 +1,6 @@
 # Core TPSSR / benchmarks
 numpy
+pandas
 scipy
 scikit-learn
 joblib
@@ -7,12 +8,10 @@ tqdm
 matplotlib
 torch
 torchvision
-
 # External PFGIN dependencies
 pyyaml
 scikit-image
 pillow
 opencv-python
 lpips
-
 # DDS2M also ships its original requirements file under external/DDS2M/requirements.txt.

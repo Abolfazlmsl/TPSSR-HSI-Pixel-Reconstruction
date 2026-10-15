@@ -3,7 +3,7 @@
 """TPSSR Hybrid V2: fit a confidence gate for a FROZEN spectral-only CNN-Transformer.
 
 New standalone project-root script; requires the existing project files
-train_spectral_arch_compare.py and train_spectral_transformer.py. No SWIR5/10
+training/spectral_backbone.py and training/spectral_data.py. No SWIR5/10
 are loaded. SWIR4 and SWIR9 are full acquisition-held-out validation cores.
 Two INDEPENDENT workers: GPU0 global/scalar gate, GPU1 per-band gate. No NCCL.
 """
@@ -26,15 +26,15 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-ROOT=Path(__file__).resolve().parent
+ROOT=Path(__file__).resolve().parent.parent
 CORE=ROOT/'core'
 for p in (str(ROOT),str(CORE)):
     if p not in sys.path: sys.path.insert(0,p)
 
 from experiment_config import add_experiment_args,resolve_experiment
 from _launcher_common import env_for
-from train_spectral_transformer import SpectraDataset,load_core_data,FAMILIES
-from train_spectral_arch_compare import (
+from training.spectral_data import SpectraDataset,load_core_data,FAMILIES
+from training.spectral_backbone import (
     SpectralHybrid, read_validation, summarize, write_csv,group_rows,atomic_save
 )
 
@@ -135,12 +135,12 @@ def sha(path):
 
 
 def get_backbone(models_dir:Path):
-    folder=models_dir/'texture_restoration_router_rf_v2'/'spectral_architecture_compare_v1'/'hybrid'
+    folder=models_dir/'tpssr'/'spectral_backbone'/'hybrid'
     accepted=folder/'best_model.pt'
     diagnostic=folder/'diagnostic_best_val.pt'
     ck=accepted if accepted.exists() else diagnostic
     if not ck.exists():raise RuntimeError('Frozen Hybrid checkpoint missing. Expected one of:\n'
-        f'  {accepted}\n  {diagnostic}\nRun train_spectral_arch_compare.py first.')
+        f'  {accepted}\n  {diagnostic}\nRun training/spectral_backbone.py first.')
     # The v1 hybrid failed the strict acceptance threshold on actual prior run.
     return ck,ck==accepted
 
@@ -215,7 +215,7 @@ def worker(args):
     model.base.load_state_dict(source['model_state_dict'],strict=True)
     model.base.eval()
     opt=torch.optim.AdamW(model.gate.parameters(),lr=args.lr,weight_decay=1e-5)
-    out=Path(config.MODELS_DIR)/'texture_restoration_router_rf_v2'/'spectral_hybrid_gate_v2'/args.worker_variant
+    out=Path(config.MODELS_DIR)/'tpssr'/'spectral_gate'/args.worker_variant
     out.mkdir(parents=True,exist_ok=True)
     last=out/'last_model.pt'; accepted=out/'best_model.pt'; diagnostic=out/'diagnostic_best_val.pt'
     history_path=out/'training_history.csv'
@@ -302,7 +302,7 @@ def worker(args):
 
 def combine(args):
     import config
-    parent=Path(config.MODELS_DIR)/'texture_restoration_router_rf_v2'/'spectral_hybrid_gate_v2'
+    parent=Path(config.MODELS_DIR)/'tpssr'/'spectral_gate'
     scores=[];casefiles={}
     for name in VARIANTS:
         folder=parent/name
