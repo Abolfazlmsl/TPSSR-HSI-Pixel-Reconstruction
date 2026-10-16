@@ -73,3 +73,21 @@ def test_model_is_spectral_only():
         output = model(features)
     assert output.shape == (2, 16)
     assert torch.isfinite(output).all()
+
+
+def test_spectral_validation_does_not_include_test_acquisitions():
+    from argparse import Namespace
+    from experiment_config import resolve_experiment, spectral_validation_cores
+    expected = {
+        "swir_8x2": ("SWIR4", "SWIR9"),
+        "swir_region_a_to_b": ("SWIR4", "SWIR5"),
+        "swir_region_b_to_a": ("SWIR9", "SWIR10"),
+        "vnir_8x2": ("VNIR4", "VNIR9"),
+    }
+    for preset, validation in expected.items():
+        spec = resolve_experiment(Namespace(preset=preset, train_datasets=None,
+            test_datasets=None, dataset=None, active_test=None, experiment_name=None))
+        assert spectral_validation_cores(spec) == validation
+        assert not set(validation) & set(spec.tests)
+        assert set(validation).issubset(spec.train)
+        assert len([x for x in spec.train if x not in validation]) >= 3

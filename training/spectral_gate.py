@@ -3,8 +3,8 @@
 """TPSSR Hybrid V2: fit a confidence gate for a FROZEN spectral-only CNN-Transformer.
 
 New standalone project-root script; requires the existing project files
-training/spectral_backbone.py and training/spectral_data.py. No SWIR5/10
-are loaded. SWIR4 and SWIR9 are full acquisition-held-out validation cores.
+training/spectral_backbone.py and training/spectral_data.py. Only the
+source partition is used; validation cores are predeclared per preset.
 Two INDEPENDENT workers: GPU0 global/scalar gate, GPU1 per-band gate. No NCCL.
 """
 from __future__ import annotations
@@ -31,7 +31,7 @@ CORE=ROOT/'core'
 for p in (str(ROOT),str(CORE)):
     if p not in sys.path: sys.path.insert(0,p)
 
-from experiment_config import add_experiment_args,resolve_experiment
+from experiment_config import add_experiment_args,resolve_experiment,spectral_validation_cores
 from _launcher_common import env_for
 from training.spectral_data import SpectraDataset,load_core_data,FAMILIES
 from training.spectral_backbone import (
@@ -39,8 +39,20 @@ from training.spectral_backbone import (
 )
 
 VARIANTS=('global','band')
-TRAIN_CORES=('SWIR1','SWIR2','SWIR3','SWIR6','SWIR7','SWIR8')
-VALID_CORES=('SWIR4','SWIR9')
+# The active experiment comes from launcher environment or the explicit preset.
+# Resolve it at import so the inference loader and training workers agree.
+_preset_hint = None
+if '--preset' in sys.argv:
+    _index = sys.argv.index('--preset')
+    if _index + 1 < len(sys.argv):
+        _preset_hint = sys.argv[_index + 1]
+if _preset_hint is None and not (os.environ.get('HSI_TRAIN_DATASETS') and os.environ.get('HSI_TEST_DATASETS')):
+    _preset_hint = 'swir_8x2'
+_split_spec = resolve_experiment(argparse.Namespace(
+    preset=_preset_hint, train_datasets=None, test_datasets=None,
+    dataset=None, active_test=None, experiment_name=None))
+VALID_CORES = spectral_validation_cores(_split_spec)
+TRAIN_CORES = tuple(x for x in _split_spec.train if x not in VALID_CORES)
 
 class GlobalGate(nn.Module):
     """One correction-strength decision for a complete single-pixel spectrum."""
@@ -194,6 +206,8 @@ def worker(args):
     random.seed(args.seed);np.random.seed(args.seed);torch.manual_seed(args.seed)
     import config
     spec=resolve_experiment(args)
+    if args.val_cores is not None and tuple(args.val_cores)!=VALID_CORES:
+        raise RuntimeError('Validation split override does not match predeclared split')
     training,train_c,tr_i,val_c,val_i,wave=load_core_data(spec,VALID_CORES)
     if tuple(training)!=TRAIN_CORES:raise RuntimeError(f'Unexpected training cores: {training}')
     source_path,source_approved=get_backbone(Path(config.MODELS_DIR))
@@ -283,8 +297,8 @@ def worker(args):
             model_case_rmse=score['overall']['mean_case_model_rmse'],
             raw_case_rmse=score['overall']['mean_case_raw_rmse'],
             wins=score['overall']['wins'],losses=score['overall']['losses'],
-            swir4_rmse=score['by_core']['SWIR4']['model_rmse'],
-            swir9_rmse=score['by_core']['SWIR9']['model_rmse'],
+            swir4_rmse=score['by_core'][VALID_CORES[0]]['model_rmse'],
+            swir9_rmse=score['by_core'][VALID_CORES[1]]['model_rmse'],
             accepted=int(safe)))
         write_csv(history_path,hist)
         print(f'[{args.worker_variant}/GPU{args.gpu_index}] epoch {epoch}/{args.epochs}: '
@@ -315,8 +329,8 @@ def combine(args):
             rmse=overall['model_rmse'],raw_rmse=overall['raw_rmse'],
             mean_case_rmse=overall['mean_case_model_rmse'],raw_case_rmse=overall['mean_case_raw_rmse'],
             wins=overall['wins'],losses=overall['losses'],n_cases=overall['n_cases'],
-            swir4_rmse=bc['SWIR4']['model_rmse'],swir4_raw=bc['SWIR4']['raw_rmse'],
-            swir9_rmse=bc['SWIR9']['model_rmse'],swir9_raw=bc['SWIR9']['raw_rmse'],
+            swir4_rmse=bc[VALID_CORES[0]]['model_rmse'],swir4_raw=bc[VALID_CORES[0]]['raw_rmse'],
+            swir9_rmse=bc[VALID_CORES[1]]['model_rmse'],swir9_raw=bc[VALID_CORES[1]]['raw_rmse'],
             base_hybrid_checkpoint=saved['backbone_checkpoint'],checkpoint=str(cp)))
         csvname='best_accepted_val_per_case.csv' if ok else 'diagnostic_best_val_per_case.csv'
         with (folder/csvname).open(encoding='utf-8',newline='') as f:
@@ -362,7 +376,7 @@ def combine(args):
       'Only gate parameters trained. Spectral anchor and backbone unchanged.',
       'TRAIN CORES: '+', '.join(TRAIN_CORES),
       'FULLY HELDOUT VALIDATION CORES: '+', '.join(VALID_CORES),
-      'NO SWIR5 OR SWIR10 ACCESSED. NO SPATIAL INPUT.',
+      'Held-out test acquisitions not accessed. No spatial input.',
       'Single-pixel fully-missing spectrum remains ineligible: Region fallback.',
       'Original hybrid (same validation data): RMSE={:.7f}, wins={}/{} against raw.'.format(
           prev['model_rmse'],prev['wins'],prev['n_cases']),
@@ -373,8 +387,8 @@ def combine(args):
           f"  pooled RMSE={r['rmse']:.7f}; raw={r['raw_rmse']:.7f}",
           f"  mean-case RMSE={r['mean_case_rmse']:.7f}; raw={r['raw_case_rmse']:.7f}",
           f"  mask wins={r['wins']}/{r['n_cases']}; losses={r['losses']}",
-          f"  SWIR4={r['swir4_rmse']:.7f} vs raw={r['swir4_raw']:.7f}",
-          f"  SWIR9={r['swir9_rmse']:.7f} vs raw={r['swir9_raw']:.7f}",''])
+          f"  Validation A={r['swir4_rmse']:.7f} vs raw={r['swir4_raw']:.7f}",
+          f"  Validation B={r['swir9_rmse']:.7f} vs raw={r['swir9_raw']:.7f}",''])
     (parent/'GATE_SUMMARY.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
     print('\n'.join(lines),flush=True)
 
@@ -434,6 +448,7 @@ def main():
     add_experiment_args(ap)
     ap.add_argument('--gpus',type=int,default=2,choices=(2,))
     ap.add_argument('--epochs',type=int,default=8)
+    ap.add_argument('--val-cores',nargs='+',default=None)
     ap.add_argument('--train-samples',type=int,default=6000)
     ap.add_argument('--val-samples',type=int,default=1800)
     ap.add_argument('--batch-size',type=int,default=32)
@@ -451,8 +466,9 @@ def main():
     if any(k in os.environ for k in ('RANK','LOCAL_RANK','WORLD_SIZE')):
         raise RuntimeError('Unexpected distributed launch. Run directly; no torchrun.')
     spec=resolve_experiment(args)
-    if tuple(spec.train)!=('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9') or tuple(spec.tests)!=('SWIR5','SWIR10'):
-        raise RuntimeError('Use preset swir_8x2 with the original held-out split')
+    validation = spectral_validation_cores(spec)
+    if validation != VALID_CORES:
+        raise RuntimeError('Validation metadata differs from environment split')
     if not torch.cuda.is_available() or torch.cuda.device_count()<2:
         raise RuntimeError('Two GPUs required')
     if min(args.epochs,args.batch_size,args.train_samples,args.val_samples)<1 or args.val_samples%90:
@@ -463,10 +479,10 @@ def main():
     try:
         for gpu,name in enumerate(VARIANTS):
             cmd=[sys.executable,str(Path(__file__).resolve()),
-                '--preset','swir_8x2','--gpus','2','--epochs',str(args.epochs),
+                '--preset',args.preset,'--gpus','2','--epochs',str(args.epochs),
                 '--train-samples',str(args.train_samples),'--val-samples',str(args.val_samples),
                 '--batch-size',str(args.batch_size),'--lr',str(args.lr),'--seed',str(args.seed),
-                '--worker-variant',name,'--gpu-index',str(gpu)]
+                '--worker-variant',name,'--gpu-index',str(gpu),'--val-cores',*validation]
             if args.amp:cmd.append('--amp')
             if args.resume:cmd.append('--resume')
             print(f'Launching frozen-Hybrid {name} gate on GPU {gpu}',flush=True)

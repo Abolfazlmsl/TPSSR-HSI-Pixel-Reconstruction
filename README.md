@@ -25,13 +25,34 @@ plot_method_comparison.py      Scenario/severity plots (DDS2M omitted pending co
 preflight.py                   Checkpoint and processed-data checks
 ```
 
-## Reproducible protocol
+## Reproducible protocol and presets
 
-The released TPSSR network trainers target the `swir_8x2` experiment. Train acquisitions are **SWIR1, SWIR2, SWIR3, SWIR4, SWIR6, SWIR7, SWIR8 and SWIR9**; independent held-out tests are **SWIR5 and SWIR10**. The spectral network fits its parameters using six training acquisitions and uses SWIR4/SWIR9 for validation. Both held-out acquisitions share one trained TPSSR model; `swir5` is only its checkpoint tag.
+The released TPSSR V2.3 architecture and fixed mask-only routing policy can be
+trained under these four presets. Each experiment has separate folders for
+checkpoints, masks and results; the original `swir_8x2` checkpoint layout is
+unchanged.
 
-The test benchmark uses **200 masks in total across SWIR5 and SWIR10**, not 200 per acquisition. The global budget is allocated deterministically between test acquisitions. The same experiment mask selection is used by the benchmark launchers. No held-out reflectance is used for network training or choosing inference routes. Prior selection of the routing policy using these test acquisitions does, however, make performance on them *development-set*, not untouched holdout, evidence; document that distinction in publication materials.
+| Preset | Training acquisitions | Held-out test acquisitions | Spectral validation acquisitions |
+|---|---|---|---|
+| `swir_8x2` | SWIR1–4, SWIR6–9 | SWIR5, SWIR10 | SWIR4, SWIR9 |
+| `swir_region_a_to_b` | SWIR1–5 | SWIR6–10 | SWIR4, SWIR5 |
+| `swir_region_b_to_a` | SWIR6–10 | SWIR1–5 | SWIR9, SWIR10 |
+| `vnir_8x2` | VNIR1–4, VNIR6–9 | VNIR5, VNIR10 | VNIR4, VNIR9 |
 
-The `experiment_config.py` module supports other baseline and data-preparation splits, but the included spectral TPSSR trainer is fixed to `swir_8x2`. Do not label other TPSSR splits as supported without adapting and validating the network trainers.
+Spectral validation acquisitions are **held out from spectral weight fitting**,
+although they belong to the source-side partition; the geometry/topology
+training uses the configured full source partition with within-acquisition
+spatial validation. Therefore A→B and B→A each have three acquisitions for
+spectral weight fitting and two for core-level validation, not five spectral
+training acquisitions. This choice preserves two-core spectral acceptance
+criteria and prevents target-area validation leakage.
+
+The official benchmark uses **200 masks per complete experiment** (100 per test
+acquisition with two tests, 40 with five tests). The same deterministic
+scenario/severity-stratified mask budgeting is used by TPSSR and the analytical
+Spectral baseline. The routing policy was previously developed with insight
+from SWIR5/SWIR10 and is frozen for these runs; do not claim those specific
+acquisitions are completely unseen in policy development.
 
 ## Environment
 
@@ -53,19 +74,41 @@ python prepare_dataset.py --preset swir_8x2
 
 Preserve the original experiment's processed arrays, synthetic masks, and trained checkpoints when comparing results. Do not replace those with new random masks for a paired comparison.
 
-## Training and inference
+## TPSSR training and evaluation (two GPUs)
+
+For **each** new preset, run the following in sequence, replacing `PRESET` with
+`swir_region_a_to_b`, `swir_region_b_to_a`, or `vnir_8x2`:
 
 ```bash
-python train.py --preset swir_8x2 --dry-run
-python train.py --preset swir_8x2 --gpus 2
-python preflight.py --preset swir_8x2
-python test.py --preset swir_8x2 --gpus 2 --max-masks 200
-python evaluate.py --preset swir_8x2 --visuals 3
+python prepare_dataset.py --preset PRESET
+python preflight.py --preset PRESET --data-only
+python train.py --preset PRESET --gpus 2 --dry-run
+python train.py --preset PRESET --gpus 2
+python preflight.py --preset PRESET
+python test.py --preset PRESET --gpus 2 --max-masks 200
+python evaluate.py --preset PRESET --visuals 0
+python benchmarks.py --preset PRESET --method spectral --stage test --max-masks 200
 ```
 
-Training stages: (1) spectral backbone; (2) band-wise confidence gate with a frozen backbone; (3) learned geometry guidance; (4) topology-based reconstruction with frozen guidance. The routing rules are deterministic and use only corrupted observations, mask geometry, and measured neighbors, with no additional trainable router. Existing accepted checkpoint files are not overwritten by the coordinator.
+`--data-only` checks existing processed arrays, wavelength alignment and mask
+presence without loading the full cubes or using a GPU. Do not start the long
+training run if this check fails. For new experiments, the backbone, band gate,
+geometry and topology all require new weights; never copy the original
+`swir_8x2` weights across sensor or transfer experiments. The checkpoint tag
+uses the first held-out acquisition only as a **folder name**, not as training
+input. Two GPUs train CNN and Hybrid candidates concurrently, then the two
+gate candidates; geometry/topology run DDP on two GPUs. The fixed V2.3 routing
+policy is not retrained.
 
-The spectral gate is pinned to the SHA256 digest of its source backbone. An incompatible backbone is rejected rather than silently loaded. No model weights or datasets are included in this code-only release.
+The spectral backbone and confidence gate have validation acceptance checks.
+If no band gate meets them within the configured epochs, training stops instead
+of silently promoting a diagnostic model to publication status. Investigate
+validation results before making a documented new experiment or retrying.
+
+Results are stored under `results/<experiment>/...`, and TPSSR checkpoints
+under `trained_models/<experiment>/tpssr/`. The clean code bundle contains
+no actual data or trained weights. The smoke and dry-run checks are NOT a
+substitute for end-to-end GPU verification on the laboratory server.
 
 ## Benchmarks
 
@@ -86,7 +129,7 @@ DDS2M is deliberately **not** included in the method comparison plots until the 
 python plot_method_comparison.py --experiment-dir results/swir__train_1-2-3-4-6-7-8-9__test_5-10
 ```
 
-The evaluator reports **RMSE, MAE, R², SAM and SSIM** where provided by each method. Missing benchmark SSIM values are not invented; the plotting script leaves them absent. TPSSR's combined results appear under `results/<experiment>/combined/tpssr/`. Figures show original / masked / reconstructed panels and should be interpreted alongside coverage and comparable sampled-mask identities.
+The evaluator reports **RMSE, MAE, R², SAM and SSIM** where provided by each method, but SSIM is not used in the final cross-method comparison. Missing benchmark SSIM values are not invented; the plotting script leaves them absent. TPSSR's combined results appear under `results/<experiment>/combined/tpssr/`. Figures show original / masked / reconstructed panels and should be interpreted alongside coverage and comparable sampled-mask identities.
 
 ## Safety and reproducibility
 
@@ -102,4 +145,5 @@ The evaluator reports **RMSE, MAE, R², SAM and SSIM** where provided by each me
 python -m compileall -q .
 python -m pytest -q tests
 python train.py --preset swir_8x2 --dry-run
+python train.py --preset swir_region_a_to_b --dry-run
 ```

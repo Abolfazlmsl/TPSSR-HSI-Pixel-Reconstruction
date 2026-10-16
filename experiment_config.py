@@ -323,3 +323,21 @@ def describe(spec: ExperimentSpec) -> str:
         f"Active test: {spec.active_test}\n"
         f"Internal model tag: {spec.primary_test}"
     )
+
+
+def spectral_validation_cores(spec: ExperimentSpec) -> tuple[str, str]:
+    """Two acquisition-held-out validation cores from the training partition.
+
+    Preserve the original 8x2 split exactly. Region transfer uses two cores
+    from the source region, never from the target region.
+    """
+    choices = {
+        ("SWIR5", "SWIR10"): ("SWIR4", "SWIR9"),
+        ("SWIR6", "SWIR7", "SWIR8", "SWIR9", "SWIR10"): ("SWIR4", "SWIR5"),
+        ("SWIR1", "SWIR2", "SWIR3", "SWIR4", "SWIR5"): ("SWIR9", "SWIR10"),
+        ("VNIR5", "VNIR10"): ("VNIR4", "VNIR9"),
+    }
+    names = choices.get(tuple(spec.tests))
+    if names is None or not set(names).issubset(set(spec.train)):
+        raise ValueError(f"No predeclared spectral validation split for {spec.experiment_name}")
+    return names

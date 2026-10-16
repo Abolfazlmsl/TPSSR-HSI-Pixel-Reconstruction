@@ -228,3 +228,5 @@ simulated_saturation/
 trained_models/
 
 results/
+
+NRMSE_PERCENT_AUDIT/

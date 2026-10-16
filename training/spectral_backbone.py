@@ -5,8 +5,8 @@
 One independent process per GPU (CNN GPU 0, Hybrid GPU 1); no NCCL or DDP.
 This file is standalone ADDITION to project root; it imports the EXISTING
 training/spectral_data.py's trusted data/mask helpers.
-No access to SWIR5/SWIR10; cross-acquisition validation SWIR4/SWIR9.
-Run: python training/spectral_backbone.py --preset swir_8x2 --gpus 2 ...
+Validation acquisitions are selected from the source partition by preset.
+Run: python -m training.spectral_backbone --preset PRESET --gpus 2 ...
 """
 from __future__ import annotations
 import argparse
@@ -32,7 +32,7 @@ CORE = ROOT / 'core'
 for p in (str(ROOT), str(CORE)):
     if p not in sys.path: sys.path.insert(0,p)
 
-from experiment_config import add_experiment_args, resolve_experiment
+from experiment_config import add_experiment_args, resolve_experiment, spectral_validation_cores
 from _launcher_common import env_for
 try:
     from training.spectral_data import (
@@ -200,7 +200,7 @@ def write_csv(path,rows):
 
 def group_rows(path,rows):
     output=[]
-    for name in ('SWIR4','SWIR9'):
+    for name in sorted({x['validation_core'] for x in rows}):
         for fam in FAMILIES:
             for sev in range(1,6):
                 r=[x for x in rows if x['validation_core']==name and x['scenario']==fam
@@ -256,7 +256,7 @@ def run_worker(args):
     torch.cuda.manual_seed_all(args.seed)
     import config
     spec=resolve_experiment(args)
-    val_cores=tuple(c.upper() for c in args.val_cores)
+    val_cores=tuple(c.upper() for c in (args.val_cores or spectral_validation_cores(spec)))
     train_names, train_c,tr_i,val_c,val_i,wave=load_core_data(spec,val_cores)
     model_name=args.worker_model
     output=(Path(config.MODELS_DIR)/'tpssr'
@@ -346,8 +346,8 @@ def run_worker(args):
             val_mean_case_rmse=score['overall']['mean_case_model_rmse'],
             raw_mean_case_rmse=score['overall']['mean_case_raw_rmse'],
             wins=score['overall']['wins'],losses=score['overall']['losses'],
-            SWIR4_rmse=score['by_core'][val_cores[0]]['model_rmse'],
-            SWIR9_rmse=score['by_core'][val_cores[1]]['model_rmse'],
+            val_a_rmse=score['by_core'][val_cores[0]]['model_rmse'],
+            val_b_rmse=score['by_core'][val_cores[1]]['model_rmse'],
             accepted=int(accepted)))
         write_csv(history_path,history)
         print(f'[{model_name.upper()} / GPU {args.gpu_index}] epoch {epoch}/{args.epochs}: '
@@ -381,8 +381,8 @@ def combine(args):
            n_parameters=chk['n_parameters'],pooled_rmse=a['model_rmse'],raw_rmse=a['raw_rmse'],
            mean_case_rmse=a['mean_case_model_rmse'],raw_mean_case_rmse=a['mean_case_raw_rmse'],
            wins=a['wins'],losses=a['losses'],n_cases=a['n_cases'],
-           swir4_rmse=bc['SWIR4']['model_rmse'],swir4_raw=bc['SWIR4']['raw_rmse'],
-           swir9_rmse=bc['SWIR9']['model_rmse'],swir9_raw=bc['SWIR9']['raw_rmse'],
+           swir4_rmse=bc[list(bc)[0]]['model_rmse'],swir4_raw=bc[list(bc)[0]]['raw_rmse'],
+           swir9_rmse=bc[list(bc)[1]]['model_rmse'],swir9_raw=bc[list(bc)[1]]['raw_rmse'],
            checkpoint=str(path)))
     per_case={}
     for r in results:
@@ -409,7 +409,7 @@ def combine(args):
             hybrid_wins=int(float(b['model_rmse'])<float(a['model_rmse']))))
     write_csv(parent/'PAIRED_CNN_VS_HYBRID.csv',paired)
     scenarios=[]
-    for core_name in ('SWIR4','SWIR9'):
+    for core_name in sorted({x['validation_core'] for x in paired}):
         for fam in FAMILIES:
             for sev in range(1,6):
                 sub=[k for k in paired if k['validation_core']==core_name and
@@ -429,21 +429,21 @@ def combine(args):
     write_csv(parent/'SCENARIO_SEVERITY_COMPARISON.csv',scenarios)
     write_csv(parent/'ARCHITECTURE_COMPARISON.csv',results)
     lines=['TPSSR SPECTRAL-ONLY ARCHITECTURE COMPARISON',
-      'Training: SWIR1, SWIR2, SWIR3, SWIR6, SWIR7, SWIR8',
-      'Core-level validation: SWIR4, SWIR9 (never SWIR5 or SWIR10)',
+      'Training cores specified by experiment preset',
+      'Core-level validation: acquisition held-out from source training partition',
       'CNN GPU0, Hybrid CNN-Transformer GPU1; independent runs; identical data and seeds.',
       'All reported validation targets are synthetic held-out bands (same coordinates/masks).',
       'SSIM cannot be meaningfully evaluated from isolated spectra; final image test required.',
       'A model with accepted=0 is DIAGNOSTIC ONLY, NOT APPROVED to replace Spectral.',
-      'Both architectures compared on identical 1800 validation samples.',
+      'Both architectures compared on identical validation samples.',
       'Fully missing spectra ineligible; Region remains necessary.','']
     for r in results:
         lines += [f'{r["architecture"]}: accepted={bool(r["accepted"])}; '
                 f'epoch={r["selected_epoch"]}; params={r["n_parameters"]:,}',
                   f'  pooled RMSE={r["pooled_rmse"]:.7f}; raw={r["raw_rmse"]:.7f}',
                   f'  mean-case RMSE={r["mean_case_rmse"]:.7f}; raw={r["raw_mean_case_rmse"]:.7f}',
-                  f'  wins={r["wins"]}/{r["n_cases"]}; SWIR4={r["swir4_rmse"]:.7f} raw={r["swir4_raw"]:.7f}; '
-                  f'SWIR9={r["swir9_rmse"]:.7f} raw={r["swir9_raw"]:.7f}','']
+                  f'  wins={r["wins"]}/{r["n_cases"]}; validation A={r["swir4_rmse"]:.7f} raw={r["swir4_raw"]:.7f}; '
+                  f'validation B={r["swir9_rmse"]:.7f} raw={r["swir9_raw"]:.7f}','']
     lines += [f'CNN beats Hybrid on {sum(z["cnn_wins"] for z in paired)} / {len(paired)} validation samples;',
               f'Hybrid beats CNN on {sum(z["hybrid_wins"] for z in paired)} / {len(paired)}.', '']
     (parent/'ARCHITECTURE_SUMMARY.txt').write_text('\n'.join(lines)+'\n',encoding='utf8')
@@ -500,7 +500,7 @@ def main():
     parser.add_argument('--seed',type=int,default=20261012)
     parser.add_argument('--workers',type=int,default=0,
           help='DataLoader workers per process; 0 minimizes RAM and avoids subprocess hangs')
-    parser.add_argument('--val-cores',nargs='+',default=['SWIR4','SWIR9'])
+    parser.add_argument('--val-cores',nargs='+',default=None)
     parser.add_argument('--amp',action='store_true')
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--smoke-test',action='store_true')
@@ -514,11 +514,9 @@ def main():
     if any(k in os.environ for k in ('RANK','LOCAL_RANK','WORLD_SIZE')):
         raise RuntimeError('Unexpected distributed environment; run directly, not via torchrun')
     spec=resolve_experiment(args)
-    val_names=tuple(x.upper() for x in args.val_cores)
-    if tuple(val_names)!=('SWIR4','SWIR9'):
-        raise RuntimeError('This controlled comparison fixes validation acquisitions to SWIR4, SWIR9')
-    if len(spec.train)!=8 or tuple(spec.tests)!=('SWIR5','SWIR10') or set(val_names)&set(spec.tests):
-        raise RuntimeError('Use --preset swir_8x2; never use test cores in training/validation')
+    val_names=tuple(x.upper() for x in (args.val_cores or spectral_validation_cores(spec)))
+    if val_names != spectral_validation_cores(spec):
+        raise RuntimeError('Validation acquisitions must match the predeclared split')
     if args.batch_size<1 or args.train_samples<10 or args.val_samples<90 or args.epochs<1:
         raise ValueError('Insufficient training/validation settings')
     if not torch.cuda.is_available() or torch.cuda.device_count()<2:
@@ -531,7 +529,7 @@ def main():
     try:
         for gpu,name in enumerate(MODEL_NAMES):
             cmd=[sys.executable,str(Path(__file__).resolve()),
-                  '--preset','swir_8x2','--worker-model',name,'--gpu-index',str(gpu),
+                  '--preset',args.preset,'--worker-model',name,'--gpu-index',str(gpu),
                   '--gpus','2','--epochs',str(args.epochs),
                   '--train-samples',str(args.train_samples),
                   '--val-samples',str(args.val_samples),'--batch-size',str(args.batch_size),

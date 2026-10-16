@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Verify the checkpoint and test-data layout used by TPSSR V2.3 inference.
 
-SWIR5 is the stable checkpoint tag for the shared SWIR5/SWIR10 experiment.
-The tests DO NOT need one separately trained region model per acquisition.
+The first held-out acquisition is only a checkpoint folder tag.
+Each experiment shares a trained model across its held-out acquisitions.
 """
 from __future__ import annotations
 import argparse
@@ -25,10 +25,47 @@ def sha256(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     add_experiment_args(parser)
+    parser.add_argument("--data-only", action="store_true",
+                        help="Verify all training/test arrays and test masks before GPU training")
     a = parser.parse_args()
     spec = resolve_experiment(a)
-    if tuple(spec.tests) != ('SWIR5', 'SWIR10') or len(spec.train) != 8:
-        parser.error('This specific Hybrid gate checker supports only the main swir_8x2 split.')
+    from experiment_config import spectral_validation_cores
+    validation = spectral_validation_cores(spec)
+    training = tuple(x for x in spec.train if x not in validation)
+    if a.data_only:
+        failures = []
+        reference = None
+        for name in (*spec.train, *spec.tests):
+            data = ROOT / 'processed_data' / name
+            required = ['calibrated_reflectance.npy', 'invalid_mask.npy', 'wavelengths_nm.npy']
+            if any(not (data / item).is_file() for item in required):
+                failures.append(f"{name}: missing processed arrays")
+                continue
+            try:
+                cube = np.load(data / required[0], mmap_mode='r')
+                invalid = np.load(data / required[1], mmap_mode='r')
+                wave = np.load(data / required[2])
+                if cube.ndim != 3 or cube.shape != invalid.shape or cube.shape[-1] != len(wave):
+                    failures.append(f"{name}: inconsistent array shapes")
+                if reference is None:
+                    reference = wave
+                elif len(reference) != len(wave) or not np.allclose(reference, wave, rtol=0, atol=0.5):
+                    failures.append(f"{name}: incompatible wavelength grid")
+                print(f"{name}: cube={cube.shape}; invalid={invalid.shape}; bands={len(wave)}")
+            except Exception as exc:
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+        for name in spec.tests:
+            folder = ROOT / 'simulated_saturation' / spec.experiment_name / name / 'masks'
+            count = sum(1 for _ in folder.glob('*.npz'))
+            print(f"{name}: {count} simulated masks")
+            if count < 40:
+                failures.append(f"{name}: too few test masks (found {count})")
+        print(f"DATA CHECK: {len(failures)} issue(s)")
+        for failure in failures:
+            print("ERROR:", failure)
+        if failures:
+            sys.exit(2)
+        return
     root = ROOT / 'trained_models' / spec.experiment_name / 'tpssr'
     tag = spec.model_tag
     backbone_options = [
@@ -65,6 +102,9 @@ def main():
         g = torch.load(gate, map_location='cpu', weights_only=False)
         if g.get('architecture') != 'spectral_only_hybrid_confidence_gate_v2' or g.get('gate_variant') != 'band':
             missing.append('Invalid band confidence gate architecture')
+        elif (tuple(g.get('run_config', {}).get('train_cores', ())) != training or
+              tuple(g.get('run_config', {}).get('val_cores', ())) != validation):
+            missing.append('Spectral checkpoint split metadata mismatch')
         elif not any(p.exists() and sha256(p) == g.get('backbone_sha256') for p in backbone_options):
             missing.append('Spectral backbone does not match gate SHA256')
         else:

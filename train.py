@@ -21,8 +21,6 @@ from experiment_config import add_experiment_args, resolve_experiment, describe
 
 METHOD_DIR = CORE / 'reconstruction_methods' / 'tpssr'
 FAMILY = 'tpssr'
-EXPECTED_TRAIN = ('SWIR1', 'SWIR2', 'SWIR3', 'SWIR4', 'SWIR6', 'SWIR7', 'SWIR8', 'SWIR9')
-EXPECTED_TEST = ('SWIR5', 'SWIR10')
 
 
 def sha256(path: Path) -> str:
@@ -131,9 +129,8 @@ def main():
     ap.add_argument('--topology-val-samples', type=int, default=900)
     args = ap.parse_args()
     spec = resolve_experiment(args)
-    if tuple(spec.train) != EXPECTED_TRAIN or tuple(spec.tests) != EXPECTED_TEST:
-        ap.error('The current frozen Spectral trainer/runtime supports only --preset swir_8x2. '
-                 'Cross-region and VNIR require retraining/adapting their spectral trainers, not merely changing tags.')
+    from experiment_config import spectral_validation_cores
+    val_cores = spectral_validation_cores(spec)
     if min(args.hybrid_epochs, args.gate_epochs, args.topology_epochs,
            args.topology_min_epochs, args.topology_patience,
            args.topology_train_samples, args.topology_val_samples) < 1:
@@ -162,7 +159,8 @@ def main():
 
     print('\nTPSSR V2.3 TRAINING: spectral backbone + confidence gate + geometry-guided completion')
     print(describe(spec))
-    print('One shared model; SWIR5 and SWIR10 are never used for training.')
+    print('One shared model; held-out TEST acquisitions are never used for training.')
+    print('Spectral validation cores:', ', '.join(val_cores))
     print('Checkpoint tag:', tag, '(folder label only, not training data)')
     print('The inference policy needs NO trainable router.\n')
 
@@ -183,8 +181,8 @@ def main():
             print('SKIP spectral backbone: found', chosen)
         else:
             print('STAGE 1/4: spectral backbone')
-            cmd = [sys.executable, '-m', 'training.spectral_backbone', '--preset', 'swir_8x2', '--gpus', '2',
-                   '--epochs', str(args.hybrid_epochs)]
+            cmd = [sys.executable, '-m', 'training.spectral_backbone', '--preset', args.preset, '--gpus', '2',
+                   '--epochs', str(args.hybrid_epochs), '--val-cores', *val_cores]
             if (hybrid_root / 'last_model.pt').exists():
                 cmd.append('--resume')
             launch(cmd, spec, dry_run=args.dry_run)
@@ -195,8 +193,8 @@ def main():
             print('SKIP band confidence gate: found', gate)
         else:
             print('STAGE 2/4: confidence gate with a frozen backbone')
-            cmd = [sys.executable, '-m', 'training.spectral_gate', '--preset', 'swir_8x2', '--gpus', '2',
-                   '--epochs', str(args.gate_epochs)]
+            cmd = [sys.executable, '-m', 'training.spectral_gate', '--preset', args.preset, '--gpus', '2',
+                   '--epochs', str(args.gate_epochs), '--val-cores', *val_cores]
             if (gate_dir / 'last_model.pt').exists():
                 cmd.append('--resume')
             launch(cmd, spec, dry_run=args.dry_run)
@@ -251,7 +249,7 @@ def main():
 
     print('\nDONE.' if not args.dry_run else '\nDRY-RUN PLAN FINISHED.')
     if not args.dry_run and args.stage == 'all':
-        print('Inference: python test.py --preset swir_8x2 --gpus 2 '
+        print('Inference: python test.py --preset ' + str(args.preset) + ' --gpus 2 '
               '--routing-mode tpssr --max-masks 200')
 
 
