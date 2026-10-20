@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the checkpoint and test-data layout used by TPSSR V2.3 inference.
+"""Check data and frozen checkpoint files before TPSSR inference.
 
 The first held-out acquisition is only a checkpoint folder tag.
 Each experiment shares a trained model across its held-out acquisitions.
@@ -27,6 +27,9 @@ def main():
     add_experiment_args(parser)
     parser.add_argument("--data-only", action="store_true",
                         help="Verify all training/test arrays and test masks before GPU training")
+    parser.add_argument("--router", choices=("learned_router3_aligned", "v23"),
+                        default="learned_router3_aligned",
+                        help="Checkpoint set to verify; defaults to the final learned router")
     a = parser.parse_args()
     spec = resolve_experiment(a)
     from experiment_config import spectral_validation_cores
@@ -83,13 +86,18 @@ def main():
         'Geometry guidance checkpoint': geometry_options,
         'Topology completion checkpoint': [topology],
     }
+    if a.router == 'learned_router3_aligned':
+        groups['Learned neighbor fusion checkpoint'] = [
+            root / 'neighbor_fusion' / 'best_model.pt']
+        groups['Learned three-expert router checkpoint'] = [
+            root / 'learned_router3_aligned' / 'best_model.joblib']
     for name in spec.tests:
         for short, file in (('reflectance', 'calibrated_reflectance.npy'),
                             ('invalid mask', 'invalid_mask.npy'),
                             ('wavelength grid', 'wavelengths_nm.npy')):
             groups[f'{name} {short}'] = [ROOT / 'processed_data' / name / file]
     missing = []
-    print('TPSSR V2.3 PRE-FLIGHT\nExperiment:', spec.experiment_name,
+    print('TPSSR PRE-FLIGHT\nExperiment:', spec.experiment_name,
           '\nShared model tag:', tag, '\n')
     for label, options in groups.items():
         found = next((path for path in options if path.is_file()), None)

@@ -229,6 +229,7 @@ trained_models/
 
 results/
 
+NRMSE_PERCENT_AUDIT/
+
 vnir_png_exports/
 swir_png_exports/
-NRMSE_PERCENT_AUDIT/

@@ -22,7 +22,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.model_selection import KFold
 
 import config
 from experiment_config import add_experiment_args, resolve_experiment, spectral_validation_cores
@@ -47,10 +46,10 @@ FEATURE_NAMES = (
 )
 
 
-def path_for(base, objective="log_rmse", region_expert="raw", adaptive=False):
+def path_for(base, objective="log_rmse", region_expert="raw"):
     if region_expert not in ("raw", "refined"):
         raise ValueError("Unknown Region expert variant")
-    folder = ("learned_router3_adaptive" if adaptive else "learned_router3_aligned" if region_expert == "refined"
+    folder = ("learned_router3_aligned" if region_expert == "refined"
               else "learned_router3_rmse" if objective == "mse" else "learned_router3")
     if objective not in ("log_rmse", "mse"):
         raise ValueError("Unknown Router3 objective")
@@ -58,13 +57,14 @@ def path_for(base, objective="log_rmse", region_expert="raw", adaptive=False):
 
 
 def shadow_experiment(spec, val_cores):
-    if len(val_cores) != 2 or len(set(val_cores)) != 2 or not set(val_cores).issubset(spec.train):
+    if (len(val_cores) != 2 or len(set(val_cores)) != 2 or
+            not set(val_cores).issubset(spec.train)):
         raise ValueError('Three-expert calibration requires two distinct source-only calibration cores')
     train = tuple(n for n in spec.train if n not in val_cores)
     if len(train) not in (3, 6):
-        raise ValueError('Shadow Region expects three (5/5) or six (8/2) source fitting cores')
+        raise ValueError('Shadow Region expects three or six fitting cores')
     if set(train) & set(spec.tests):
-        raise ValueError('Held-out test acquisitions must never enter shadow Region training')
+        raise ValueError('Held-out test cores cannot be used to fit Shadow Region')
     return spec.experiment_name + '__router3_region_oof', train
 
 
@@ -209,73 +209,6 @@ def features_for_pixel(cube, mask, cy, cx, mean, std, wave, fusion_model=None,
     return row, anchor if obs.size >= 2 else None, fusion
 
 
-
-def spectral_blend_moments(interpolation, fusion, truth):
-    """Squared-error polynomial for interp + alpha * (fusion - interp)."""
-    i = np.asarray(interpolation, np.float64)
-    f = np.asarray(fusion, np.float64)
-    y = np.asarray(truth, np.float64)
-    if i.shape != f.shape or i.shape != y.shape or not np.isfinite(i+f+y).all():
-        raise ValueError('Cannot compute spectral blend target from invalid arrays')
-    d = f-i
-    e = i-y
-    return np.array([np.mean(e*e), np.mean(e*d), np.mean(d*d)], np.float64)
-
-
-def spectral_blend_error(moments, alpha):
-    a, c, d = np.moveaxis(np.asarray(moments, np.float64), -1, 0)
-    alpha = np.asarray(alpha, np.float64)
-    return np.sqrt(np.maximum(0., a + 2. * alpha * c + alpha**2 * d))
-
-
-def fit_spectral_blend_gate(x, moments):
-    """Fit measured-error optimal blend weights without hand-coded damage routing."""
-    x = np.asarray(x, np.float32)
-    m = np.asarray(moments, np.float64)
-    usable = np.isfinite(m).all(axis=1) & (m[:,2] > 1e-12)
-    if usable.sum() < 60:
-        raise RuntimeError('Too few usable spectral observations for learned guard')
-    optimum = np.clip(-m[usable,1]/m[usable,2], 0., 1.)
-    weight = m[usable,2]
-    # Extreme squared corrections can dominate small source-core calibrations.
-    weight = np.minimum(weight, np.percentile(weight, 95))
-    weight /= max(float(np.mean(weight)), 1e-12)
-    model = HistGradientBoostingRegressor(max_iter=110, max_leaf_nodes=7,
-        learning_rate=.045, min_samples_leaf=20, l2_regularization=3., random_state=8241)
-    model.fit(x[usable], optimum, sample_weight=weight)
-    return model
-
-
-def spectral_gate_weights(model, x):
-    x=np.asarray(x,np.float32)
-    if x.ndim!=2 or x.shape[1]!=len(FEATURE_NAMES):
-        raise ValueError('Invalid spectral gate features')
-    values=np.asarray(model.predict(x), np.float64)
-    if not np.isfinite(values).all():
-        raise RuntimeError('Spectral guard returned nonfinite weights')
-    return np.clip(values,0.,1.)
-
-
-def cross_fit_spectral_gate(x, moments, cores, seed=8207):
-    """No calibration label uses the guard fitted to that same example."""
-    x=np.asarray(x,np.float32); m=np.asarray(moments,np.float64)
-    cores=np.asarray(cores,np.int64)
-    fit=np.flatnonzero(cores==0)
-    hold=np.flatnonzero(cores==1)
-    if len(fit)<100 or len(hold)<100:
-        raise RuntimeError('Missing source calibration and holdout cores')
-    weights=np.full(len(x), np.nan, np.float64)
-    kfold=KFold(n_splits=4,shuffle=True,random_state=seed)
-    for train_index, val_index in kfold.split(fit):
-        model=fit_spectral_blend_gate(x[fit[train_index]],m[fit[train_index]])
-        weights[fit[val_index]]=spectral_gate_weights(model,x[fit[val_index]])
-    final=fit_spectral_blend_gate(x[fit],m[fit])
-    weights[hold]=spectral_gate_weights(final,x[hold])
-    if not np.isfinite(weights).all():
-        raise RuntimeError('Incomplete cross-fitted spectral weights')
-    return final, weights
-
-
 def predict_risks(payload, x, availability=None):
     x = np.asarray(x, np.float32)
     if x.ndim != 2 or x.shape[1] != len(FEATURE_NAMES):
@@ -297,7 +230,7 @@ def predict_risks(payload, x, availability=None):
     return risks
 
 
-def fit_models(x, err, present, core, source_cores, objective="log_rmse", case_meta=None, region_quantile=None):
+def fit_models(x, err, present, core, source_cores, objective="log_rmse", case_meta=None):
     """Fit three independent conditional risk regressors, holding out one core."""
     x=np.asarray(x,np.float32); err=np.asarray(err,np.float64)
     present=np.asarray(present,bool); core=np.asarray(core,np.int64)
@@ -314,18 +247,16 @@ def fit_models(x, err, present, core, source_cores, objective="log_rmse", case_m
         fit = (core == 0) & present[:,k] & np.isfinite(err[:,k])
         if fit.sum() < 50:
             raise RuntimeError(f'Insufficient calibration data for expert {EXPERTS[k]}: {fit.sum()}')
-        options = dict(max_iter=130, learning_rate=.045, max_leaf_nodes=12,
+        estimator = HistGradientBoostingRegressor(
+            max_iter=130, learning_rate=.045, max_leaf_nodes=12,
             min_samples_leaf=12, l2_regularization=1.5, random_state=8207+k)
-        if k == 2 and region_quantile is not None:
-            options.update(loss='quantile', quantile=float(region_quantile))
-        estimator = HistGradientBoostingRegressor(**options)
         target = np.square(err[fit,k]) if objective == 'mse' else np.log(np.maximum(err[fit,k], 1e-6))
         estimator.fit(x[fit], target)
         models.append(estimator)
     payload={'architecture':ARCH_MSE if objective == 'mse' else ARCH,
              'risk_target':objective,'feature_names':FEATURE_NAMES,'expert_names':EXPERTS,
              'models':models,'fit_cores':[source_cores[0]],'holdout_cores':[source_cores[1]],
-             'source_cores':list(source_cores), 'region_tail_quantile':region_quantile, 'fit_cases':int((core==0).sum()),
+             'source_cores':list(source_cores), 'fit_cases':int((core==0).sum()),
              'holdout_cases':int((core==1).sum())}
     hold = core == 1
     risk = predict_risks(payload, x[hold], present[hold])
@@ -386,7 +317,7 @@ def fit_models(x, err, present, core, source_cores, objective="log_rmse", case_m
     return payload
 
 
-def load_checkpoint(path, gate_path, fusion_path, region_geometry_path, region_topology_path, expected_cores, objective="log_rmse", region_expert="raw", adaptive=False):
+def load_checkpoint(path, gate_path, fusion_path, region_geometry_path, region_topology_path, expected_cores, objective="log_rmse", region_expert="raw"):
     payload=joblib.load(path)
     if (payload.get('architecture') != (ARCH_MSE if objective == 'mse' else ARCH) or
         tuple(payload.get('feature_names',())) != FEATURE_NAMES or
@@ -403,11 +334,6 @@ def load_checkpoint(path, gate_path, fusion_path, region_geometry_path, region_t
         raise RuntimeError('Three-expert Region definition mismatch')
     if tuple(payload.get('source_cores',())) != tuple(expected_cores):
         raise RuntimeError('Three-expert router provenance mismatch')
-    if adaptive:
-        if (payload.get('router_variant') != 'adaptive_spectral_tailrisk_v1' or
-            payload.get('spectral_guard_model') is None or
-            payload.get('region_tail_quantile') != .85):
-            raise RuntimeError('Adaptive Router3 checkpoint missing trained components')
     return payload
 
 
@@ -441,7 +367,7 @@ def _lookup_region(region_model, cube, mask, coords, device, batch):
 
 
 def make_training_case(cube, invalid, rng, scenario, severity, mean, std, wave,
-                       hybrid, fusion, region, device, region_batch, region_expert="raw", spectral_moments=False):
+                       hybrid, fusion, region, device, region_batch, region_expert="raw"):
     h,w,b=cube.shape
     for _ in range(75):
         y=int(rng.integers(32,h-32)) if h>64 else int(rng.integers(h))
@@ -473,10 +399,6 @@ def make_training_case(cube, invalid, rng, scenario, severity, mean, std, wave,
         risks=np.asarray([np.sqrt(np.mean((interp[bands]-truth)**2)) if interp is not None else np.nan,
                           np.sqrt(np.mean((fp[bands]-truth)**2)) if fp is not None else np.nan,
                           np.sqrt(np.mean((rp-truth)**2))],np.float64)
-        if spectral_moments:
-            moments = (spectral_blend_moments(interp[bands], fp[bands], truth)
-                       if interp is not None and fp is not None else np.full(3,np.nan))
-            return feat,risks,np.isfinite(risks),moments
         return feat,risks,np.isfinite(risks)
     raise RuntimeError(f'Could not sample {scenario} S{severity}')
 
@@ -484,8 +406,6 @@ def make_training_case(cube, invalid, rng, scenario, severity, mean, std, wave,
 def train(args):
     from src.pipeline import _load_accepted_spectral_hybrid_v2
     spec=resolve_experiment(args)
-    if args.adaptive_spectral and (args.region_expert != 'refined' or args.objective != 'log_rmse'):
-        raise ValueError('Adaptive Router requires refined Region and log-RMSE objective')
     if args.region_expert == 'refined' and args.objective != 'log_rmse':
         raise ValueError('Aligned Region router currently uses log_rmse calibration')
     val=tuple(spectral_validation_cores(spec))
@@ -514,53 +434,24 @@ def train(args):
         for j,(ci,case,severity,k) in enumerate(jobs):
             if j%2 != rank:continue
             rng=np.random.default_rng(args.seed+10331*j)
-            case_result=make_training_case(val_c[ci],val_i[ci],rng,
+            row,rmses,eligible=make_training_case(val_c[ci],val_i[ci],rng,
                 case,severity,mean,std,wave,hybrid,fusion,(topology,tck,geometry),
-                device,args.region_batch,region_expert=args.region_expert,
-                spectral_moments=args.adaptive_spectral)
-            row,rmses,eligible=case_result[:3]
-            moments=case_result[3] if args.adaptive_spectral else None
-            samples.append((ci,row,rmses,eligible,case,severity,moments))
+                device,args.region_batch,region_expert=args.region_expert)
+            samples.append((ci,row,rmses,eligible,case,severity))
             if len(samples)%25==0:
                 print(f'[GPU{rank}] three-expert labels: {len(samples)}',flush=True)
         gathered=[None,None]
         dist.all_gather_object(gathered,samples)
         if rank == 0:
             combined=[item for group in gathered for item in group]
-            ck=path_for(config.MODELS_DIR, objective=args.objective, region_expert=args.region_expert, adaptive=args.adaptive_spectral)
+            ck=path_for(config.MODELS_DIR, objective=args.objective, region_expert=args.region_expert)
             if ck.exists():
                 raise FileExistsError('Three-expert Router exists; it will not be overwritten')
             cores=np.asarray([s[0] for s in combined],np.int64)
             features=np.stack([s[1] for s in combined]);err=np.stack([s[2] for s in combined])
             eligible=np.stack([s[3] for s in combined])
-            spectral_moments = None
-            guard_model = None
-            source_holdout = cores == 1
-            raw_fusion_err = err[:,1].copy()
-            if args.adaptive_spectral:
-                spectral_moments=np.stack([s[6] for s in combined])
-                guard_model,weights=cross_fit_spectral_gate(features,spectral_moments,cores)
-                can_blend=eligible[:,0] & eligible[:,1]
-                err[can_blend,1]=spectral_blend_error(spectral_moments[can_blend],weights[can_blend])
             fitted=fit_models(features,err,eligible,cores,val,objective=args.objective,
-                              case_meta=[(s[4],s[5]) for s in combined],
-                              region_quantile=.85 if args.adaptive_spectral else None)
-            if args.adaptive_spectral:
-                common = source_holdout & eligible[:,1] & eligible[:,0]
-                if not common.any():
-                    raise RuntimeError('No source holdout spectra for guard evaluation')
-                raw_rmse=float(np.sqrt(np.mean(raw_fusion_err[common]**2)))
-                guarded_rmse=float(np.sqrt(np.mean(err[common,1]**2)))
-                fitted.update(router_variant='adaptive_spectral_tailrisk_v1',
-                    spectral_guard_model=guard_model,
-                    spectral_guard_calibration='four_fold_source_core_only',
-                    spectral_guard_validation=list(val)[1],
-                    holdout_raw_fusion_common_rmse=raw_rmse,
-                    holdout_adaptive_fusion_common_rmse=guarded_rmse,
-                    holdout_adaptive_vs_raw_fusion_pct=100*(guarded_rmse/raw_rmse-1),
-                    holdout_spectral_blend_mean=float(np.mean(weights[common])),
-                    holdout_spectral_blend_min=float(np.min(weights[common])),
-                    holdout_spectral_blend_max=float(np.max(weights[common])))
+                              case_meta=[(s[4],s[5]) for s in combined])
             fitted.update(region_expert=args.region_expert,
                 gate_sha256=sha(gate_path),fusion_sha256=sha(fusion_path),
                 region_geometry_sha256=sha(Path(config.MODELS_DIR)/'tpssr'/f'geometry_{str(config.TEST_DATASET_FOLDER).lower()}'/'best_model.pt'),
@@ -580,16 +471,14 @@ def train(args):
                     fusion_sha256=np.asarray(sha(fusion_path)),
                     shadow_geometry_sha256=np.asarray(sha(shadow_gpath)),
                     shadow_topology_sha256=np.asarray(sha(shadow_tpath)),
-                    region_expert=np.asarray(args.region_expert),
-                    spectral_moments=(spectral_moments if spectral_moments is not None
-                                      else np.empty((0,3),np.float64)))
+                    region_expert=np.asarray(args.region_expert))
             import csv
             report=ck.parent/'holdout_case_audit.csv'
             with report.open('w',newline='',encoding='utf-8') as stream:
                 writer=csv.DictWriter(stream,fieldnames=list(audit[0]))
                 writer.writeheader();writer.writerows(audit)
             tmp=ck.with_suffix('.tmp');joblib.dump(fitted,tmp);os.replace(tmp,ck)
-            summary={k:v for k,v in fitted.items() if k not in ('models','spectral_guard_model')}
+            summary={k:v for k,v in fitted.items() if k!='models'}
             (ck.parent/'TRAINING_SUMMARY.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
             print('Three-expert router trained. Held-out SWIR core result:', summary['holdout_router_rmse'],flush=True)
             print('Checkpoint:',ck,flush=True)
@@ -607,7 +496,6 @@ def main():
     parser.add_argument('--seed',type=int,default=8207)
     parser.add_argument('--objective', choices=('log_rmse','mse'),default='log_rmse')
     parser.add_argument('--region-expert', choices=('raw','refined'),default='raw')
-    parser.add_argument('--adaptive-spectral', action='store_true')
     args=parser.parse_args()
     if args.samples_per_case<2:parser.error('Need at least 2 samples for each scenario and severity')
     train(args)

@@ -118,7 +118,7 @@ def main():
     add_experiment_args(ap)
     ap.add_argument('--gpus', type=int, choices=[2], default=2)
     ap.add_argument('--dry-run', action='store_true', help='Show training plan without touching GPU/data')
-    ap.add_argument('--stage', choices=('all', 'hybrid', 'region', 'fusion', 'router', 'router3', 'router3_rmse', 'router3_aligned', 'router3_adaptive', 'region_guidance'), default='all',
+    ap.add_argument('--stage', choices=('all', 'hybrid', 'region', 'fusion', 'router', 'router3', 'router3_rmse', 'router3_aligned'), default='all',
                     help='Optionally restrict the training family; default trains all missing components')
     ap.add_argument('--router-samples', type=int, default=3200)
     ap.add_argument('--router3-samples-per-case', type=int, default=10)
@@ -171,7 +171,7 @@ def main():
     if val_cores:
         print('Spectral validation cores:', ', '.join(val_cores))
     print('Checkpoint tag:', tag, '(folder label only, not training data)')
-    if args.stage in ('router3','router3_rmse','router3_aligned','router3_adaptive'):
+    if args.stage in ('router3','router3_rmse','router3_aligned'):
         print('Training a learned selector among all three experts; source-only Region shadow.\n')
     elif args.stage == 'router':
         print('Training a conservative spectral selector; Region remains V2.\n')
@@ -189,30 +189,7 @@ def main():
     if args.dry_run:
         print('DRY RUN: no dataset files are opened and no GPU jobs are submitted.\n')
 
-    if args.stage == 'region_guidance':
-        if args.preset != 'swir_region_a_to_b':
-            raise RuntimeError('Region guidance pilot is restricted to the A→B preset')
-        from training.three_expert_router import shadow_experiment
-        val = tuple(val_cores)
-        shadow_name, _ = shadow_experiment(spec, val)
-        shadow = ROOT / 'trained_models' / shadow_name / FAMILY
-        required = (shadow / f'geometry_{val[0].lower()}' / 'best_model.pt',
-                    shadow / f'topology_{val[0].lower()}' / 'best_model.pt')
-        if not args.dry_run and not all(p.is_file() for p in required):
-            raise RuntimeError('Region guidance needs the already-trained shadow Geometry and Topology checkpoints')
-        ck = base / 'region_spectral_guidance' / 'best_model.pt'
-        if ck.exists():
-            print('SKIP Region spectral guidance: found', ck)
-        else:
-            cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
-                   '--nproc_per_node=2', '-m', 'training.region_spectral_guidance',
-                   '--preset', args.preset]
-            launch(cmd, spec, dry_run=args.dry_run)
-        if not args.dry_run and not ck.is_file():
-            raise RuntimeError('Region guidance training did not produce a checkpoint')
-        return
-
-    if args.stage in ('router3','router3_rmse','router3_aligned','router3_adaptive'):
+    if args.stage in ('router3','router3_rmse','router3_aligned'):
         if not args.preset:
             raise RuntimeError('Use an explicit --preset for the three-expert routing run')
         from training.three_expert_router import shadow_experiment
@@ -221,7 +198,7 @@ def main():
         shadow_root = ROOT / 'trained_models' / shadow_name / FAMILY
         shadow_geom = shadow_root / f'geometry_{val[0].lower()}' / 'best_model.pt'
         shadow_top = shadow_root / f'topology_{val[0].lower()}' / 'best_model.pt'
-        ck = base / ('learned_router3_adaptive' if args.stage == 'router3_adaptive' else 'learned_router3_aligned' if args.stage == 'router3_aligned' else 'learned_router3_rmse' if args.stage == 'router3_rmse' else 'learned_router3') / 'best_model.joblib'
+        ck = base / ('learned_router3_aligned' if args.stage == 'router3_aligned' else 'learned_router3_rmse' if args.stage == 'router3_rmse' else 'learned_router3') / 'best_model.joblib'
         fusion_ck = base / 'neighbor_fusion' / 'best_model.pt'
         if not args.dry_run and not all(p.is_file() for p in (gate,fusion_ck,geometry_candidates[0],topology)):
             raise RuntimeError('Three-expert Router requires all accepted frozen experts first.')
@@ -249,9 +226,7 @@ def main():
                  '--nproc_per_node=2','-m','training.three_expert_router',
                  '--preset',str(args.preset),'--samples-per-case',str(args.router3_samples_per_case),
                  '--objective', 'mse' if args.stage == 'router3_rmse' else 'log_rmse',
-                 '--region-expert', 'refined' if args.stage in ('router3_aligned','router3_adaptive') else 'raw']
-            if args.stage == 'router3_adaptive':
-                cmd.append('--adaptive-spectral')
+                 '--region-expert', 'refined' if args.stage == 'router3_aligned' else 'raw']
             launch(cmd,spec,dry_run=args.dry_run)
         if not args.dry_run and not ck.is_file():
             raise RuntimeError('Three-expert Router calibration did not produce a checkpoint')

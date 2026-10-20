@@ -132,14 +132,14 @@ def _hybrid_replace_spectral_only(pipeline, test_cube, mask, spectral_coords):
     values=pixel_pred[inv,coords[:,2]]
     return values,np.isfinite(values)
 
-def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fusion=False, learned_router=False, learned_router3=False, learned_router3_rmse=False, learned_router3_aligned=False, learned_router3_adaptive=False):
+def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fusion=False, learned_router=False, learned_router3=False, learned_router3_rmse=False, learned_router3_aligned=False):
     """Load the spectral and topology-guided spatial experts."""
     hybrid, mean, std, wave, gate_path, backbone_path = _load_accepted_spectral_hybrid_v2(device)
     topology, checkpoint, geometry, _geometry_checkpoint, topology_path, geometry_path = (
         load_final_region_models(device)
     )
     fusion_model, fusion_path = None, None
-    if (learned_router or learned_router3 or learned_router3_rmse or learned_router3_aligned or learned_router3_adaptive) and not learned_fusion:
+    if (learned_router or learned_router3 or learned_router3_rmse or learned_router3_aligned) and not learned_fusion:
         raise ValueError('Learned Router requires learned fusion')
     if learned_fusion:
         from training.neighbor_fusion import checkpoint_path, load_fusion_checkpoint
@@ -169,16 +169,16 @@ def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fus
         router_payload = load_router_checkpoint(router_path, gate_path, fusion_path,
                                                  tuple(VALID_CORES))
     router3_payload = None
-    if learned_router3 or learned_router3_rmse or learned_router3_aligned or learned_router3_adaptive:
+    if learned_router3 or learned_router3_rmse or learned_router3_aligned:
         from training.three_expert_router import load_checkpoint, path_for
         from training.spectral_gate import VALID_CORES
         objective = 'mse' if learned_router3_rmse else 'log_rmse'
-        region_expert = 'refined' if (learned_router3_aligned or learned_router3_adaptive) else 'raw'
-        path = path_for(config.MODELS_DIR, objective=objective, region_expert=region_expert, adaptive=learned_router3_adaptive)
+        region_expert = 'refined' if learned_router3_aligned else 'raw'
+        path = path_for(config.MODELS_DIR, objective=objective, region_expert=region_expert)
         if not path.is_file():
             raise FileNotFoundError('Three-expert router checkpoint missing: ' + str(path))
         router3_payload = load_checkpoint(path, gate_path, fusion_path,
-                            geometry_path, topology_path, tuple(VALID_CORES), objective=objective, region_expert=region_expert, adaptive=learned_router3_adaptive)
+                            geometry_path, topology_path, tuple(VALID_CORES), objective=objective, region_expert=region_expert)
     return ModelBundle(
         device=device,
         topology_model=topology,
@@ -1042,15 +1042,7 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
         fusion_all.append(fusion)
     eligible = np.asarray([[a is not None, b is not None, True]
                            for a,b in zip(interp_all,fusion_all)], bool)
-    feature_rows = np.stack(x)
-    if pipeline.router3_checkpoint.get('router_variant') == 'adaptive_spectral_tailrisk_v1':
-        from training.three_expert_router import spectral_gate_weights
-        guard = pipeline.router3_checkpoint['spectral_guard_model']
-        alpha = spectral_gate_weights(guard,feature_rows)
-        for j, (interp, fused) in enumerate(zip(interp_all,fusion_all)):
-            if interp is not None and fused is not None:
-                fusion_all[j] = interp + np.float32(alpha[j]) * (fused-interp)
-    risks = predict_risks(pipeline.router3_checkpoint, feature_rows, eligible)
+    risks = predict_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
     decisions = np.argmin(risks, axis=1)
 
     n = len(coords)

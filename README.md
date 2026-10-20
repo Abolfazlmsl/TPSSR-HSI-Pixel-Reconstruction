@@ -1,192 +1,111 @@
 # TPSSR — Hyperspectral Pixel Reconstruction
 
-TPSSR V2.3 reconstructs missing and corrupted hyperspectral reflectance values using a spectral network and a geometry-guided spatial completion network. This distribution includes the five classical benchmarks and two independently maintained external methods.
+This source distribution preserves the **Learned Router3 Aligned** configuration selected for the SWIR experiments. It combines three reconstruction experts: spectral interpolation, a learned spectral–neighbor fusion model, and geometry/topology-based Region reconstruction. A source-trained quality router selects among eligible experts using observed information only.
 
-## Project layout
+The model also retains the frozen band-gated CNN/Transformer backbone and the refined Region output. The candidate Adaptive spectral gate and experimental Region Spectral Guidance are **not** included in the selected inference route.
 
-```text
-train.py                       Four-stage TPSSR training coordinator
-training/                     Spectral backbone and confidence-gate training
-core/src/pipeline.py           TPSSR inference and observed-only routing
-core/src/spatial_inference.py  Geometry-guided spatial reconstruction
-core/src/                     Reconstruction networks and evaluation utilities
-core/reconstruction_methods/tpssr/   Geometry and topology training
-core/reconstruction_methods/baselines/    Spectral, spatial, spatio-spectral
-core/reconstruction_methods/pca/          PCA benchmark
-core/reconstruction_methods/random_forest/ Random Forest benchmark
-core/reconstruction_methods/pfgin/        PFGIN wrapper
-core/reconstruction_methods/dds2m/        DDS2M wrapper
-external/                      Source implementations for PFGIN and DDS2M
-test.py                        Masked-pixel prediction with per-mask progress
-evaluate.py                    Summaries and original/corrupted/reconstructed visuals
-benchmarks.py                  Five classical/reference benchmarks
-external_methods.py            PFGIN and DDS2M entrypoint
-plot_method_comparison.py      Scenario/severity plots (DDS2M omitted pending completion)
-preflight.py                   Checkpoint and processed-data checks
-```
+## Installation without losing previous experiments
 
-## Reproducible protocol and presets
+This is a **code-only distribution**. It does **not** contain `processed_data/`, `trained_models/`, `simulated_saturation/`, `input_raw/`, or `results/`. Checkpoint and result folders must remain in place. Save a backup of the running project before extracting this archive into the same project directory; files with matching code paths can replace the old versions.
 
-The released TPSSR V2.3 architecture and fixed mask-only routing policy can be
-trained under these four presets. Each experiment has separate folders for
-checkpoints, masks and results; the original `swir_8x2` checkpoint layout is
-unchanged.
+No migration of checkpoint files is performed. Checkpoints from different splits (SWIR 8×2, A→B, B→A) must not be exchanged. The existing experiment folders should remain intact, including the six-core shadow Region checkpoints used during router calibration.
 
-| Preset | Training acquisitions | Held-out test acquisitions | Spectral validation acquisitions |
+The archived source has no cached bytecode, diagnostic probe scripts, or stored DDS2M trial logs. The independently authored external baseline implementations remain under `external/` with their documentation and must retain applicable attribution and licenses.
+
+## Dataset splits
+
+| Preset | Source acquisitions | Held-out test acquisitions | Source calibration/validation acquisitions |
 |---|---|---|---|
-| `swir_8x2` | SWIR1–4, SWIR6–9 | SWIR5, SWIR10 | SWIR4, SWIR9 |
+| `swir_8x2` | SWIR1–4 and SWIR6–9 | **SWIR5, SWIR10** | SWIR4, SWIR9 |
 | `swir_region_a_to_b` | SWIR1–5 | SWIR6–10 | SWIR4, SWIR5 |
 | `swir_region_b_to_a` | SWIR6–10 | SWIR1–5 | SWIR9, SWIR10 |
-| `vnir_8x2` | VNIR1–4, VNIR6–9 | VNIR5, VNIR10 | VNIR4, VNIR9 |
+| `vnir_8x2` | VNIR1–4 and VNIR6–9 | VNIR5, VNIR10 | VNIR4, VNIR9 |
 
-Spectral validation acquisitions are **held out from spectral weight fitting**,
-although they belong to the source-side partition; the geometry/topology
-training uses the configured full source partition with within-acquisition
-spatial validation. Therefore A→B and B→A each have three acquisitions for
-spectral weight fitting and two for core-level validation, not five spectral
-training acquisitions. This choice preserves two-core spectral acceptance
-criteria and prevents target-area validation leakage.
+Under `swir_8x2`, the Router's auxiliary (shadow) Region experts are fitted on SWIR1–3 and SWIR6–8; their held-out source calibration cores are SWIR4 and SWIR9. **SWIR5 and SWIR10 never enter this fit.** The original eight-source Region model and the separately trained spectral models are retained. The Router's training labels use a refined Region prediction produced by the shadow model.
 
-The official benchmark uses **200 masks per complete experiment** (100 per test
-acquisition with two tests, 40 with five tests). The same deterministic
-scenario/severity-stratified mask budgeting is used by TPSSR and the analytical
-Spectral baseline. The routing policy was previously developed with insight
-from SWIR5/SWIR10 and is frozen for these runs; do not claim those specific
-acquisitions are completely unseen in policy development.
+For the main SWIR 8×2 test, a total budget of **200 masks** means **100 masks for SWIR5 and 100 for SWIR10**, not 200 for each. Preserve the existing deterministic mask files when conducting paired comparisons.
 
-## Environment
+## Verify the selected model (two GPUs)
 
-Recommended: Linux, Python 3.11+, NVIDIA drivers, compatible CUDA-enabled PyTorch, and two GPUs for distributed training. Keep the dependency versions aligned with the environment used for prior experiments. Install core dependencies using:
+Run these commands at the project root, in the environment used for the accepted TPSSR checkpoints:
 
 ```bash
-python -m pip install -r requirements.txt
+python preflight.py --preset swir_8x2
+python test.py --preset swir_8x2 --router learned_router3_aligned --gpus 2 --max-masks 200
+python evaluate.py --preset swir_8x2 --router learned_router3_aligned --visuals 0
 ```
 
-The `external/` directory retains the separately authored PFGIN and DDS2M source code; consult their documentation for method-specific dependencies. Their original software licenses and scientific attribution must be respected.
+`preflight.py` checks for the learned fusion and three-expert router checkpoints as well as the base network weights. The `test.py` and `evaluate.py` commands require `--router learned_router3_aligned`: the baseline V2.3 inference mode is still available explicitly for historical comparisons.
 
-## Input data and preparation
+The combined outputs are written under:
 
-Place each acquisition in `input_raw/<acquisition>/` according to the requirements of `core/data_preparation/prepare_dataset.py`. Processed arrays are stored under `processed_data/<acquisition>/` (including `calibrated_reflectance.npy`, `invalid_mask.npy` and `wavelengths_nm.npy`). Prepare only if the existing processed data and masks are absent:
-
-```bash
-python prepare_dataset.py --preset swir_8x2
+```
+results/swir__train_1-2-3-4-6-7-8-9__test_5-10/combined/tpssr_learned_router3_aligned/
 ```
 
-Preserve the original experiment's processed arrays, synthetic masks, and trained checkpoints when comparing results. Do not replace those with new random masks for a paired comparison.
+Do not use `--force` unless the intention is to overwrite completed mask-level results.
 
-## TPSSR training and evaluation (two GPUs)
+## Training sequence for a genuinely new split
 
-For **each** new preset, run the following in sequence, replacing `PRESET` with
-`swir_region_a_to_b`, `swir_region_b_to_a`, or `vnir_8x2`:
+If checkpoints for that split already exist, keep them; the trainers normally skip accepted checkpoint files. For a new split, the ordered stages are:
 
 ```bash
-python prepare_dataset.py --preset PRESET
-python preflight.py --preset PRESET --data-only
-python train.py --preset PRESET --gpus 2 --dry-run
-python train.py --preset PRESET --gpus 2
-python preflight.py --preset PRESET
-python test.py --preset PRESET --gpus 2 --max-masks 200
-python evaluate.py --preset PRESET --visuals 0
-python benchmarks.py --preset PRESET --method spectral --stage test --max-masks 200
+python preflight.py --preset swir_8x2 --data-only
+python train.py --preset swir_8x2 --stage all --gpus 2 --dry-run
+python train.py --preset swir_8x2 --stage all --gpus 2
+python train.py --preset swir_8x2 --stage fusion --gpus 2
+python train.py --preset swir_8x2 --stage router3_aligned --gpus 2
+python preflight.py --preset swir_8x2
 ```
 
-`--data-only` checks existing processed arrays, wavelength alignment and mask
-presence without loading the full cubes or using a GPU. Do not start the long
-training run if this check fails. For new experiments, the backbone, band gate,
-geometry and topology all require new weights; never copy the original
-`swir_8x2` weights across sensor or transfer experiments. The checkpoint tag
-uses the first held-out acquisition only as a **folder name**, not as training
-input. Two GPUs train CNN and Hybrid candidates concurrently, then the two
-gate candidates; geometry/topology run DDP on two GPUs. The fixed V2.3 routing
-policy is not retrained.
+The `all` stage trains the accepted spectral backbone, confidence gate, Geometry, and Topology. It does not automatically train learned fusion or the three-expert router; those are separate stages. The router stage may fit the auxiliary shadow Region model if the corresponding checkpoint files are absent. This can be computationally expensive. In normal post-training evaluation none of these steps needs to be repeated.
 
-The spectral backbone and confidence gate have validation acceptance checks.
-If no band gate meets them within the configured epochs, training stops instead
-of silently promoting a diagnostic model to publication status. Investigate
-validation results before making a documented new experiment or retrying.
+## Reference methods and paired comparisons
 
-Results are stored under `results/<experiment>/...`, and TPSSR checkpoints
-under `trained_models/<experiment>/tpssr/`. The clean code bundle contains
-no actual data or trained weights. The smoke and dry-run checks are NOT a
-substitute for end-to-end GPU verification on the laboratory server.
-
-## Benchmarks
+The source tree retains the classical/reference benchmark entrypoints and the wrappers for PFGIN and DDS2M. Existing baseline runs should be reused rather than recomputed without a specific reason.
 
 ```bash
-python benchmarks.py --preset swir_8x2 --method all --stage both --max-masks 200
-python external_methods.py --preset swir_8x2 --method pfgin --stage both --max-masks 200
-```
-
-Methods: **Spectral**, **Spatial**, **Spatio-Spectral**, **PCA**, **Random Forest**, **PFGIN**, **DDS2M**. PFGIN can have variable GPU-memory demands; run according to its external documentation. DDS2M is very computationally intensive, has no joint-acquisition training stage, and can be run independently when needed:
-
-```bash
-python external_methods.py --preset swir_8x2 --method dds2m --stage test --max-masks 200
-```
-
-DDS2M is deliberately **not** included in the method comparison plots until the external run is complete. Avoid rerunning it merely to generate TPSSR plots.
-
-```bash
+python benchmarks.py --preset swir_8x2 --method spectral --stage test --max-masks 200
 python plot_method_comparison.py --experiment-dir results/swir__train_1-2-3-4-6-7-8-9__test_5-10
 ```
 
-The evaluator reports **RMSE, MAE, R², SAM and SSIM** where provided by each method, but SSIM is not used in the final cross-method comparison. Missing benchmark SSIM values are not invented; the plotting script leaves them absent. TPSSR's combined results appear under `results/<experiment>/combined/tpssr/`. Figures show original / masked / reconstructed panels and should be interpreted alongside coverage and comparable sampled-mask identities.
-
-## Safety and reproducibility
-
-- Back up existing results, masks and trained models before replacing a project directory.
-- The clean source distribution uses standardized checkpoint folders. Previously trained checkpoints require a one-time file layout migration; keep the original files unchanged until verified using `preflight.py`.
-- Checkpoint files are trusted Python/PyTorch artifacts. Only load checkpoints from trusted sources.
-- CLI dry-runs and unit tests do **not** establish numerical equivalence to the old GPU implementation or prove full end-to-end convergence. Verify a small set of identical saved masks with the same frozen weights before a paper-scale run.
-- PFGIN and DDS2M vendor code has not been rewritten; keep upstream licenses and attribution.
-
-## Development checks
+For the manual-gated comparator, use the same masks:
 
 ```bash
-python -m compileall -q .
+python test.py --preset swir_8x2 --router learned_fusion_guarded --gpus 2 --max-masks 200
+python evaluate.py --preset swir_8x2 --router learned_fusion_guarded --visuals 0
+```
+
+**Reference results from the completed 200-mask SWIR 8×2 tests (macro-averaged per mask):**
+
+| Mode | RMSE | Coverage |
+|---|---:|---:|
+| TPSSR V2.3 | 0.007788 | 100% |
+| Learned Fusion Guarded (manual branch selection) | 0.005106 | 100% |
+| Learned Router3 Aligned (learned branch selection) | 0.005119 | 100% |
+
+The learned router is approximately 0.25% above the best manual comparator in macro-RMSE; the two are not claimed to be statistically equivalent. The learned router is preferred for the selected architecture because branch selection is data-driven. Report the statistical protocol honestly: SWIR5 and SWIR10 are separate from weight fitting in the final 8×2 run, but their earlier results informed architecture development. This is **not** a never-seen independent dataset.
+
+Reported RMSE, MAE, R² and SAM aggregates in `COMBINED_SUMMARY.txt` are means of valid per-mask metrics, not voxel-pooled quantities. A method with incomplete coverage cannot be compared as if it made the same predictions as a 100%-coverage method. For the final paper, compare identical masks and common reconstructed voxels where relevant. TPSSR SSIM is reported only when its mask-specific calculation is valid.
+
+## Code map
+
+- `train.py`: four base training stages, learned neighbor fusion and three-expert Router calibration.
+- `training/neighbor_fusion.py`: learned spectral and local-donor fusion.
+- `training/three_expert_router.py`: source-only Router data/labels, fitting and checkpoint verification.
+- `core/src/pipeline.py`: frozen experts and selected inference routes.
+- `core/src/spatial_inference.py`: Geometry/Topology Region inference.
+- `test.py`: mask-level reconstruction and progress reporting.
+- `evaluate.py`: per-acquisition and combined metric summaries and visuals.
+- `preflight.py`: data and checkpoint layout validation.
+- `benchmarks.py`, `external_methods.py`: benchmark tools, not part of the final learned Router.
+
+## Software checks
+
+```bash
+python -m compileall -q train.py test.py evaluate.py training core
 python -m pytest -q tests
-python train.py --preset swir_8x2 --dry-run
-python train.py --preset swir_region_a_to_b --dry-run
+python train.py --preset swir_8x2 --stage router3_aligned --gpus 2 --dry-run
 ```
 
-## Learned Neighbor Fusion (experimental stage 1)
-
-This stage preserves the trained CNN-Transformer, spectral confidence gate,
-Geometry/Topology weights, and the benchmarked `neighbor_v2` option. A separate
-local residual-attention model learns how to combine interpolation, frozen
-Hybrid, and observed donor curvature. Whole-spectrum / no-anchor pixels still
-use the original Region path. The learned Router is **not** part of this stage.
-
-Train separately for each transfer direction (two GPUs; no backbone retraining):
-
-```bash
-python train.py --preset swir_region_a_to_b --stage fusion --gpus 2
-python train.py --preset swir_region_b_to_a --stage fusion --gpus 2
-```
-
-Source-only training history and the best model are saved under
-`trained_models/<experiment>/tpssr/neighbor_fusion/`. The history compares
-Fusion with interpolation, frozen Hybrid and an **approximation** of Neighbor
-V2's spectral policy on the same synthetic samples. The authoritative V2
-comparison is the identical-mask held-out run below. The learned model is
-isolated and cannot overwrite the existing checkpoints.
-
-```bash
-python test.py --preset swir_region_a_to_b --router learned_fusion --gpus 2 --max-masks 200
-python evaluate.py --preset swir_region_a_to_b --router learned_fusion --visuals 0
-python test.py --preset swir_region_b_to_a --router learned_fusion --gpus 2 --max-masks 200
-python evaluate.py --preset swir_region_b_to_a --router learned_fusion --visuals 0
-```
-
-`--max-masks 200` is the existing **experiment-wide** total; for region
-transfer it is distributed across five destination cores, not 200 per core.
-For an early integration check, use `--max-masks 10` before the full 200.
-Learned Fusion writes to separate `tpssr_learned_fusion` result folders.
-Original V2 results in `tpssr_neighbor_v2` remain intact.
-
-The generated training masks are spatial-spectral (with randomized wavelength
-positions); masked values are erased before building model inputs. Synthetic
-whole-spectrum centers and mixed-saturation cases without spectral anchors
-are excluded from Fusion fitting because Region handles them. The current
-source validation is developmental, since source validation cores have been
-used for prior architecture selection. A clean independent final evaluation
-requires an untouched acquisition/protocol.
+These checks validate syntax, selected interfaces and the training plan. They do **not** reproduce the numerical results without the exact processed data, masks, checkpoints and server environment.
