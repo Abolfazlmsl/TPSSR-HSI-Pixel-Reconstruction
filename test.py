@@ -45,6 +45,10 @@ def parse_args():
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--no-verify-region-batch", action="store_true")
     p.add_argument("--force", action="store_true", help="Recompute completed masks")
+    p.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_adaptive"], default="v23",
+                   help="Select original V2.3, fixed Neighbor V1/V2, or learned spectral fusion")
+    p.add_argument("--focus-band-guard", action="store_true",
+                   help="Evaluate only the 12 mask cases where V2 band guard was activated")
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
@@ -52,6 +56,8 @@ def parse_args():
 
 
 def launch_all_tests(args, spec):
+    if args.focus_band_guard and args.router != 'learned_fusion_guarded':
+        raise ValueError('--focus-band-guard requires --router learned_fusion_guarded')
     print(describe(spec))
     counts = planned_counts(args.max_masks, len(spec.tests))
     offset = 0
@@ -78,10 +84,13 @@ def launch_all_tests(args, spec):
             str(args.region_batch),
             "--worker",
         ]
+        common.extend(["--router", args.router])
         if args.no_verify_region_batch:
             common.append("--no-verify-region-batch")
         if args.force:
             common.append("--force")
+        if args.focus_band_guard:
+            common.append("--focus-band-guard")
 
         if args.gpus == 2:
             cmd = [
@@ -132,7 +141,7 @@ import torch
 from tqdm import tqdm
 import config
 from src.evaluation_utils import (
-    load_dataset,
+    _mask_case_key, load_dataset,
     split_blocks,
     list_mask_files,
     load_test_mask,
@@ -140,7 +149,7 @@ from src.evaluation_utils import (
     benchmark_case_index,
     experiment_progress,
 )
-from src.pipeline import load_pipeline, predict_mask, sparse_band_predictions, subset_rmse
+from src.pipeline import load_pipeline, predict_mask, predict_mask_candidate, predict_mask_candidate_v2, predict_mask_learned_fusion, predict_mask_learned_fusion_guarded, predict_mask_learned_router, predict_mask_learned_router3, sparse_band_predictions, subset_rmse
 from src.spatial_inference import evaluate_reconstruction
 
 RANK = int(os.environ.get("RANK", "0"))
@@ -152,7 +161,7 @@ if torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-OUTDIR = Path(config.RESULTS_DIR) / 'tpssr'
+OUTDIR = Path(config.RESULTS_DIR) / ({'v23': 'tpssr', 'neighbor_v1': 'tpssr_neighbor_v1', 'neighbor_v2': 'tpssr_neighbor_v2', 'learned_fusion': 'tpssr_learned_fusion', 'learned_fusion_guarded': 'tpssr_learned_fusion_guarded', 'learned_router': 'tpssr_learned_router', 'learned_router3': 'tpssr_learned_router3', 'learned_router3_rmse': 'tpssr_learned_router3_rmse', 'learned_router3_aligned': 'tpssr_learned_router3_aligned', 'learned_router3_adaptive': 'tpssr_learned_router3_adaptive'}[ARGS.router])
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -187,6 +196,12 @@ def evaluate_worker(mask_files):
         DEVICE,
         region_batch=ARGS.region_batch,
         verify_region_batch=not ARGS.no_verify_region_batch,
+        learned_fusion=(ARGS.router in ("learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_adaptive")),
+        learned_router=(ARGS.router == "learned_router"),
+        learned_router3=(ARGS.router == "learned_router3"),
+        learned_router3_rmse=(ARGS.router == "learned_router3_rmse"),
+        learned_router3_aligned=(ARGS.router == "learned_router3_aligned"),
+        learned_router3_adaptive=(ARGS.router == "learned_router3_adaptive"),
     )
     cube, _, split, _ = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
@@ -250,7 +265,13 @@ def evaluate_worker(mask_files):
             if len(coords) == 0:
                 raise RuntimeError("No evaluation coordinates selected.")
 
-            out = predict_mask(
+            predictor = {"v23": predict_mask, "neighbor_v1": predict_mask_candidate,
+                         "neighbor_v2": predict_mask_candidate_v2,
+                         "learned_fusion": predict_mask_learned_fusion,
+                         "learned_fusion_guarded": predict_mask_learned_fusion_guarded,
+                         "learned_router": predict_mask_learned_router,
+                         "learned_router3": predict_mask_learned_router3, "learned_router3_rmse": predict_mask_learned_router3, "learned_router3_aligned": predict_mask_learned_router3, "learned_router3_adaptive": predict_mask_learned_router3}[ARGS.router]
+            out = predictor(
                 pipeline,
                 test_cube,
                 mask,
@@ -294,6 +315,9 @@ def evaluate_worker(mask_files):
                 "dataset": DATASET,
                 "experiment": config.EXPERIMENT_NAME,
                 "eval_protocol": EVAL_PROTOCOL,
+                "router_variant": ARGS.router,
+                **({f"candidate_{k}_voxels": v for k, v in out.get("candidate_method_voxels", {}).items()} if ARGS.router != "v23" else {}),
+                **({f"candidate_{k}": v for k, v in out.get("candidate_policy_audit", {}).items()} if ARGS.router != "v23" else {}),
                 "mask_file": mask_path.name,
                 "scenario": str(meta["scenario"]),
                 "severity": int(meta["severity"]),
@@ -306,8 +330,8 @@ def evaluate_worker(mask_files):
                 "final_region_fraction": float(np.mean(route == 2)),
                 "mean_gate_probability": float(np.nanmean(out["gate_probability"])),
                 "component_count": int(len(out["component_records"])),
-                "routing_mode": "tpssr",
-                "router_policy": "mask_geometry_and_local_consistency",
+                "routing_mode": ARGS.router,
+                "router_policy": "learned_three_expert_quality" if ARGS.router in ("learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_adaptive") else "mask_geometry_and_local_consistency",
                 "stage1_spectral_override_components": int(sum(r["stage1_spectral_override"] for r in out["component_records"])),
                 "spectral_safe_override_components": int(safe_override_count),
                 "spectral_safe_override_component_fraction": float(safe_override_count / component_count),
@@ -390,7 +414,7 @@ def evaluate_worker(mask_files):
         "test_datasets": list(config.TEST_DATASET_FOLDERS),
         "rank": RANK,
         "device": str(DEVICE),
-        "routing_mode": "tpssr",
+        "routing_mode": ARGS.router,
         "routing_parameters": __import__("src.routing_policy", fromlist=["policy_spec"]).policy_spec(),
         "spectral_backbone_checkpoint": str(pipeline.hybrid_backbone_checkpoint_path),
         "spectral_gate_checkpoint": str(pipeline.hybrid_gate_checkpoint_path),
@@ -450,6 +474,10 @@ def main_worker():
     # list_mask_files() already applies --max-masks as a GLOBAL experiment
     # budget through HSI_TOTAL_TEST_MASKS.  Do not slice again per acquisition.
     mask_files = list_mask_files()
+    if ARGS.focus_band_guard:
+        selected = {('band_wide_saturation', 4), ('band_wide_saturation', 5),
+                    ('mixed_saturation', 5)}
+        mask_files = [p for p in mask_files if _mask_case_key(p)[:2] in selected]
     if not mask_files:
         raise RuntimeError("No benchmark masks found. Run prepare_dataset.py first.")
     if RANK == 0:

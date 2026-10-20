@@ -147,3 +147,46 @@ python -m pytest -q tests
 python train.py --preset swir_8x2 --dry-run
 python train.py --preset swir_region_a_to_b --dry-run
 ```
+
+## Learned Neighbor Fusion (experimental stage 1)
+
+This stage preserves the trained CNN-Transformer, spectral confidence gate,
+Geometry/Topology weights, and the benchmarked `neighbor_v2` option. A separate
+local residual-attention model learns how to combine interpolation, frozen
+Hybrid, and observed donor curvature. Whole-spectrum / no-anchor pixels still
+use the original Region path. The learned Router is **not** part of this stage.
+
+Train separately for each transfer direction (two GPUs; no backbone retraining):
+
+```bash
+python train.py --preset swir_region_a_to_b --stage fusion --gpus 2
+python train.py --preset swir_region_b_to_a --stage fusion --gpus 2
+```
+
+Source-only training history and the best model are saved under
+`trained_models/<experiment>/tpssr/neighbor_fusion/`. The history compares
+Fusion with interpolation, frozen Hybrid and an **approximation** of Neighbor
+V2's spectral policy on the same synthetic samples. The authoritative V2
+comparison is the identical-mask held-out run below. The learned model is
+isolated and cannot overwrite the existing checkpoints.
+
+```bash
+python test.py --preset swir_region_a_to_b --router learned_fusion --gpus 2 --max-masks 200
+python evaluate.py --preset swir_region_a_to_b --router learned_fusion --visuals 0
+python test.py --preset swir_region_b_to_a --router learned_fusion --gpus 2 --max-masks 200
+python evaluate.py --preset swir_region_b_to_a --router learned_fusion --visuals 0
+```
+
+`--max-masks 200` is the existing **experiment-wide** total; for region
+transfer it is distributed across five destination cores, not 200 per core.
+For an early integration check, use `--max-masks 10` before the full 200.
+Learned Fusion writes to separate `tpssr_learned_fusion` result folders.
+Original V2 results in `tpssr_neighbor_v2` remain intact.
+
+The generated training masks are spatial-spectral (with randomized wavelength
+positions); masked values are erased before building model inputs. Synthetic
+whole-spectrum centers and mixed-saturation cases without spectral anchors
+are excluded from Fusion fitting because Region handles them. The current
+source validation is developmental, since source validation cores have been
+used for prior architecture selection. A clean independent final evaluation
+requires an untouched acquisition/protocol.

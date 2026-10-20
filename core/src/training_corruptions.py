@@ -21,22 +21,30 @@ def _bounds(center, size, limit):
     return start, start + size
 
 
-def _band_block(mask, cy, cx, width):
+def _band_block(mask, cy, cx, width, center_band=None):
     pb = mask.shape[2]
-    cb = pb // 2
+    cb = pb // 2 if center_band is None else int(center_band)
     b0, b1 = _bounds(cb, width, pb)
     mask[cy, cx, b0:b1] = True
 
 
-def generate_training_mask(shape, rng, severity=None):
+def generate_training_mask(shape, rng, severity=None, scenario=None, center=None, band_center=None):
     py, px, pb = map(int, shape)
-    cy, cx, cb = py // 2, px // 2, pb // 2
+    cy, cx = (py // 2, px // 2) if center is None else tuple(map(int, center))
+    if not (0 <= cy < py and 0 <= cx < px):
+        raise ValueError("Corruption center outside patch")
+    cb = pb // 2 if band_center is None else int(band_center)
+    if not 0 <= cb < pb:
+        raise ValueError("Corruption band center outside spectrum")
 
     if severity is None:
         severity = int(rng.integers(1, 6))
     severity = int(np.clip(severity, 1, 5))
 
-    scenario = SCENARIOS[int(rng.integers(0, len(SCENARIOS)))]
+    scenario = (SCENARIOS[int(rng.integers(0, len(SCENARIOS)))]
+                if scenario is None else str(scenario))
+    if scenario not in SCENARIOS:
+        raise ValueError(f"Unsupported training scenario {scenario}")
     mask = np.zeros(shape, dtype=bool)
 
     if scenario == "isolated_voxels":
@@ -79,7 +87,7 @@ def generate_training_mask(shape, rng, severity=None):
 
     elif scenario == "consecutive_spectral_bands":
         widths = [3, 7, 15, 31, 63]
-        _band_block(mask, cy, cx, min(widths[severity - 1], pb))
+        _band_block(mask, cy, cx, min(widths[severity - 1], pb), cb)
 
     elif scenario == "spatio_spectral_block":
         sizes = [3, 7, 11, 19, 27]

@@ -118,8 +118,15 @@ def main():
     add_experiment_args(ap)
     ap.add_argument('--gpus', type=int, choices=[2], default=2)
     ap.add_argument('--dry-run', action='store_true', help='Show training plan without touching GPU/data')
-    ap.add_argument('--stage', choices=('all', 'hybrid', 'region'), default='all',
+    ap.add_argument('--stage', choices=('all', 'hybrid', 'region', 'fusion', 'router', 'router3', 'router3_rmse', 'router3_aligned', 'router3_adaptive', 'region_guidance'), default='all',
                     help='Optionally restrict the training family; default trains all missing components')
+    ap.add_argument('--router-samples', type=int, default=3200)
+    ap.add_argument('--router3-samples-per-case', type=int, default=10)
+    ap.add_argument('--router-batch-size', type=int, default=16)
+    ap.add_argument('--fusion-epochs', type=int, default=8)
+    ap.add_argument('--fusion-train-samples', type=int, default=6000)
+    ap.add_argument('--fusion-val-samples', type=int, default=1000)
+    ap.add_argument('--fusion-batch-size', type=int, default=16)
     ap.add_argument('--hybrid-epochs', type=int, default=5)
     ap.add_argument('--gate-epochs', type=int, default=8)
     ap.add_argument('--topology-epochs', type=int, default=22)
@@ -130,8 +137,9 @@ def main():
     args = ap.parse_args()
     spec = resolve_experiment(args)
     from experiment_config import spectral_validation_cores
-    val_cores = spectral_validation_cores(spec)
-    if min(args.hybrid_epochs, args.gate_epochs, args.topology_epochs,
+    val_cores = spectral_validation_cores(spec) if args.stage != 'region' else ()
+    if min(args.router_samples, args.router_batch_size, args.fusion_epochs, args.fusion_train_samples, args.fusion_val_samples, args.fusion_batch_size,
+           args.hybrid_epochs, args.gate_epochs, args.topology_epochs,
            args.topology_min_epochs, args.topology_patience,
            args.topology_train_samples, args.topology_val_samples) < 1:
         ap.error('All epoch and sample counts must be positive.')
@@ -160,9 +168,15 @@ def main():
     print('\nTPSSR V2.3 TRAINING: spectral backbone + confidence gate + geometry-guided completion')
     print(describe(spec))
     print('One shared model; held-out TEST acquisitions are never used for training.')
-    print('Spectral validation cores:', ', '.join(val_cores))
+    if val_cores:
+        print('Spectral validation cores:', ', '.join(val_cores))
     print('Checkpoint tag:', tag, '(folder label only, not training data)')
-    print('The inference policy needs NO trainable router.\n')
+    if args.stage in ('router3','router3_rmse','router3_aligned','router3_adaptive'):
+        print('Training a learned selector among all three experts; source-only Region shadow.\n')
+    elif args.stage == 'router':
+        print('Training a conservative spectral selector; Region remains V2.\n')
+    else:
+        print('Original inference modes keep their accepted policies.\n')
 
     scripts = (
         ROOT / 'training/spectral_backbone.py', ROOT / 'training/spectral_gate.py',
@@ -174,6 +188,114 @@ def main():
             raise FileNotFoundError(f'Required V2.3 trainer is missing: {script}')
     if args.dry_run:
         print('DRY RUN: no dataset files are opened and no GPU jobs are submitted.\n')
+
+    if args.stage == 'region_guidance':
+        if args.preset != 'swir_region_a_to_b':
+            raise RuntimeError('Region guidance pilot is restricted to the A→B preset')
+        from training.three_expert_router import shadow_experiment
+        val = tuple(val_cores)
+        shadow_name, _ = shadow_experiment(spec, val)
+        shadow = ROOT / 'trained_models' / shadow_name / FAMILY
+        required = (shadow / f'geometry_{val[0].lower()}' / 'best_model.pt',
+                    shadow / f'topology_{val[0].lower()}' / 'best_model.pt')
+        if not args.dry_run and not all(p.is_file() for p in required):
+            raise RuntimeError('Region guidance needs the already-trained shadow Geometry and Topology checkpoints')
+        ck = base / 'region_spectral_guidance' / 'best_model.pt'
+        if ck.exists():
+            print('SKIP Region spectral guidance: found', ck)
+        else:
+            cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
+                   '--nproc_per_node=2', '-m', 'training.region_spectral_guidance',
+                   '--preset', args.preset]
+            launch(cmd, spec, dry_run=args.dry_run)
+        if not args.dry_run and not ck.is_file():
+            raise RuntimeError('Region guidance training did not produce a checkpoint')
+        return
+
+    if args.stage in ('router3','router3_rmse','router3_aligned','router3_adaptive'):
+        if not args.preset:
+            raise RuntimeError('Use an explicit --preset for the three-expert routing run')
+        from training.three_expert_router import shadow_experiment
+        val = tuple(val_cores)
+        shadow_name, shadow_train = shadow_experiment(spec, val)
+        shadow_root = ROOT / 'trained_models' / shadow_name / FAMILY
+        shadow_geom = shadow_root / f'geometry_{val[0].lower()}' / 'best_model.pt'
+        shadow_top = shadow_root / f'topology_{val[0].lower()}' / 'best_model.pt'
+        ck = base / ('learned_router3_adaptive' if args.stage == 'router3_adaptive' else 'learned_router3_aligned' if args.stage == 'router3_aligned' else 'learned_router3_rmse' if args.stage == 'router3_rmse' else 'learned_router3') / 'best_model.joblib'
+        fusion_ck = base / 'neighbor_fusion' / 'best_model.pt'
+        if not args.dry_run and not all(p.is_file() for p in (gate,fusion_ck,geometry_candidates[0],topology)):
+            raise RuntimeError('Three-expert Router requires all accepted frozen experts first.')
+        if not shadow_geom.is_file() or not shadow_top.is_file():
+            print(f'TRAIN shadow Region on {len(shadow_train)} source cores only (2 GPUs)')
+            cmd=[sys.executable,str(ROOT/'train.py'),'--train-datasets',*shadow_train,
+                 '--test-datasets',*val,'--experiment-name',shadow_name,
+                 '--stage','region','--gpus','2',
+                 '--topology-epochs',str(args.topology_epochs),
+                 '--topology-min-epochs',str(args.topology_min_epochs),
+                 '--topology-patience',str(args.topology_patience),
+                 '--topology-train-samples',str(args.topology_train_samples),
+                 '--topology-val-samples',str(args.topology_val_samples)]
+            # Spawn a separate experiment; main model files remain untouched.
+            print('RUN:', ' '.join(cmd), flush=True)
+            if not args.dry_run:
+                subprocess.run(cmd,cwd=str(ROOT),check=True)
+        else:
+            print('SKIP shadow Region: both checkpoints exist')
+        if ck.exists():
+            print('SKIP three-expert Router: found', ck)
+        else:
+            print('TRAIN three-expert learned quality Router on source calibration cores (2 GPUs)')
+            cmd=[sys.executable,'-m','torch.distributed.run','--standalone',
+                 '--nproc_per_node=2','-m','training.three_expert_router',
+                 '--preset',str(args.preset),'--samples-per-case',str(args.router3_samples_per_case),
+                 '--objective', 'mse' if args.stage == 'router3_rmse' else 'log_rmse',
+                 '--region-expert', 'refined' if args.stage in ('router3_aligned','router3_adaptive') else 'raw']
+            if args.stage == 'router3_adaptive':
+                cmd.append('--adaptive-spectral')
+            launch(cmd,spec,dry_run=args.dry_run)
+        if not args.dry_run and not ck.is_file():
+            raise RuntimeError('Three-expert Router calibration did not produce a checkpoint')
+        return
+
+    if args.stage == 'router':
+        router_ck = base / 'learned_router' / 'best_model.joblib'
+        fusion_ck = base / 'neighbor_fusion' / 'best_model.pt'
+        if not args.dry_run and not (gate.is_file() and fusion_ck.is_file()):
+            raise RuntimeError('Router requires accepted frozen Hybrid and Fusion checkpoints.')
+        if router_ck.exists():
+            print('SKIP learned router: found', router_ck)
+        else:
+            print('CALIBRATE learned spectral selector on source cores (2 GPUs)')
+            cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
+                   '--nproc_per_node=2', '-m', 'training.learned_router',
+                   '--preset', args.preset, '--gpus', '2',
+                   '--samples', str(args.router_samples),
+                   '--batch-size', str(args.router_batch_size)]
+            launch(cmd, spec, dry_run=args.dry_run)
+        if not args.dry_run and not router_ck.exists():
+            raise RuntimeError('Learned Router calibration did not produce a checkpoint')
+        return
+
+    if args.stage == 'fusion':
+        fusion_ck = base / 'neighbor_fusion' / 'best_model.pt'
+        if not args.dry_run and (not gate.is_file() or not (backbone.is_file() or diagnostic.is_file())):
+            raise RuntimeError('Fusion needs the existing accepted gate and matching frozen backbone.')
+        if fusion_ck.is_file():
+            print('SKIP learned neighbor fusion: found', fusion_ck)
+        else:
+            print('TRAIN learned neighbor fusion (frozen spectral models, 2 GPUs)')
+            cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
+                   '--nproc_per_node=2', '-m', 'training.neighbor_fusion',
+                   '--preset', args.preset, '--gpus', '2',
+                   '--epochs', str(args.fusion_epochs),
+                   '--train-samples', str(args.fusion_train_samples),
+                   '--val-samples', str(args.fusion_val_samples),
+                   '--batch-size', str(args.fusion_batch_size)]
+            launch(cmd, spec, dry_run=args.dry_run)
+        if not args.dry_run and not fusion_ck.is_file():
+            raise RuntimeError('Fusion training did not produce best_model.pt')
+        print('DRY RUN: fusion training not started.' if args.dry_run else f'DONE: fusion checkpoint {fusion_ck}')
+        return
 
     if args.stage in ('all', 'hybrid'):
         if backbone.exists() or diagnostic.exists():

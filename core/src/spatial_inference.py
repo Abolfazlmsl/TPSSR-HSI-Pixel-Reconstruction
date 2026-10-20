@@ -22,6 +22,12 @@ CORE = next(p for p in HERE.parents if (p / "config.py").exists())
 if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 METHOD_DIR = CORE / "reconstruction_methods" / "tpssr"
+# Some cleaned archives retain the same code under its legacy directory.
+# This fallback changes the architecture-import location only, not checkpoint paths.
+if not (METHOD_DIR / "train_geometry.py").is_file():
+    legacy_dir = CORE / "reconstruction_methods" / "texture_restoration_router_rf_v2"
+    if (legacy_dir / "train_geometry.py").is_file():
+        METHOD_DIR = legacy_dir
 if str(METHOD_DIR) not in sys.path:
     sys.path.insert(0, str(METHOD_DIR))
 

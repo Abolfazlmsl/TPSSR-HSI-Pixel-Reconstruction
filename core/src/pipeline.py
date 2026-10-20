@@ -2,7 +2,8 @@
 
 The confidence gate reconstructs spectrally supported pixels. A fixed,
 observed-only routing policy directs spatially difficult cases to the
-geometry-guided topology model. No additional learned router is required.
+geometry-guided topology model. An optional trained three-expert router can
+select between interpolation, learned fusion and Region.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -38,6 +39,10 @@ class ModelBundle:
     verify_region_batch: bool = True
     hybrid_batch: int = 32
     routing_mode: str = "tpssr"
+    fusion_model: torch.nn.Module | None = None
+    fusion_checkpoint_path: Path | None = None
+    router_checkpoint: dict | None = None
+    router3_checkpoint: dict | None = None
 
 
 def _load_accepted_spectral_hybrid_v2(device):
@@ -127,12 +132,53 @@ def _hybrid_replace_spectral_only(pipeline, test_cube, mask, spectral_coords):
     values=pixel_pred[inv,coords[:,2]]
     return values,np.isfinite(values)
 
-def load_pipeline(device, region_batch=32, verify_region_batch=True):
+def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fusion=False, learned_router=False, learned_router3=False, learned_router3_rmse=False, learned_router3_aligned=False, learned_router3_adaptive=False):
     """Load the spectral and topology-guided spatial experts."""
     hybrid, mean, std, wave, gate_path, backbone_path = _load_accepted_spectral_hybrid_v2(device)
     topology, checkpoint, geometry, _geometry_checkpoint, topology_path, geometry_path = (
         load_final_region_models(device)
     )
+    fusion_model, fusion_path = None, None
+    if (learned_router or learned_router3 or learned_router3_rmse or learned_router3_aligned or learned_router3_adaptive) and not learned_fusion:
+        raise ValueError('Learned Router requires learned fusion')
+    if learned_fusion:
+        from training.neighbor_fusion import checkpoint_path, load_fusion_checkpoint
+        from training.spectral_gate import TRAIN_CORES, VALID_CORES
+        fusion_path = checkpoint_path(config.MODELS_DIR)
+        if not fusion_path.is_file():
+            raise FileNotFoundError('Learned fusion checkpoint missing: ' + str(fusion_path)
+              + '. Run python train.py --stage fusion --gpus 2 first.')
+        fusion_model, saved = load_fusion_checkpoint(
+            fusion_path, device, gate_path,
+            np.asarray(np.load(Path(config.PROCESSED_DATA_ROOT) /
+                               str(config.TEST_DATASET_FOLDER) / 'wavelengths_nm.npy'),np.float32),
+            mean, std)
+        if (tuple(saved['training_cores']) != tuple(TRAIN_CORES) or
+            tuple(saved['validation_cores']) != tuple(VALID_CORES)):
+            raise RuntimeError('Learned fusion checkpoint source split mismatch')
+        from training.spectral_gate import sha
+        if saved.get('backbone_sha256') != sha(backbone_path):
+            raise RuntimeError('Learned fusion backbone checkpoint mismatch')
+    router_payload = None
+    if learned_router:
+        from training.learned_router import load_router_checkpoint, router_file
+        from training.spectral_gate import VALID_CORES
+        router_path = router_file(config.MODELS_DIR)
+        if not router_path.is_file():
+            raise FileNotFoundError('Learned Router not calibrated: ' + str(router_path))
+        router_payload = load_router_checkpoint(router_path, gate_path, fusion_path,
+                                                 tuple(VALID_CORES))
+    router3_payload = None
+    if learned_router3 or learned_router3_rmse or learned_router3_aligned or learned_router3_adaptive:
+        from training.three_expert_router import load_checkpoint, path_for
+        from training.spectral_gate import VALID_CORES
+        objective = 'mse' if learned_router3_rmse else 'log_rmse'
+        region_expert = 'refined' if (learned_router3_aligned or learned_router3_adaptive) else 'raw'
+        path = path_for(config.MODELS_DIR, objective=objective, region_expert=region_expert, adaptive=learned_router3_adaptive)
+        if not path.is_file():
+            raise FileNotFoundError('Three-expert router checkpoint missing: ' + str(path))
+        router3_payload = load_checkpoint(path, gate_path, fusion_path,
+                            geometry_path, topology_path, tuple(VALID_CORES), objective=objective, region_expert=region_expert, adaptive=learned_router3_adaptive)
     return ModelBundle(
         device=device,
         topology_model=topology,
@@ -146,6 +192,10 @@ def load_pipeline(device, region_batch=32, verify_region_batch=True):
         hybrid_wave_norm=wave,
         hybrid_gate_checkpoint_path=gate_path,
         hybrid_backbone_checkpoint_path=backbone_path,
+        fusion_model=fusion_model,
+        fusion_checkpoint_path=fusion_path,
+        router_checkpoint=router_payload,
+        router3_checkpoint=router3_payload,
         region_batch=int(region_batch),
         verify_region_batch=bool(verify_region_batch),
     )
@@ -441,3 +491,649 @@ def predict_mask(pipeline, test_cube, mask, eval_coords,
                local_median_voxels=int(use.sum()))
     out['policy_baseline_guard_prediction']=base
     return out
+
+
+# Candidate policy for development-only comparison against frozen V2.3.
+# The original predict_mask() above remains byte-for-byte unchanged.
+CANDIDATE_NEIGHBOR_MIN_DONORS = 5
+CANDIDATE_NEIGHBOR_MAX_DONORS = 8
+CANDIDATE_SHORT_GAP_BANDS = 10
+CANDIDATE_NEIGHBOR_CORRECTION = 0.5
+
+
+def _candidate_longest_gap(missing):
+    edges = np.flatnonzero(np.diff(np.pad(np.asarray(missing, bool).astype(np.int8), (1, 1))))
+    return int(np.max(edges[1::2] - edges[::2])) if len(edges) else 0
+
+
+def _candidate_neighbors(cube, mask, y, x, hole, observed, anchor):
+    """Observed-only transfer of spectral curvature from similar intact neighbors.
+
+    This deliberately matches the non-learned neighbor-trend probe: donor
+    interpolation excludes the same hole, and similarity is evaluated ONLY at
+    wavelengths observed at the target. No masked target value is read.
+    """
+    target = np.asarray(cube[y, x, :], np.float32)
+    reference = target[observed].astype(np.float64)
+    if reference.size < 30:
+        return None, 0
+    scale = max(float(np.std(reference)), 0.01)
+    n_target = int(observed.sum())
+    h, w, bands = cube.shape
+    xaxis = np.arange(bands, dtype=np.float64)
+    candidates = []
+    last_radius = 0
+    for radius in (4, 8, 14):
+        for yy in range(max(0, y - radius), min(h, y + radius + 1)):
+            for xx in range(max(0, x - radius), min(w, x + radius + 1)):
+                dist = max(abs(yy-y), abs(xx-x))
+                if dist <= last_radius or (yy == y and xx == x):
+                    continue
+                # Quick reject using only the donor's measured mask and values.
+                donor = np.asarray(cube[yy, xx, :], np.float32)
+                donor_valid = (~mask[yy, xx, :]) & np.isfinite(donor)
+                if not np.all(donor_valid[hole]):
+                    continue
+                joint = donor_valid & observed
+                if int(joint.sum()) < max(30, int(0.7 * n_target)):
+                    continue
+                nx = donor[joint].astype(np.float64)
+                ty = target[joint].astype(np.float64)
+                mx, my = float(nx.mean()), float(ty.mean())
+                var = float(np.mean((nx - mx) ** 2))
+                if var < 1e-9:
+                    continue
+                slope = float(np.mean((nx - mx) * (ty - my)) / var)
+                if not 0.5 <= slope <= 1.5:
+                    continue
+                intercept = my - slope * mx
+                dissimilarity = float(np.sqrt(np.mean((slope*nx + intercept - ty)**2))) / scale
+                if not np.isfinite(dissimilarity) or dissimilarity > 0.75:
+                    continue
+                support = np.flatnonzero(donor_valid & ~hole)
+                if len(support) < 2:
+                    continue
+                donor_interp = np.interp(xaxis, support, donor[support])
+                residual = slope * (donor[hole].astype(np.float64) - donor_interp[hole])
+                if not np.isfinite(residual).all():
+                    continue
+                score = dissimilarity + 0.012 * float(np.hypot(yy-y, xx-x))
+                candidates.append((score, residual))
+        if len(candidates) >= CANDIDATE_NEIGHBOR_MIN_DONORS:
+            break
+        last_radius = radius
+    if len(candidates) < CANDIDATE_NEIGHBOR_MIN_DONORS:
+        return None, len(candidates)
+    candidates.sort(key=lambda entry: entry[0])
+    residuals = np.stack([r for _, r in candidates[:CANDIDATE_NEIGHBOR_MAX_DONORS]])
+    correction = np.median(residuals, axis=0)
+    values = anchor[hole].astype(np.float64) + CANDIDATE_NEIGHBOR_CORRECTION*correction
+    if not np.isfinite(values).all():
+        return None, len(candidates)
+    return values.astype(np.float32), len(candidates)
+
+
+@torch.inference_mode()
+def predict_mask_candidate(pipeline, test_cube, mask, eval_coords,
+                           preview_progress=None, region_progress=None):
+    """Development candidate, without altering V2.3 or checkpoint weights.
+
+    Region is mandatory only if fewer than two finite observed bands remain.
+    Otherwise, prefer observed-neighbor spectral curvature (>=5 donors), then
+    the frozen Hybrid on long gaps, or interpolation on short ones. This is a
+    *fixed hypothesis* selected after inspecting source diagnostics; its final
+    performance is unknown and it is NOT a clean held-out model selection.
+    """
+    from src.routing_policy import local_neighbor_median, route_extra_region
+    cube = np.asarray(test_cube)
+    mask = np.asarray(mask, bool)
+    coords = np.asarray(eval_coords, np.int64)
+    if cube.shape != mask.shape or coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError('Invalid cube, mask or evaluation coordinates')
+    # Feasibility-only mode invokes Region only for pixels with fewer than
+    # two observed bands and frozen Hybrid for all other masked pixels.
+    previous_mode = pipeline.routing_mode
+    pipeline.routing_mode = 'candidate_feasibility_only'
+    try:
+        out = _predict_base_routes(pipeline, cube, mask, coords,
+                                   region_progress=region_progress)
+    finally:
+        pipeline.routing_mode = previous_mode
+    prediction = np.asarray(out['prediction'], np.float32).copy()
+    route = np.asarray(out['final_route'], np.int64).copy()
+    method = np.full(len(coords), 'region', dtype='<U12')
+    spectral = np.flatnonzero(route == 0)
+    method[spectral] = 'hybrid'
+    counters = dict(neighbor_pixels=0, hybrid_pixels=0,
+                    interpolation_pixels=0, no_donor_pixels=0,
+                    region_pixels=0, region_median_voxels=0)
+    if len(spectral):
+        # A wavelength masked everywhere cannot have an observed donor.
+        globally_masked = np.all(mask, axis=(0, 1))
+        pixels, inv = np.unique(coords[spectral, :2], axis=0, return_inverse=True)
+        ordered = np.argsort(inv, kind='stable')
+        first = np.r_[0, np.flatnonzero(np.diff(inv[ordered])) + 1]
+        last = np.r_[first[1:], len(ordered)]
+        bands = cube.shape[2]
+        axis = np.arange(bands, dtype=np.float64)
+        for i, (yy, xx) in enumerate(pixels):
+            yy, xx = int(yy), int(xx)
+            where = spectral[ordered[first[i]:last[i]]]
+            target = np.asarray(cube[yy, xx, :], np.float32)
+            hole = np.asarray(mask[yy, xx, :], bool)
+            observed = ~hole & np.isfinite(target)
+            observed_idx = np.flatnonzero(observed)
+            if len(observed_idx) < 2:
+                raise RuntimeError('Candidate spectral pixel lacks anchors')
+            anchor = np.interp(axis, observed_idx, target[observed_idx]).astype(np.float32)
+            if np.any(globally_masked & hole):
+                neighbor, donors = None, 0
+            else:
+                neighbor, donors = _candidate_neighbors(
+                    cube, mask, yy, xx, hole, observed, anchor)
+            if neighbor is not None:
+                # The return order is the order of True entries in hole.
+                predicted_bands = np.flatnonzero(hole)
+                values = neighbor[np.searchsorted(predicted_bands, coords[where, 2])]
+                prediction[where] = values
+                method[where] = 'neighbor'
+                counters['neighbor_pixels'] += 1
+            elif _candidate_longest_gap(~observed) < CANDIDATE_SHORT_GAP_BANDS:
+                prediction[where] = anchor[coords[where, 2]]
+                method[where] = 'interp'
+                counters['interpolation_pixels'] += 1
+                counters['no_donor_pixels'] += 1
+            else:
+                # Preserve the original frozen Hybrid prediction.
+                method[where] = 'hybrid'
+                counters['hybrid_pixels'] += 1
+                counters['no_donor_pixels'] += 1
+    # Preserve existing measured-neighbor replacement for fully-masked pixels.
+    med, median_stats = local_neighbor_median(cube, mask, coords, route)
+    use = (route == 2) & np.isfinite(med)
+    prediction[use] = med[use]
+    method[use] = 'local_median'
+    counters['region_pixels'] = int(np.unique(coords[route == 2, :2], axis=0).shape[0])
+    counters['region_median_voxels'] = int(use.sum())
+    if not np.isfinite(prediction).all():
+        raise RuntimeError('Candidate reconstruction left nonfinite values')
+    # Diagnostic only: count how many V2.3 optional long-gap routes are bypassed.
+    from src.routing_guard import expert_eligibility_maps
+    can_hybrid, _, _, _ = expert_eligibility_maps(mask, cube)
+    extra, old_policy = route_extra_region(cube, mask, can_hybrid, coords)
+    old_extra_voxels = int(np.sum((route == 0) & extra[coords[:, 0], coords[:, 1]]))
+    for record in out['component_records']:
+        if int(record.get('final', -1)) == 0:
+            record['effective_component_type'] = 'spectral_candidate_selector'
+    out['prediction'] = prediction
+    out['spectral_prediction'] = np.where(route == 0, prediction, np.nan)
+    out['final_route'] = route
+    out['stage1_route'] = route.copy()
+    out['candidate_method'] = method
+    out['candidate_method_voxels'] = {name: int(np.sum(method == name))
+                                       for name in ('interp','hybrid','neighbor','region','local_median')}
+    out['candidate_policy_audit'] = dict(**counters,
+        old_extra_region_voxels_bypassed=old_extra_voxels,
+        old_extra_region_gap_candidates=int(old_policy['gap_candidates']),
+        **median_stats)
+    out['routing_audit'] = dict(**median_stats, additional_region_voxels=0,
+        local_median_voxels=int(use.sum()),
+        old_extra_region_voxels_bypassed=old_extra_voxels)
+    out['hybrid_changed_voxels'] = int(np.sum(method == 'hybrid'))
+    out['hybrid_fallback_voxels'] = int(np.sum(method == 'interp'))
+    out['policy_baseline_guard_prediction'] = None
+    return out
+
+
+# Candidate V2 builds on V1 without retraining or modifying the accepted models.
+# Parameters are fixed engineering hypotheses, not fitted on test-mask errors.
+CANDIDATE_V2_SPARSE_MISSING_FRACTION = 0.85
+CANDIDATE_V2_SPARSE_LONGEST_FRACTION = 0.60
+CANDIDATE_V2_MIN_SPATIAL_SUPPORT = 5
+CANDIDATE_V2_SPATIAL_OBSERVED_FRACTION = 0.95
+CANDIDATE_V2_GLOBAL_BAND_FRACTION = 0.995
+CANDIDATE_V2_GLOBAL_HYBRID_WEIGHT = 0.50
+
+
+def _candidate_v2_sparse_region_pixels(cube, mask, coords, route):
+    """Flag extreme spectral losses only when nearby measured pixels support the hole.
+
+    Nothing in this function reads a target value at a masked wavelength.
+    Spatial support is counted on the full true mask, not the sampled evaluation
+    coordinates. A severe gap alone is insufficient to activate Region.
+    """
+    h, w, bands = cube.shape
+    selected = np.zeros((h, w), dtype=bool)
+    spectral_pixels = np.unique(coords[route == 0, :2], axis=0)
+    for y, x in spectral_pixels:
+        y, x = int(y), int(x)
+        observed = ~mask[y, x] & np.isfinite(cube[y, x])
+        n_observed = int(observed.sum())
+        hole = ~observed
+        if n_observed < 2 or float(hole.mean()) < CANDIDATE_V2_SPARSE_MISSING_FRACTION:
+            continue
+        if _candidate_longest_gap(hole) < CANDIDATE_V2_SPARSE_LONGEST_FRACTION * bands:
+            continue
+        # The neighboring measurements must actually cover the missing gap.
+        enough = 0
+        for yy in range(max(0, y-1), min(h, y+2)):
+            for xx in range(max(0, x-1), min(w, x+2)):
+                if yy == y and xx == x:
+                    continue
+                donor_ok = ~mask[yy, xx] & np.isfinite(cube[yy, xx])
+                if float(np.mean(donor_ok[hole])) >= CANDIDATE_V2_SPATIAL_OBSERVED_FRACTION:
+                    enough += 1
+        if enough >= CANDIDATE_V2_MIN_SPATIAL_SUPPORT:
+            selected[y, x] = True
+    return selected
+
+
+def _candidate_v2_component_rows(mask, cube, coords, region_extra):
+    """Rebuild component accounting only if V2 introduces an extra Region route."""
+    observed_counts = np.sum((~mask) & np.isfinite(cube), axis=2, dtype=np.int32)
+    spatial_mask = np.any(mask, axis=2)
+    region = spatial_mask & ((observed_counts < 2) | region_extra)
+    spectral = spatial_mask & ~region
+    index = np.full(mask.shape[:2], -1, np.int32)
+    components = []
+    for route_id, active, reason in ((0, spectral, 'v2_spectral_feasible'),
+                                    (2, region, 'v2_no_anchors_or_supported_sparse_gap')):
+        for pixels in connected_components_4(active):
+            pixels = np.asarray(pixels, np.int64)
+            if len(pixels) == 0:
+                continue
+            cid = len(components)
+            index[pixels[:, 0], pixels[:, 1]] = cid
+            obs = observed_counts[pixels[:, 0], pixels[:, 1]]
+            components.append((route_id, reason, int(len(pixels)),
+                               int(obs.min()), int(obs.max())))
+    counts = np.bincount(index[coords[:, 0], coords[:, 1]], minlength=len(components))
+    rows = []
+    for cid, n in enumerate(counts):
+        if not n:
+            continue
+        route_id, reason, area, low, high = components[cid]
+        rows.append(dict(component=cid, area=area, eval_voxels=int(n),
+                         stage1=route_id, final=route_id,
+                         gate_probability=float(route_id == 2),
+                         baseline_stage1=route_id, baseline_final=route_id,
+                         spectral_safe_override=0, stage1_spectral_override=0,
+                         stage1_decision_reason='observed_only_candidate_v2',
+                         region_decision_reason=reason,
+                         guard_protected=0, guard_reason='not_used',
+                         router_predicted_spectral_error=float('nan'),
+                         router_predicted_deep_error=float('nan'),
+                         router_predicted_region_error=float('nan'),
+                         effective_component_type='hybrid' if route_id == 0 else 'region',
+                         min_observed_bands=low, max_observed_bands=high))
+    return rows
+
+
+@torch.inference_mode()
+def predict_mask_candidate_v2(pipeline, test_cube, mask, eval_coords,
+                              preview_progress=None, region_progress=None):
+    """Conservative V2 candidate: preserve V1 and modify only two edge cases.
+
+    For image-wide missing bands, shrink the unsupported frozen-Hybrid correction
+    halfway toward same-pixel interpolation. For extremely sparse continuous
+    spectra, try Region only when surrounding measured data cover the hole.
+    All choices use the mask and observed values; there is no test-truth oracle.
+    """
+    from src.routing_policy import local_neighbor_median
+    cube = np.asarray(test_cube)
+    mask = np.asarray(mask, bool)
+    coords = np.asarray(eval_coords, np.int64)
+    out = predict_mask_candidate(pipeline, cube, mask, coords,
+                                 preview_progress=preview_progress,
+                                 region_progress=region_progress)
+    prediction = np.asarray(out['prediction'], np.float32).copy()
+    route = np.asarray(out['final_route'], np.int64).copy()
+    method = np.asarray(out['candidate_method'], dtype='<U20').copy()
+
+    # Do not mistake a few damaged rows for a missing wavelength everywhere.
+    global_bands = mask.mean(axis=(0, 1)) >= CANDIDATE_V2_GLOBAL_BAND_FRACTION
+    global_hybrid = np.flatnonzero((route == 0) & (method == 'hybrid') & global_bands[coords[:, 2]])
+    if global_hybrid.size:
+        band_axis = np.arange(cube.shape[2], dtype=np.float64)
+        pixels, inverse = np.unique(coords[global_hybrid, :2], axis=0, return_inverse=True)
+        for j, (yy, xx) in enumerate(pixels):
+            target = np.asarray(cube[int(yy), int(xx), :], np.float32)
+            measured = (~mask[int(yy), int(xx)]) & np.isfinite(target)
+            support = np.flatnonzero(measured)
+            if support.size < 2:
+                continue
+            anchor = np.interp(band_axis, support, target[support])
+            positions = global_hybrid[inverse == j]
+            baseline = anchor[coords[positions, 2]]
+            prediction[positions] = (baseline + CANDIDATE_V2_GLOBAL_HYBRID_WEIGHT *
+                                      (prediction[positions] - baseline)).astype(np.float32)
+            method[positions] = 'band_guard'
+
+    # Unlike V2.3, a moderate-length gap is never routed to Region on length alone.
+    extra_pixels = _candidate_v2_sparse_region_pixels(cube, mask, coords, route)
+    extra = (route == 0) & extra_pixels[coords[:, 0], coords[:, 1]]
+    extra_local_median_voxels = 0
+    if np.any(extra):
+        rebuilt, _ = reconstruct_final_region(
+            pipeline.topology_model, pipeline.topology_checkpoint,
+            pipeline.geometry_model, cube, mask, pipeline.device,
+            eval_coords=coords[extra], batch_size=pipeline.region_batch,
+            verify_batch=pipeline.verify_region_batch,
+            progress_desc=region_progress or 'Candidate V2 supported extreme Region')
+        lookup = {}
+        for band, (yx, values) in rebuilt.items():
+            for (y, x), value in zip(yx, values):
+                key = (int(y), int(x), int(band))
+                if key in lookup:
+                    raise RuntimeError('Duplicate candidate V2 Region output')
+                lookup[key] = float(value)
+        for i in np.flatnonzero(extra):
+            prediction[i] = lookup.get(tuple(map(int, coords[i])), np.nan)
+        route[extra] = 2
+        method[extra] = 'region_extreme'
+        # Keep the same observed-neighbor safety replacement as V1 for Region.
+        local, _ = local_neighbor_median(cube, mask, coords, route)
+        accepted = extra & np.isfinite(local)
+        prediction[accepted] = local[accepted]
+        method[accepted] = 'local_median'
+        extra_local_median_voxels = int(np.sum(accepted))
+        out['component_records'] = _candidate_v2_component_rows(mask, cube, coords, extra_pixels)
+
+    if not np.isfinite(prediction).all():
+        raise RuntimeError('Candidate V2 left nonfinite values')
+    out['prediction'] = prediction
+    out['final_route'] = route
+    out['stage1_route'] = route.copy()
+    out['spectral_prediction'] = np.where(route == 0, prediction, np.nan)
+    out['spectral_available'] = route == 0
+    out['gate_probability'] = (route == 2).astype(np.float32)
+    out['candidate_method'] = method
+    names = ('interp', 'hybrid', 'neighbor', 'region', 'local_median',
+             'band_guard', 'region_extreme')
+    out['candidate_method_voxels'] = {name: int(np.sum(method == name)) for name in names}
+    out['candidate_policy_audit'].update(
+        v2_global_missing_bands=int(global_bands.sum()),
+        v2_band_guard_voxels=int(np.sum(method == 'band_guard')),
+        v2_region_extreme_voxels=int(np.sum(extra)),
+        v2_region_extreme_pixels=int(np.sum(extra_pixels)),
+        v2_policy='band_guard_0.5_and_supported_sparse_region')
+    out['routing_audit']['additional_region_voxels'] = int(np.sum(extra))
+    out['routing_audit']['local_median_voxels'] = (
+        int(out['routing_audit'].get('local_median_voxels', 0)) + extra_local_median_voxels)
+    out['hybrid_changed_voxels'] = int(np.sum(method == 'hybrid'))
+    out['hybrid_fallback_voxels'] = int(np.sum(method == 'interp'))
+    return out
+
+
+@torch.inference_mode()
+def predict_mask_learned_fusion(pipeline, test_cube, mask, eval_coords,
+                                preview_progress=None, region_progress=None,
+                                preserve_v2_band_guard=False):
+    """Replace V2 spectral estimates with learned fusion, preserving Region.
+
+    This evaluation route is intentionally separate from neighbor_v2. The
+    accepted V2 route and all existing checkpoints remain unchanged.
+    """
+    if pipeline.fusion_model is None:
+        raise RuntimeError('Learned fusion model was not loaded')
+    from training.neighbor_fusion import crop_at, make_features
+    cube = np.asarray(test_cube)
+    damaged = np.asarray(mask, bool)
+    coords = np.asarray(eval_coords, np.int64)
+    out = predict_mask_candidate_v2(pipeline, cube, damaged, coords,
+                                    preview_progress=preview_progress,
+                                    region_progress=region_progress)
+    route = np.asarray(out['final_route'], np.int64)
+    method = np.asarray(out['candidate_method'], dtype='<U20').copy()
+    protected = ((route == 0) & (method == 'band_guard')) if preserve_v2_band_guard else np.zeros(len(route), bool)
+    indices = np.flatnonzero((route == 0) & ~protected)
+    if not len(indices):
+        out['candidate_policy_audit']['learned_fusion_voxels'] = 0
+        out['candidate_policy_audit']['fusion_v2_band_guard_preserved_voxels'] = int(protected.sum())
+        return out
+    pixels, inv = np.unique(coords[indices,:2],axis=0,return_inverse=True)
+    pred = np.asarray(out['prediction'],np.float32).copy()
+    batch_size = max(1,int(pipeline.hybrid_batch))
+    b = cube.shape[2]
+    collect_router = bool(getattr(pipeline, 'router_checkpoint', None)
+                          and pipeline.router_checkpoint.get('enabled', False))
+    router_features, router_interpolations = [], []
+    if collect_router:
+        from training.learned_router import feature_row
+    wave = np.asarray(np.load(Path(config.PROCESSED_DATA_ROOT) /
+                              str(config.TEST_DATASET_FOLDER) / 'wavelengths_nm.npy'),np.float32)
+    # Avoid materializing whole HSI cubes or reading a hidden target value.
+    for lo in range(0,len(pixels),batch_size):
+        hi = min(lo+batch_size,len(pixels))
+        local = []
+        for y,x in pixels[lo:hi]:
+            crop, bad, cy,cx = crop_at(cube, damaged, int(y),int(x))
+            features=make_features(crop,bad,cy,cx,
+                                   pipeline.hybrid_mean,pipeline.hybrid_std,wave)
+            if features is None:
+                raise RuntimeError('Spectral fusion route lacks observed anchors')
+            local.append(features)
+        tensors=[torch.as_tensor(np.stack([sample[k] for sample in local]),
+                                 device=pipeline.device) for k in range(5)]
+        hybrid=pipeline.hybrid_model(tensors[1]).detach()
+        out_norm=pipeline.fusion_model(tensors[0],hybrid,tensors[2],tensors[3],tensors[4])
+        normalized = out_norm.cpu().numpy()
+        raw = normalized * pipeline.hybrid_std + pipeline.hybrid_mean
+        if collect_router:
+            for sample, fusion_norm in zip(local, normalized):
+                router_features.append(feature_row(sample[0], sample[2], sample[3],
+                                                   sample[4], fusion_norm))
+                router_interpolations.append(sample[0][:, 1] * pipeline.hybrid_std
+                                             + pipeline.hybrid_mean)
+        group = (inv >= lo) & (inv < hi)
+        positions = indices[group]
+        values = raw[inv[group]-lo,coords[positions,2]]
+        pred[positions]=values.astype(np.float32)
+        method[positions]='learned_fusion'
+    if not np.isfinite(pred).all():
+        raise RuntimeError('Learned fusion produced nonfinite masked predictions')
+    out['prediction']=pred
+    out['spectral_prediction']=np.where(route==0,pred,np.nan)
+    out['candidate_method']=method
+    out['candidate_method_voxels']={name:int(np.sum(method==name))
+        for name in ('interp','hybrid','neighbor','region','local_median',
+                     'band_guard','region_extreme','learned_fusion')}
+    out['candidate_policy_audit']['learned_fusion_voxels']=int(indices.size)
+    out['candidate_policy_audit']['fusion_v2_band_guard_preserved_voxels']=int(protected.sum())
+    out['candidate_policy_audit']['fusion_training']='frozen_hybrid_plus_source_trained_local_donor_attention'
+    if collect_router:
+        out['_router_pixels'] = pixels
+        out['_router_features'] = np.stack(router_features)
+        out['_router_interpolations'] = np.stack(router_interpolations)
+    return out
+
+
+@torch.inference_mode()
+def predict_mask_learned_fusion_guarded(pipeline, test_cube, mask, eval_coords,
+                                        preview_progress=None, region_progress=None):
+    """Learned fusion except where V2's global-band guard already protects Hybrid."""
+    return predict_mask_learned_fusion(
+        pipeline, test_cube, mask, eval_coords,
+        preview_progress=preview_progress, region_progress=region_progress,
+        preserve_v2_band_guard=True,
+    )
+
+
+@torch.inference_mode()
+def predict_mask_learned_router(pipeline, test_cube, mask, eval_coords,
+                                preview_progress=None, region_progress=None):
+    """Learned interpolation/Fusion choice with V2 Region and band guard intact.
+
+    No Region error label is estimated from in-sample Region training data.
+    Later cross-fitted Region calibration can expand this to three Experts.
+    """
+    if pipeline.router_checkpoint is None:
+        raise RuntimeError('Learned Router checkpoint was not loaded')
+    from training.learned_router import choice
+    coords = np.asarray(eval_coords, np.int64)
+    out = predict_mask_learned_fusion_guarded(
+        pipeline, test_cube, mask, coords, preview_progress, region_progress)
+    method = np.asarray(out['candidate_method'], dtype='<U20').copy()
+    eligible = np.flatnonzero(method == 'learned_fusion')
+    audit = out['candidate_policy_audit']
+    audit['learned_router_enabled'] = int(pipeline.router_checkpoint['enabled'])
+    audit['learned_router_candidates'] = int(len(eligible))
+    audit['learned_router_interp_voxels'] = 0
+    if not len(eligible) or not pipeline.router_checkpoint['enabled']:
+        return out
+
+    pixels, reverse = np.unique(coords[eligible, :2], axis=0, return_inverse=True)
+    cached_pixels = out.pop('_router_pixels')
+    if not np.array_equal(cached_pixels, pixels):
+        raise RuntimeError('Learned Router feature cache is misaligned')
+    features = out.pop('_router_features')
+    interpolations = out.pop('_router_interpolations')
+    prediction = np.asarray(out['prediction'], np.float32).copy()
+    choose_interp = choice(pipeline.router_checkpoint['model'], features,
+                           pipeline.router_checkpoint['enabled'])
+    for i in np.flatnonzero(choose_interp):
+        selected = eligible[reverse == i]
+        prediction[selected] = interpolations[i][coords[selected, 2]]
+        method[selected] = 'router_interp'
+    out['prediction'] = prediction
+    out['spectral_prediction'] = np.where(np.asarray(out['final_route']) == 0, prediction, np.nan)
+    out['candidate_method'] = method
+    out['candidate_method_voxels'] = {name: int(np.sum(method == name))
+        for name in ('interp', 'hybrid', 'neighbor', 'region', 'local_median',
+                     'band_guard', 'region_extreme', 'learned_fusion', 'router_interp')}
+    audit['learned_router_interp_voxels'] = int(np.sum(method == 'router_interp'))
+    audit['learned_router_interp_pixels'] = int(choose_interp.sum())
+    if not np.isfinite(prediction).all():
+        raise RuntimeError('Learned Router produced a nonfinite reconstruction')
+    return out
+
+
+@torch.inference_mode()
+def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
+                                 preview_progress=None, region_progress=None):
+    """Three-way learned routing; no V2 component routing or band-guard policy."""
+    from training.neighbor_fusion import crop_at
+    from training.three_expert_router import features_for_pixel, predict_risks
+
+    if pipeline.fusion_model is None or pipeline.router3_checkpoint is None:
+        raise RuntimeError('Three-expert checkpoints are required')
+    cube = np.asarray(test_cube)
+    mask = np.asarray(mask, bool)
+    coords = np.asarray(eval_coords, np.int64)
+    if cube.shape != mask.shape or coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError('Router input shapes are inconsistent')
+    if len(coords) == 0 or not np.all(mask[coords[:,0],coords[:,1],coords[:,2]]):
+        raise ValueError('Requested coordinates must be masked')
+    if np.any(coords < 0) or np.any(coords >= np.asarray(mask.shape)):
+        raise ValueError('Coordinates out of bounds')
+
+    wave = np.asarray(np.load(Path(config.PROCESSED_DATA_ROOT) /
+                       str(config.TEST_DATASET_FOLDER) / 'wavelengths_nm.npy'), np.float32)
+    pixels, reverse = np.unique(coords[:,:2], axis=0, return_inverse=True)
+    x, interp_all, fusion_all = [], [], []
+    # Compute only observed-only features; the reference truth is not queried.
+    for y, xx in pixels:
+        patch, damaged, cy, cx = crop_at(cube, mask, int(y), int(xx), radius=32)
+        feat, interp, fusion = features_for_pixel(
+            patch, damaged, cy, cx, pipeline.hybrid_mean, pipeline.hybrid_std,
+            wave, pipeline.fusion_model, pipeline.hybrid_model, pipeline.device)
+        x.append(feat)
+        interp_all.append(interp)
+        fusion_all.append(fusion)
+    eligible = np.asarray([[a is not None, b is not None, True]
+                           for a,b in zip(interp_all,fusion_all)], bool)
+    feature_rows = np.stack(x)
+    if pipeline.router3_checkpoint.get('router_variant') == 'adaptive_spectral_tailrisk_v1':
+        from training.three_expert_router import spectral_gate_weights
+        guard = pipeline.router3_checkpoint['spectral_guard_model']
+        alpha = spectral_gate_weights(guard,feature_rows)
+        for j, (interp, fused) in enumerate(zip(interp_all,fusion_all)):
+            if interp is not None and fused is not None:
+                fusion_all[j] = interp + np.float32(alpha[j]) * (fused-interp)
+    risks = predict_risks(pipeline.router3_checkpoint, feature_rows, eligible)
+    decisions = np.argmin(risks, axis=1)
+
+    n = len(coords)
+    selected = decisions[reverse]
+    route = np.where(selected == 2, 2, 0).astype(np.int32)
+    prediction = np.full(n, np.nan, dtype=np.float32)
+    for i in np.flatnonzero(selected != 2):
+        p = int(reverse[i]); band = int(coords[i,2])
+        source = interp_all[p] if selected[i] == 0 else fusion_all[p]
+        prediction[i] = source[band]
+    region_indices = np.flatnonzero(selected == 2)
+    if region_indices.size:
+        reconstructed, _ = reconstruct_final_region(
+            pipeline.topology_model, pipeline.topology_checkpoint,
+            pipeline.geometry_model, cube, mask, pipeline.device,
+            eval_coords=coords[region_indices], batch_size=pipeline.region_batch,
+            verify_batch=pipeline.verify_region_batch,
+            progress_desc=region_progress or 'Learned Router3 Region')
+        region_lookup = {(int(y),int(xx),int(b)):float(val)
+                         for b,(yx, values) in reconstructed.items()
+                         for (y,xx),val in zip(yx,values)}
+        for i in region_indices:
+            prediction[i] = region_lookup.get(tuple(map(int,coords[i])),np.nan)
+        if pipeline.router3_checkpoint.get('region_expert', 'raw') == 'refined':
+            from training.three_expert_router import refine_region
+            prediction[region_indices], n_refined = refine_region(
+                cube, mask, coords[region_indices], prediction[region_indices])
+        else:
+            n_refined = 0
+    else:
+        n_refined = 0
+    if not np.isfinite(prediction).all():
+        raise RuntimeError('Three-expert learned router failed to cover all evaluation voxels')
+
+    method = np.asarray(['router3_interp','router3_fusion','router3_region'],dtype='<U20')[selected]
+    records=[]
+    # Records describe connected groups of *evaluated pixels* (not original V2 components).
+    for which,name in enumerate(('interp','fusion','region')):
+        spatial = np.zeros(mask.shape[:2],bool)
+        chosen_pixels = pixels[decisions == which]
+        if not len(chosen_pixels):
+            continue
+        spatial[chosen_pixels[:,0],chosen_pixels[:,1]] = True
+        for component in connected_components_4(spatial):
+            component = np.asarray(component,np.int64)
+            matched = np.zeros(spatial.shape,bool)
+            matched[component[:,0],component[:,1]] = True
+            cidx = np.flatnonzero((selected == which) & matched[coords[:,0],coords[:,1]])
+            if not len(cidx):continue
+            obs = np.sum(~mask[component[:,0],component[:,1]] &
+                         np.isfinite(cube[component[:,0],component[:,1]]),axis=1)
+            records.append(dict(component=len(records),area=len(component),eval_voxels=len(cidx),
+                stage1=2 if which==2 else 0,final=2 if which==2 else 0,
+                gate_probability=float(which==2),baseline_stage1=2 if which==2 else 0,
+                baseline_final=2 if which==2 else 0,spectral_safe_override=0,
+                stage1_spectral_override=0,stage1_decision_reason='learned_quality_risk',
+                region_decision_reason='learned_quality_risk',guard_protected=0,
+                guard_reason='not_applicable',
+                router_predicted_spectral_error=float(np.mean(risks[reverse[cidx],0])),
+                router_predicted_deep_error=float(np.mean(risks[reverse[cidx],1])),
+                router_predicted_region_error=float(np.mean(risks[reverse[cidx],2])),
+                effective_component_type=name,min_observed_bands=int(obs.min()),
+                max_observed_bands=int(obs.max())))
+
+    return dict(prediction=prediction,
+        spectral_prediction=np.where(route==0,prediction,np.nan),
+        deep_prediction=np.full(n,np.nan,np.float32),
+        spectral_available=route==0,stage1_route=route.copy(),final_route=route,
+        gate_probability=(route==2).astype(np.float32),
+        predicted_error=risks[reverse].astype(np.float32),component_records=records,
+        spectral_fallback_components=0,hybrid_changed_voxels=int(np.sum(selected==1)),
+        hybrid_fallback_voxels=0,v6_fixed_reference_prediction=None,
+        support_policy_audit={},guard_policy_audit={},
+        candidate_method=method,
+        candidate_method_voxels={key:int(np.sum(selected==i)) for i,key in enumerate(
+            ('router3_interp','router3_fusion','router3_region'))},
+        candidate_policy_audit=dict(
+            learned_router3=1,learned_three_expert_decisions=int(len(pixels)),
+            router3_interp_pixels=int(np.sum(decisions==0)),
+            router3_fusion_pixels=int(np.sum(decisions==1)),
+            router3_region_pixels=int(np.sum(decisions==2)),
+            router3_interp_voxels=int(np.sum(selected==0)),
+            router3_fusion_voxels=int(np.sum(selected==1)),
+            router3_region_voxels=int(np.sum(selected==2)),
+            router3_region_refined_voxels=int(n_refined)),
+        routing_audit={'additional_region_voxels':0})
