@@ -89,9 +89,9 @@ def main():
     if selected_lineaware_region(spec, a.router):
         lineaware_root = root / 'region_lineaware_trial_v1'
         groups['Final line-aware Geometry checkpoint'] = [
-            lineaware_root / 'geometry_swir5' / 'best_model.pt']
+            lineaware_root / f'geometry_{tag}' / 'best_model.pt']
         groups['Final line-aware Topology checkpoint'] = [
-            lineaware_root / 'topology_swir5' / 'best_model.pt']
+            lineaware_root / f'topology_{tag}' / 'best_model.pt']
     if a.router == 'learned_router3_aligned':
         groups['Learned neighbor fusion checkpoint'] = [
             root / 'neighbor_fusion' / 'best_model.pt']
@@ -127,11 +127,11 @@ def main():
         import torch
         from pathlib import Path
         trial = root / 'region_lineaware_trial_v1'
-        geometry = trial / 'geometry_swir5' / 'best_model.pt'
-        topology = trial / 'topology_swir5' / 'best_model.pt'
+        geometry = trial / f'geometry_{tag}' / 'best_model.pt'
+        topology = trial / f'topology_{tag}' / 'best_model.pt'
         t = torch.load(topology, map_location='cpu', weights_only=False)
         source = Path(str(t.get('source_geometry_checkpoint', '')))
-        if source.parent.name != 'geometry_swir5' or source.name != 'best_model.pt':
+        if source.parent.name != f'geometry_{tag}' or source.name != 'best_model.pt':
             missing.append('Line-aware Topology has unexpected source Geometry metadata')
         else:
             geom = torch.load(geometry, map_location='cpu', weights_only=False)

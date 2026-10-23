@@ -6,6 +6,8 @@ geometry-guided topology model. An optional trained three-expert router can
 select between interpolation, learned fusion and Region.
 """
 from __future__ import annotations
+
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
@@ -183,16 +185,21 @@ def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fus
     # same eight sources. The router checkpoint is validated against the
     # original Region first; no spectral or routing weights are changed.
     swir8_sources = ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')
-    use_lineaware = (
-        learned_router3_aligned and
-        tuple(config.TRAIN_DATASET_FOLDERS) == swir8_sources and
-        tuple(config.TEST_DATASET_FOLDERS) == ('SWIR5','SWIR10') and
-        str(config.TEST_DATASET_FOLDER).upper() == 'SWIR5'
+    use_a2b_trial = (
+        os.environ.get('TPSSR_A2B_LINEAWARE_TEST') == '1' and
+        tuple(config.TRAIN_DATASET_FOLDERS) == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5') and
+        tuple(config.TEST_DATASET_FOLDERS) == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10') and
+        str(config.TEST_DATASET_FOLDER).upper() == 'SWIR6'
+    )
+    use_lineaware = learned_router3_aligned and (
+        (tuple(config.TRAIN_DATASET_FOLDERS) == swir8_sources and
+         tuple(config.TEST_DATASET_FOLDERS) == ('SWIR5','SWIR10') and
+         str(config.TEST_DATASET_FOLDER).upper() == 'SWIR5') or use_a2b_trial
     )
     if use_lineaware:
         from src.lineaware_region import load_lineaware_region
         waves = np.asarray(np.load(Path(config.PROCESSED_DATA_ROOT) /
-            'SWIR5' / 'wavelengths_nm.npy'), dtype=np.float32)
+            str(config.TEST_DATASET_FOLDER) / 'wavelengths_nm.npy'), dtype=np.float32)
         del topology, geometry
         if device.type == 'cuda':
             torch.cuda.empty_cache()

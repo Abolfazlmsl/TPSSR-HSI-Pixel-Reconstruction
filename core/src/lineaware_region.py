@@ -18,15 +18,20 @@ TRIAL_NAME = "region_lineaware_trial_v1"
 
 
 def checkpoint_paths():
-    if (str(config.TEST_DATASET_FOLDER).upper() != 'SWIR5' or
-        tuple(config.TEST_DATASET_FOLDERS) != ('SWIR5', 'SWIR10') or
-        tuple(config.TRAIN_DATASET_FOLDERS) !=
-        ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')):
-        raise RuntimeError('Line-aware final Region is selected only for the accepted SWIR 8x2 model')
-    root = Path(config.MODELS_DIR) / 'tpssr'
-    trial = root / TRIAL_NAME
-    return (trial / 'geometry_swir5' / 'best_model.pt',
-            trial / 'topology_swir5' / 'best_model.pt')
+    swir8 = (str(config.TEST_DATASET_FOLDER).upper() == 'SWIR5' and
+        tuple(config.TEST_DATASET_FOLDERS) == ('SWIR5', 'SWIR10') and
+        tuple(config.TRAIN_DATASET_FOLDERS) ==
+        ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9'))
+    a2b = (str(config.TEST_DATASET_FOLDER).upper() == 'SWIR6' and
+        tuple(config.TEST_DATASET_FOLDERS) == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10') and
+        tuple(config.TRAIN_DATASET_FOLDERS) == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5') and
+        __import__('os').environ.get('TPSSR_A2B_LINEAWARE_TEST') == '1')
+    if not (swir8 or a2b):
+        raise RuntimeError('No verified line-aware Region is selected for this split')
+    tag = 'swir5' if swir8 else 'swir6'
+    root = Path(config.MODELS_DIR) / 'tpssr' / TRIAL_NAME
+    return (root / f'geometry_{tag}' / 'best_model.pt',
+            root / f'topology_{tag}' / 'best_model.pt')
 
 
 def fingerprint(path):
@@ -39,8 +44,8 @@ def fingerprint(path):
 
 def validate_paths(geometry_path, topology_path):
     reference = Path(config.MODELS_DIR) / 'tpssr'
-    original_geom = reference / 'geometry_swir5' / 'best_model.pt'
-    original_topo = reference / 'topology_swir5' / 'best_model.pt'
+    original_geom = reference / geometry_path.parent.name / 'best_model.pt'
+    original_topo = reference / topology_path.parent.name / 'best_model.pt'
     for label, p in [('Line-aware Geometry', geometry_path),
                      ('Line-aware Topology', topology_path),
                      ('Accepted Geometry', original_geom),
@@ -89,7 +94,7 @@ def load_lineaware_region(device, wavelengths):
     if Path(geo_path).resolve() != geometry_path.resolve():
         raise RuntimeError(f'Loaded wrong Geometry checkpoint: {geo_path}; check source_geometry_checkpoint in trial Topology')
     source = Path(str(topo_ck.get('source_geometry_checkpoint', '')))
-    if source.parent.name != 'geometry_swir5' or source.name != 'best_model.pt':
+    if source.parent.name != geometry_path.parent.name or source.name != 'best_model.pt':
         raise RuntimeError('Topology source does not identify the expected line-aware Geometry')
     for key in ('band_mean', 'band_std', 'wavelengths_nm'):
         if not np.allclose(np.asarray(topo_ck[key]), np.asarray(geom_ck[key]),

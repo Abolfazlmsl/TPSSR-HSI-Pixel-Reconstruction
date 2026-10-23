@@ -345,9 +345,14 @@ def spectral_validation_cores(spec: ExperimentSpec) -> tuple[str, str]:
 
 def selected_lineaware_region(spec: ExperimentSpec, router: str) -> bool:
     """True only for the evaluated final SWIR 8x2 learned-router configuration."""
-    return (router == 'learned_router3_aligned'
-            and spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')
-            and spec.tests == ('SWIR5','SWIR10'))
+    if router != 'learned_router3_aligned':
+        return False
+    swir8 = (spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')
+             and spec.tests == ('SWIR5','SWIR10'))
+    a2b_trial = (os.environ.get('TPSSR_A2B_LINEAWARE_TEST') == '1'
+                 and spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5')
+                 and spec.tests == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10'))
+    return swir8 or a2b_trial
 
 
 def selected_results_folder(spec: ExperimentSpec, router: str) -> str:
@@ -361,4 +366,8 @@ def selected_results_folder(spec: ExperimentSpec, router: str) -> str:
         'learned_router3_rmse':'tpssr_learned_router3_rmse',
         'learned_router3_aligned':'tpssr_learned_router3_aligned',
     }[router]
+    if (os.environ.get('TPSSR_A2B_LINEAWARE_TEST') == '1'
+            and spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5')
+            and spec.tests == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10')):
+        return base + '_lineaware_a2b_trial'
     return base + ('_lineaware' if selected_lineaware_region(spec, router) else '')
