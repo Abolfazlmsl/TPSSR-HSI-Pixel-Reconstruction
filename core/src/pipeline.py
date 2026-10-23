@@ -179,6 +179,26 @@ def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fus
             raise FileNotFoundError('Three-expert router checkpoint missing: ' + str(path))
         router3_payload = load_checkpoint(path, gate_path, fusion_path,
                             geometry_path, topology_path, tuple(VALID_CORES), objective=objective, region_expert=region_expert)
+    # Accepted SWIR 8x2 inference uses the line-aware Region trained on the
+    # same eight sources. The router checkpoint is validated against the
+    # original Region first; no spectral or routing weights are changed.
+    swir8_sources = ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')
+    use_lineaware = (
+        learned_router3_aligned and
+        tuple(config.TRAIN_DATASET_FOLDERS) == swir8_sources and
+        tuple(config.TEST_DATASET_FOLDERS) == ('SWIR5','SWIR10') and
+        str(config.TEST_DATASET_FOLDER).upper() == 'SWIR5'
+    )
+    if use_lineaware:
+        from src.lineaware_region import load_lineaware_region
+        waves = np.asarray(np.load(Path(config.PROCESSED_DATA_ROOT) /
+            'SWIR5' / 'wavelengths_nm.npy'), dtype=np.float32)
+        del topology, geometry
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        topology, checkpoint, geometry, _geom_ck, topology_path, geometry_path = (
+            load_lineaware_region(device, waves)
+        )
     return ModelBundle(
         device=device,
         topology_model=topology,

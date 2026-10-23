@@ -10,7 +10,7 @@ import hashlib
 from pathlib import Path
 import sys
 import numpy as np
-from experiment_config import add_experiment_args, resolve_experiment
+from experiment_config import add_experiment_args, resolve_experiment, selected_lineaware_region
 
 ROOT = Path(__file__).resolve().parent
 
@@ -86,6 +86,12 @@ def main():
         'Geometry guidance checkpoint': geometry_options,
         'Topology completion checkpoint': [topology],
     }
+    if selected_lineaware_region(spec, a.router):
+        lineaware_root = root / 'region_lineaware_trial_v1'
+        groups['Final line-aware Geometry checkpoint'] = [
+            lineaware_root / 'geometry_swir5' / 'best_model.pt']
+        groups['Final line-aware Topology checkpoint'] = [
+            lineaware_root / 'topology_swir5' / 'best_model.pt']
     if a.router == 'learned_router3_aligned':
         groups['Learned neighbor fusion checkpoint'] = [
             root / 'neighbor_fusion' / 'best_model.pt']
@@ -117,6 +123,23 @@ def main():
             missing.append('Spectral backbone does not match gate SHA256')
         else:
             print('OK      SHA256 of frozen spectral backbone')
+    if not missing and selected_lineaware_region(spec, a.router):
+        import torch
+        from pathlib import Path
+        trial = root / 'region_lineaware_trial_v1'
+        geometry = trial / 'geometry_swir5' / 'best_model.pt'
+        topology = trial / 'topology_swir5' / 'best_model.pt'
+        t = torch.load(topology, map_location='cpu', weights_only=False)
+        source = Path(str(t.get('source_geometry_checkpoint', '')))
+        if source.parent.name != 'geometry_swir5' or source.name != 'best_model.pt':
+            missing.append('Line-aware Topology has unexpected source Geometry metadata')
+        else:
+            geom = torch.load(geometry, map_location='cpu', weights_only=False)
+            for field in ('band_mean', 'band_std', 'wavelengths_nm'):
+                if not np.allclose(np.asarray(geom[field]), np.asarray(t[field]), atol=1e-6, rtol=1e-6):
+                    missing.append('Line-aware Geometry/Topology normalization differs: ' + field)
+            if not missing:
+                print('OK      Line-aware Geometry and Topology normalization provenance')
     print('\n', len(missing), 'issue(s).', sep='')
     if missing:
         sys.exit(2)

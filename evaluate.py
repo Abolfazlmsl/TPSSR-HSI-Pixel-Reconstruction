@@ -13,7 +13,7 @@ import sys
 import numpy as np
 
 from _launcher_common import ROOT, CORE, env_for
-from experiment_config import add_experiment_args, experiment_cli_args, resolve_experiment
+from experiment_config import add_experiment_args, experiment_cli_args, resolve_experiment, selected_results_folder
 
 
 def read_csv(path: Path) -> list[dict]:
@@ -74,16 +74,12 @@ def parse_args():
     parser.add_argument("--region-batch", type=int, default=32)
     parser.add_argument("--crop-size", type=int, default=128)
     parser.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned"], default="v23")
+    parser.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned"], default="learned_router3_aligned")
     return parser.parse_args()
 
 
 def combine(spec, router="v23") -> None:
-    folder = {"v23": "tpssr", "neighbor_v1": "tpssr_neighbor_v1",
-              "neighbor_v2": "tpssr_neighbor_v2",
-              "learned_fusion": "tpssr_learned_fusion",
-              "learned_fusion_guarded": "tpssr_learned_fusion_guarded",
-              "learned_router": "tpssr_learned_router", "learned_router3": "tpssr_learned_router3", "learned_router3_rmse": "tpssr_learned_router3_rmse", "learned_router3_aligned": "tpssr_learned_router3_aligned"}[router]
+    folder = selected_results_folder(spec, router)
     all_rows = []
     seen = set()
     for dataset in spec.tests:
@@ -146,11 +142,7 @@ def evaluate_one(spec, args):
     globals().update(load_dataset=load_dataset, split_blocks=split_blocks,
                      list_mask_files=list_mask_files, load_test_mask=load_test_mask,
                      load_pipeline=load_pipeline, predict_mask=predict_mask)
-    OUTDIR = Path(config.RESULTS_DIR) / ({"v23": "tpssr", "neighbor_v1": "tpssr_neighbor_v1",
-                                                "neighbor_v2": "tpssr_neighbor_v2",
-              "learned_fusion": "tpssr_learned_fusion",
-              "learned_fusion_guarded": "tpssr_learned_fusion_guarded",
-              "learned_router": "tpssr_learned_router", "learned_router3": "tpssr_learned_router3", "learned_router3_rmse": "tpssr_learned_router3_rmse", "learned_router3_aligned": "tpssr_learned_router3_aligned"}[args.router])
+    OUTDIR = Path(config.RESULTS_DIR) / selected_results_folder(spec, args.router)
     METRICS = OUTDIR / "test_metrics.csv"
     VISDIR = OUTDIR / "visuals"
     if not METRICS.exists():

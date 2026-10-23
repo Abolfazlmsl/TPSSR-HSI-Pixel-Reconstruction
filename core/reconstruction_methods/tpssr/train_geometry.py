@@ -41,7 +41,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from scipy.ndimage import distance_transform_edt, binary_dilation, gaussian_filter
+from scipy.ndimage import distance_transform_edt, binary_dilation, gaussian_filter, grey_closing
 
 import config
 from src.evaluation_utils import load_global_training_data
@@ -70,8 +70,11 @@ P_STRUCTURE_CENTER = 0.92
 P_CROSSING_CENTER = 0.78
 P_DIAGONAL_CENTER = 0.70
 
-TRAIN_SAMPLES_PER_EPOCH = 2200
-VAL_SAMPLES = 550
+TRAIN_SAMPLES_PER_EPOCH = int(os.environ.get("TPSSR_GEOM_TRAIN_SAMPLES", "2200"))
+VAL_SAMPLES = int(os.environ.get("TPSSR_GEOM_VAL_SAMPLES", "550"))
+FINE_LINE_PROBABILITY = float(os.environ.get("TPSSR_FINE_LINE_PROBABILITY", "0"))
+HARD_VAL_SAMPLES = int(os.environ.get("TPSSR_GEOM_HARD_VAL_SAMPLES", "0"))
+HARD_VAL_WEIGHT = float(os.environ.get("TPSSR_GEOM_HARD_VAL_WEIGHT", "0"))
 
 STRUCTURE_EPOCHS = 6
 JOINT_EPOCHS = 10
@@ -459,7 +462,32 @@ def crossing_score_at(
     return float(min(left_score, right_score))
 
 
-def structure_aware_mask(target_norm, full_valid, rng):
+def thin_dark_line_candidates(image, valid, allowed):
+    """Find narrow dark ridges with oblique orientation, not generic edges.
+
+    Black top-hat suppresses wide dark areas. The locally averaged gradient
+    tensor supplies the ridge tangent even when the gradient at its center
+    approaches zero. Selection uses only ground truth during TRAIN sampling.
+    """
+    image = np.asarray(image, dtype=np.float32)
+    response = np.maximum(grey_closing(image, size=(5, 5)) - image, 0.0)
+    candidate_area = valid & allowed & np.isfinite(response)
+    if int(candidate_area.sum()) < 25:
+        return []
+    threshold = max(float(np.quantile(response[candidate_area], .90)), .10)
+    gy, gx = np.gradient(image)
+    jxx = gaussian_filter(gx * gx, sigma=1.25)
+    jyy = gaussian_filter(gy * gy, sigma=1.25)
+    jxy = gaussian_filter(gx * gy, sigma=1.25)
+    normal_angle = .5 * np.arctan2(2.0 * jxy, jxx - jyy)
+    tangent = normal_angle + np.pi / 2.0
+    diagonal = (np.abs(np.cos(tangent)) > .25) & (np.abs(np.sin(tangent)) > .25)
+    coherence = np.hypot(jxx - jyy, 2 * jxy) / (jxx + jyy + 1e-6)
+    hits = candidate_area & diagonal & (coherence > .30) & (response >= threshold)
+    return [tuple(map(int, pair)) for pair in np.argwhere(hits)]
+
+
+def structure_aware_mask(target_norm, full_valid, rng, fine_line_probability=0.0):
     """
     Prefer holes that actually interrupt a structure.
 
@@ -509,7 +537,12 @@ def structure_aware_mask(target_norm, full_valid, rng):
         chosen_pool = []
         chosen_type = "random"
 
-        if float(rng.random()) < P_STRUCTURE_CENTER:
+        if fine_line_probability > 0 and float(rng.random()) < fine_line_probability:
+            chosen_pool = thin_dark_line_candidates(target_norm, full_valid, allowed)
+            if chosen_pool:
+                chosen_type = "thin_dark_diagonal"
+
+        if not chosen_pool and float(rng.random()) < P_STRUCTURE_CENTER:
             strong = [
                 (int(y), int(x))
                 for y, x in candidates
@@ -633,7 +666,9 @@ class GeometryLearnedCorrespondenceDataset(Dataset):
         samples,
         seed,
         training,
+        hard_validation=False,
     ):
+        self.hard_validation = bool(hard_validation)
         self.cubes = [
             np.asarray(cube)
             for cube in cubes
@@ -766,6 +801,8 @@ class GeometryLearnedCorrespondenceDataset(Dataset):
                 target_norm,
                 full_valid,
                 rng,
+                fine_line_probability=(1.0 if self.hard_validation else
+                                       FINE_LINE_PROBABILITY if self.training else 0.0),
             )
 
             if mask_info is None:
@@ -4217,6 +4254,16 @@ def train_joint_phase(
         world_size,
     )
 
+    hard_val_loader = None
+    if HARD_VAL_SAMPLES > 0:
+        hard_dataset = GeometryLearnedCorrespondenceDataset(
+            val_ds.cubes, val_ds.band_mean, val_ds.band_std,
+            HARD_VAL_SAMPLES, SEED + 91919, False, hard_validation=True,
+        )
+        _, hard_val_loader, _, _ = make_loaders(
+            train_ds, hard_dataset, rank, world_size,
+        )
+
     try:
         structure_checkpoint = torch.load(
             structure_checkpoint_path,
@@ -4515,6 +4562,8 @@ def train_joint_phase(
             val_loader,
             device,
         )
+        hard_val = (evaluate_joint(model, hard_val_loader, device)
+                    if hard_val_loader is not None else None)
 
         scheduler.step()
 
@@ -4588,6 +4637,13 @@ def train_joint_phase(
                         "total_loss"
                     ]
                 ),
+                "val_hard_rmse_norm": (float(hard_val["prediction_rmse"])
+                                       if hard_val else float("nan")),
+                "val_hard_loss": (float(hard_val["total_loss"])
+                                  if hard_val else float("nan")),
+                "val_selection_score": (float(val["total_loss"] +
+                                          HARD_VAL_WEIGHT * hard_val["total_loss"])
+                                        if hard_val else float(val["total_loss"])),
                 "val_recon_loss": float(
                     val[
                         "recon_loss"
@@ -4666,14 +4722,14 @@ def train_joint_phase(
 
             is_best = (
                 row[
-                    "val_total_loss"
+                    "val_selection_score"
                 ] < best_val
             )
 
             if is_best:
                 best_val = float(
                     row[
-                        "val_total_loss"
+                        "val_selection_score"
                     ]
                 )
 
@@ -4844,11 +4900,10 @@ def worker_main():
                 "Normalization wavelength grid does not match the current SWIR fold."
             )
 
-        model_dir = (
-            Path(config.MODELS_DIR)
-            / "tpssr"
-            / MODEL_SUBDIR
-        )
+        model_dir = Path(os.environ.get(
+            "TPSSR_REGION_GEOMETRY_OUTPUT_DIR",
+            str(Path(config.MODELS_DIR) / "tpssr" / MODEL_SUBDIR),
+        )).resolve()
 
         if main_process:
             model_dir.mkdir(
@@ -4980,7 +5035,7 @@ def worker_main():
             best_row = min(
                 joint_history,
                 key=lambda item: item[
-                    "val_total_loss"
+                    "val_selection_score"
                 ],
             )
 

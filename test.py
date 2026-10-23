@@ -32,6 +32,7 @@ from experiment_config import (
     describe,
     experiment_cli_args,
     resolve_experiment,
+    selected_results_folder, selected_lineaware_region,
 )
 
 EVAL_PROTOCOL = "sampled_masked_voxel_evaluation"
@@ -45,7 +46,7 @@ def parse_args():
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--no-verify-region-batch", action="store_true")
     p.add_argument("--force", action="store_true", help="Recompute completed masks")
-    p.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned"], default="v23",
+    p.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned"], default="learned_router3_aligned",
                    help="Select original V2.3, fixed Neighbor V1/V2, or learned spectral fusion")
     p.add_argument("--focus-band-guard", action="store_true",
                    help="Evaluate only the 12 mask cases where V2 band guard was activated")
@@ -161,7 +162,7 @@ if torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-OUTDIR = Path(config.RESULTS_DIR) / ({'v23': 'tpssr', 'neighbor_v1': 'tpssr_neighbor_v1', 'neighbor_v2': 'tpssr_neighbor_v2', 'learned_fusion': 'tpssr_learned_fusion', 'learned_fusion_guarded': 'tpssr_learned_fusion_guarded', 'learned_router': 'tpssr_learned_router', 'learned_router3': 'tpssr_learned_router3', 'learned_router3_rmse': 'tpssr_learned_router3_rmse', 'learned_router3_aligned': 'tpssr_learned_router3_aligned'}[ARGS.router])
+OUTDIR = Path(config.RESULTS_DIR) / selected_results_folder(SPEC, ARGS.router)
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -202,6 +203,13 @@ def evaluate_worker(mask_files):
         learned_router3_rmse=(ARGS.router == "learned_router3_rmse"),
         learned_router3_aligned=(ARGS.router == "learned_router3_aligned"),
     )
+    if selected_lineaware_region(SPEC, ARGS.router):
+        from src.lineaware_region import checkpoint_paths
+        geometry_ck, topology_ck = checkpoint_paths()
+        if (Path(pipeline.geometry_path).resolve() != geometry_ck.resolve() or
+                Path(pipeline.topology_path).resolve() != topology_ck.resolve()):
+            raise RuntimeError('Incorrect Region checkpoints loaded: refusing inference')
+        print(f'[TPSSR][{DATASET}][GPU {RANK}] line-aware Region checkpoints verified', flush=True)
     cube, _, split, _ = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
 
@@ -419,6 +427,7 @@ def evaluate_worker(mask_files):
         "spectral_gate_checkpoint": str(pipeline.hybrid_gate_checkpoint_path),
         "topology_checkpoint": str(pipeline.topology_path),
         "geometry_stage_a_checkpoint": str(pipeline.geometry_path),
+        "region_variant": "lineaware" if selected_lineaware_region(SPEC, ARGS.router) else "original",
     }
     (OUTDIR / f"worker.rank{RANK}.json").write_text(
         json.dumps(worker_meta, indent=2), encoding="utf-8"

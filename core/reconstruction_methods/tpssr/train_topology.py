@@ -53,6 +53,8 @@ EPOCHS = int(os.environ.get("TPSSR_TOPOLOGY_EPOCHS", "22"))
 MIN_EPOCHS = int(os.environ.get("TPSSR_TOPOLOGY_MIN_EPOCHS", "14"))
 PATIENCE = int(os.environ.get("TPSSR_TOPOLOGY_PATIENCE", "5"))
 TRAIN_SAMPLES = int(os.environ.get("TPSSR_TOPOLOGY_TRAIN_SAMPLES", "4200"))
+HARD_VAL_SAMPLES = int(os.environ.get("TPSSR_TOPOLOGY_HARD_VAL_SAMPLES", "0"))
+HARD_VAL_WEIGHT = float(os.environ.get("TPSSR_TOPOLOGY_HARD_VAL_WEIGHT", "0"))
 VAL_SAMPLES = int(os.environ.get("TPSSR_TOPOLOGY_VAL_SAMPLES", "900"))
 BATCH_SIZE = int(os.environ.get("TPSSR_TOPOLOGY_BATCH_SIZE", "1"))
 NUM_WORKERS = int(os.environ.get("TPSSR_TOPOLOGY_NUM_WORKERS", "2"))
@@ -419,7 +421,12 @@ def main():
     try:
         BASE.set_seed(SEED + rank)
         train_cubes, val_cubes, wavelengths = load_global_training_data()
-        geometry_path = BASE.geometry_checkpoint_path(); geometry_ck = BASE.torch_load(geometry_path, "cpu")
+        geometry_override = os.environ.get("TPSSR_REGION_GEOMETRY_CHECKPOINT")
+        geometry_path = (Path(geometry_override).resolve() if geometry_override
+                         else BASE.geometry_checkpoint_path())
+        if not geometry_path.is_file():
+            raise FileNotFoundError(f"Geometry checkpoint missing: {geometry_path}")
+        geometry_ck = BASE.torch_load(geometry_path, "cpu")
         if int(geometry_ck["n_bands"]) != int(train_cubes[0].shape[-1]):
             raise RuntimeError("Geometry spectral dimension differs from current fold")
         if not np.allclose(np.asarray(geometry_ck["wavelengths_nm"]), np.asarray(wavelengths), atol=1e-3, rtol=0):
@@ -429,10 +436,15 @@ def main():
         mean = np.asarray(geometry_ck["band_mean"], np.float32); std = np.asarray(geometry_ck["band_std"], np.float32)
         train_ds = Geometry.GeometryLearnedCorrespondenceDataset(train_cubes, mean, std, TRAIN_SAMPLES, SEED + 101, True)
         val_ds = Geometry.GeometryLearnedCorrespondenceDataset(val_cubes, mean, std, VAL_SAMPLES, SEED + 202, False) if main_process else None
+        hard_val_ds = (Geometry.GeometryLearnedCorrespondenceDataset(
+            val_cubes, mean, std, HARD_VAL_SAMPLES, SEED + 91919, False,
+            hard_validation=True) if main_process and HARD_VAL_SAMPLES > 0 else None)
         sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, seed=SEED) if distributed else None
         train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=sampler is None, sampler=sampler,
                                   num_workers=NUM_WORKERS, pin_memory=True, persistent_workers=False)
         val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True) if main_process else None
+        hard_val_loader = (DataLoader(hard_val_ds, batch_size=1, shuffle=False,
+                          num_workers=0, pin_memory=True) if hard_val_ds is not None else None)
 
         raw = TopologyCompletionNetwork(int(geometry_ck["n_bands"]), structure_ch).to(device)
         ema = EMA(raw, EMA_DECAY)
@@ -442,7 +454,10 @@ def main():
         scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
         tag = str(config.TEST_DATASET_FOLDER).lower()
-        outdir = Path(config.MODELS_DIR) / METHOD / f"topology_{tag}"
+        outdir = Path(os.environ.get(
+            "TPSSR_REGION_TOPOLOGY_OUTPUT_DIR",
+            str(Path(config.MODELS_DIR) / METHOD / f"topology_{tag}"),
+        )).resolve()
         if main_process: outdir.mkdir(parents=True, exist_ok=True)
         if distributed: dist.barrier()
         last_path, best_path = outdir / "last_model.pt", outdir / "best_model.pt"
@@ -499,10 +514,17 @@ def main():
 
             if main_process:
                 val = evaluate(ema.model.to(device), structure_net, val_loader, device)
+                hard_val = (evaluate(ema.model, structure_net, hard_val_loader, device)
+                            if hard_val_loader is not None else None)
+                score = val["loss"] + (HARD_VAL_WEIGHT * hard_val["loss"] if hard_val else 0.0)
                 row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val["loss"], "lr": lr,
+                       "val_hard_loss": hard_val["loss"] if hard_val else float("nan"),
+                       "val_hard_cldice": hard_val["cldice"] if hard_val else float("nan"),
+                       "val_hard_final_polarity": hard_val["final_polarity"] if hard_val else float("nan"),
+                       "val_selection_score": score,
                        **{f"val_{k}": val[k] for k in val if k != "loss"}}
-                history.append(row); improved = val["loss"] < best - 1e-6
-                if improved: best, no_improve = val["loss"], 0
+                history.append(row); improved = score < best - 1e-6
+                if improved: best, no_improve = score, 0
                 else: no_improve += 1
                 current = model.module if isinstance(model, DDP) else model
                 save_checkpoint(last_path, current, ema.model, opt, sched, epoch, best, geometry_ck, geometry_path, history)

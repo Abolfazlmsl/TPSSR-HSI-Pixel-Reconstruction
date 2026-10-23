@@ -341,3 +341,24 @@ def spectral_validation_cores(spec: ExperimentSpec) -> tuple[str, str]:
     if names is None or not set(names).issubset(set(spec.train)):
         raise ValueError(f"No predeclared spectral validation split for {spec.experiment_name}")
     return names
+
+
+def selected_lineaware_region(spec: ExperimentSpec, router: str) -> bool:
+    """True only for the evaluated final SWIR 8x2 learned-router configuration."""
+    return (router == 'learned_router3_aligned'
+            and spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')
+            and spec.tests == ('SWIR5','SWIR10'))
+
+
+def selected_results_folder(spec: ExperimentSpec, router: str) -> str:
+    """Keep accepted Line-aware results distinct from previous checkpoint runs."""
+    base = {
+        'v23':'tpssr', 'neighbor_v1':'tpssr_neighbor_v1',
+        'neighbor_v2':'tpssr_neighbor_v2', 'learned_fusion':'tpssr_learned_fusion',
+        'learned_fusion_guarded':'tpssr_learned_fusion_guarded',
+        'learned_router':'tpssr_learned_router',
+        'learned_router3':'tpssr_learned_router3',
+        'learned_router3_rmse':'tpssr_learned_router3_rmse',
+        'learned_router3_aligned':'tpssr_learned_router3_aligned',
+    }[router]
+    return base + ('_lineaware' if selected_lineaware_region(spec, router) else '')
