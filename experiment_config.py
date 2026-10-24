@@ -352,7 +352,10 @@ def selected_lineaware_region(spec: ExperimentSpec, router: str) -> bool:
     a2b_trial = (os.environ.get('TPSSR_A2B_LINEAWARE_TEST') == '1'
                  and spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5')
                  and spec.tests == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10'))
-    return swir8 or a2b_trial
+    b2a_trial = (os.environ.get('TPSSR_B2A_LINEAWARE_TEST') == '1'
+                 and spec.train == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10')
+                 and spec.tests == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5'))
+    return swir8 or a2b_trial or b2a_trial
 
 
 def selected_results_folder(spec: ExperimentSpec, router: str) -> str:
@@ -370,4 +373,9 @@ def selected_results_folder(spec: ExperimentSpec, router: str) -> str:
             and spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5')
             and spec.tests == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10')):
         return base + '_lineaware_a2b_trial'
+    if (os.environ.get('TPSSR_B2A_LINEAWARE_TEST') == '1'
+            and router == 'learned_router3_aligned'
+            and spec.train == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10')
+            and spec.tests == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5')):
+        return base + '_lineaware_b2a_trial'
     return base + ('_lineaware' if selected_lineaware_region(spec, router) else '')

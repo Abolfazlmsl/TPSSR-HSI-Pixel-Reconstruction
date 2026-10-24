@@ -191,10 +191,17 @@ def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fus
         tuple(config.TEST_DATASET_FOLDERS) == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10') and
         str(config.TEST_DATASET_FOLDER).upper() == 'SWIR6'
     )
+    use_b2a_trial = (
+        os.environ.get('TPSSR_B2A_LINEAWARE_TEST') == '1' and
+        tuple(config.TRAIN_DATASET_FOLDERS) == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10') and
+        tuple(config.TEST_DATASET_FOLDERS) == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5') and
+        str(config.TEST_DATASET_FOLDER).upper() == 'SWIR1'
+    )
     use_lineaware = learned_router3_aligned and (
         (tuple(config.TRAIN_DATASET_FOLDERS) == swir8_sources and
          tuple(config.TEST_DATASET_FOLDERS) == ('SWIR5','SWIR10') and
-         str(config.TEST_DATASET_FOLDER).upper() == 'SWIR5') or use_a2b_trial
+         str(config.TEST_DATASET_FOLDER).upper() == 'SWIR5') or
+        use_a2b_trial or use_b2a_trial
     )
     if use_lineaware:
         from src.lineaware_region import load_lineaware_region

@@ -26,9 +26,13 @@ def checkpoint_paths():
         tuple(config.TEST_DATASET_FOLDERS) == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10') and
         tuple(config.TRAIN_DATASET_FOLDERS) == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5') and
         __import__('os').environ.get('TPSSR_A2B_LINEAWARE_TEST') == '1')
-    if not (swir8 or a2b):
+    b2a = (str(config.TEST_DATASET_FOLDER).upper() == 'SWIR1' and
+        tuple(config.TEST_DATASET_FOLDERS) == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5') and
+        tuple(config.TRAIN_DATASET_FOLDERS) == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10') and
+        __import__('os').environ.get('TPSSR_B2A_LINEAWARE_TEST') == '1')
+    if not (swir8 or a2b or b2a):
         raise RuntimeError('No verified line-aware Region is selected for this split')
-    tag = 'swir5' if swir8 else 'swir6'
+    tag = 'swir5' if swir8 else ('swir6' if a2b else 'swir1')
     root = Path(config.MODELS_DIR) / 'tpssr' / TRIAL_NAME
     return (root / f'geometry_{tag}' / 'best_model.pt',
             root / f'topology_{tag}' / 'best_model.pt')
