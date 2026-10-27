@@ -118,7 +118,7 @@ def main():
     add_experiment_args(ap)
     ap.add_argument('--gpus', type=int, choices=[2], default=2)
     ap.add_argument('--dry-run', action='store_true', help='Show training plan without touching GPU/data')
-    ap.add_argument('--stage', choices=('all', 'hybrid', 'region', 'fusion', 'router', 'router3', 'router3_rmse', 'router3_aligned'), default='all',
+    ap.add_argument('--stage', choices=('all', 'hybrid', 'region', 'fusion', 'router', 'router3', 'router3_rmse', 'router3_aligned', 'router3_lineaware', 'router3_lineaware_mse', 'router3_lineaware_rankcv', 'router3_lineaware_regretcv', 'router2_lineaware'), default='all',
                     help='Optionally restrict the training family; default trains all missing components')
     ap.add_argument('--router-samples', type=int, default=3200)
     ap.add_argument('--router3-samples-per-case', type=int, default=10)
@@ -138,6 +138,8 @@ def main():
     spec = resolve_experiment(args)
     from experiment_config import spectral_validation_cores
     val_cores = spectral_validation_cores(spec) if args.stage != 'region' else ()
+    if args.router3_samples_per_case < 2:
+        ap.error('Need at least 2 samples per Router3 case and severity')
     if min(args.router_samples, args.router_batch_size, args.fusion_epochs, args.fusion_train_samples, args.fusion_val_samples, args.fusion_batch_size,
            args.hybrid_epochs, args.gate_epochs, args.topology_epochs,
            args.topology_min_epochs, args.topology_patience,
@@ -171,8 +173,10 @@ def main():
     if val_cores:
         print('Spectral validation cores:', ', '.join(val_cores))
     print('Checkpoint tag:', tag, '(folder label only, not training data)')
-    if args.stage in ('router3','router3_rmse','router3_aligned'):
+    if args.stage in ('router3','router3_rmse','router3_aligned','router3_lineaware','router3_lineaware_mse','router3_lineaware_rankcv','router3_lineaware_regretcv'):
         print('Training a learned selector among all three experts; source-only Region shadow.\n')
+    elif args.stage == 'router2_lineaware':
+        print('Training a learned two-spectral-expert selector; Region for unsupported spectra.\n')
     elif args.stage == 'router':
         print('Training a conservative spectral selector; Region remains V2.\n')
     else:
@@ -189,29 +193,126 @@ def main():
     if args.dry_run:
         print('DRY RUN: no dataset files are opened and no GPU jobs are submitted.\n')
 
-    if args.stage in ('router3','router3_rmse','router3_aligned'):
+    if args.stage == 'router2_lineaware':
+        if not args.preset:
+            raise RuntimeError('Supply an explicit SWIR --preset')
+        from experiment_config import selected_lineaware_region
+        if not selected_lineaware_region(spec, 'learned_router2_lineaware'):
+            raise RuntimeError('Two-spectral-expert Router supports the three defined SWIR splits')
+        from training.three_expert_router import binary_path
+        checkpoint = binary_path(ROOT / 'trained_models' / spec.experiment_name)
+        if checkpoint.is_file():
+            print('SKIP Binary Router: checkpoint already exists', checkpoint)
+        else:
+            print('REFIT Binary Router from source-only cached counterfactual labels (CPU)')
+            cmd = [sys.executable, '-m', 'training.three_expert_router',
+                   '--preset', str(args.preset), '--region-expert', 'lineaware',
+                   '--binary-from-cache']
+            launch(cmd, spec, dry_run=args.dry_run)
+        return
+
+    if args.stage == 'router3_lineaware_regretcv':
+        if not args.preset:
+            raise RuntimeError('Use an explicit SWIR --preset')
+        from experiment_config import selected_lineaware_region
+        if not selected_lineaware_region(spec, 'learned_router3_lineaware_regretcv'):
+            raise RuntimeError('RegretCV supports only the three defined SWIR splits')
+        from training.three_expert_router import path_for
+        checkpoint = path_for(ROOT / 'trained_models' / spec.experiment_name,
+                              objective='regret_cv', region_expert='lineaware')
+        if checkpoint.is_file():
+            print('SKIP RegretCV Router: checkpoint already exists', checkpoint)
+        else:
+            print('Fit cost-sensitive Router3 on source-only cached labels (CPU)')
+            cmd = [sys.executable, '-m', 'training.three_expert_router',
+                   '--preset', str(args.preset), '--region-expert', 'lineaware',
+                   '--regret-cv-from-cache']
+            launch(cmd, spec, dry_run=args.dry_run)
+        return
+
+    if args.stage == 'router3_lineaware_rankcv':
+        if not args.preset:
+            raise RuntimeError('Use an explicit SWIR --preset')
+        from experiment_config import selected_lineaware_region
+        if not selected_lineaware_region(spec, 'learned_router3_lineaware_rankcv'):
+            raise RuntimeError('RankCV supports only the three defined SWIR splits')
+        from training.three_expert_router import path_for
+        checkpoint = path_for(ROOT / 'trained_models' / spec.experiment_name,
+                              objective='rank_cv', region_expert='lineaware')
+        if checkpoint.is_file():
+            print('SKIP RankCV Router: checkpoint already exists',checkpoint)
+        else:
+            print('CROSSFIT three-expert RankCV Router using verified source-only cached labels (CPU)')
+            cmd = [sys.executable, '-m','training.three_expert_router',
+                   '--preset',str(args.preset),'--region-expert','lineaware',
+                   '--rank-cv-from-cache']
+            launch(cmd,spec,dry_run=args.dry_run)
+        return
+
+    if args.stage == 'router3_lineaware_mse':
+        if not args.preset:
+            raise RuntimeError('Use an explicit SWIR --preset')
+        from experiment_config import selected_lineaware_region
+        if not selected_lineaware_region(spec, 'learned_router3_lineaware_mse'):
+            raise RuntimeError('Squared-risk Line-aware Router supports the three SWIR splits only')
+        from training.three_expert_router import path_for
+        checkpoint = path_for(ROOT / 'trained_models' / spec.experiment_name,
+                              objective='mse', region_expert='lineaware')
+        if checkpoint.is_file():
+            print('SKIP squared-risk Router: checkpoint already exists', checkpoint)
+        else:
+            print('REFIT squared-risk Router from verified source-only cached labels (CPU)')
+            cmd = [sys.executable, '-m', 'training.three_expert_router',
+                   '--preset', str(args.preset), '--region-expert', 'lineaware',
+                   '--objective', 'mse', '--from-cache']
+            launch(cmd, spec, dry_run=args.dry_run)
+        return
+
+    if args.stage in ('router3','router3_rmse','router3_aligned','router3_lineaware'):
         if not args.preset:
             raise RuntimeError('Use an explicit --preset for the three-expert routing run')
         from training.three_expert_router import shadow_experiment
         val = tuple(val_cores)
         shadow_name, shadow_train = shadow_experiment(spec, val)
+        from training.three_expert_router import path_for
+        from src.lineaware_region import TRIAL_NAME
+        lineaware = args.stage == 'router3_lineaware'
+        if lineaware:
+            from experiment_config import selected_lineaware_region
+            if not selected_lineaware_region(spec, 'learned_router3_lineaware'):
+                raise RuntimeError('Router3 Line-aware requires one of the three defined SWIR splits')
         shadow_root = ROOT / 'trained_models' / shadow_name / FAMILY
-        shadow_geom = shadow_root / f'geometry_{val[0].lower()}' / 'best_model.pt'
-        shadow_top = shadow_root / f'topology_{val[0].lower()}' / 'best_model.pt'
-        ck = base / ('learned_router3_aligned' if args.stage == 'router3_aligned' else 'learned_router3_rmse' if args.stage == 'router3_rmse' else 'learned_router3') / 'best_model.joblib'
+        shadow_base = shadow_root / TRIAL_NAME if lineaware else shadow_root
+        shadow_geom = shadow_base / f'geometry_{val[0].lower()}' / 'best_model.pt'
+        shadow_top = shadow_base / f'topology_{val[0].lower()}' / 'best_model.pt'
+        variant = 'lineaware' if lineaware else 'refined' if args.stage == 'router3_aligned' else 'raw'
+        ck = path_for(ROOT / 'trained_models' / spec.experiment_name,
+                      objective='mse' if args.stage == 'router3_rmse' else 'log_rmse',
+                      region_expert=variant)
         fusion_ck = base / 'neighbor_fusion' / 'best_model.pt'
         if not args.dry_run and not all(p.is_file() for p in (gate,fusion_ck,geometry_candidates[0],topology)):
             raise RuntimeError('Three-expert Router requires all accepted frozen experts first.')
+        if lineaware:
+            final_base = base / TRIAL_NAME
+            final_checkpoints = (final_base / f'geometry_{tag}' / 'best_model.pt',
+                                 final_base / f'topology_{tag}' / 'best_model.pt')
+            if not args.dry_run and not all(p.is_file() for p in final_checkpoints):
+                raise FileNotFoundError('Train the full-split Line-aware Region first: ' + str(final_base))
         if not shadow_geom.is_file() or not shadow_top.is_file():
             print(f'TRAIN shadow Region on {len(shadow_train)} source cores only (2 GPUs)')
-            cmd=[sys.executable,str(ROOT/'train.py'),'--train-datasets',*shadow_train,
-                 '--test-datasets',*val,'--experiment-name',shadow_name,
-                 '--stage','region','--gpus','2',
-                 '--topology-epochs',str(args.topology_epochs),
-                 '--topology-min-epochs',str(args.topology_min_epochs),
-                 '--topology-patience',str(args.topology_patience),
-                 '--topology-train-samples',str(args.topology_train_samples),
-                 '--topology-val-samples',str(args.topology_val_samples)]
+            if lineaware:
+                cmd=[sys.executable,str(ROOT/'train_region_lineaware.py'),
+                     '--train-datasets',*shadow_train,'--test-datasets',*val,
+                     '--experiment-name',shadow_name,'--gpus','2']
+            else:
+                cmd=[sys.executable,str(ROOT/'train.py'),'--train-datasets',*shadow_train,
+                     '--test-datasets',*val,'--experiment-name',shadow_name,
+                     '--stage','region','--gpus','2',
+                     '--topology-epochs',str(args.topology_epochs),
+                     '--topology-min-epochs',str(args.topology_min_epochs),
+                     '--topology-patience',str(args.topology_patience),
+                     '--topology-train-samples',str(args.topology_train_samples),
+                     '--topology-val-samples',str(args.topology_val_samples)]
             # Spawn a separate experiment; main model files remain untouched.
             print('RUN:', ' '.join(cmd), flush=True)
             if not args.dry_run:
@@ -226,7 +327,7 @@ def main():
                  '--nproc_per_node=2','-m','training.three_expert_router',
                  '--preset',str(args.preset),'--samples-per-case',str(args.router3_samples_per_case),
                  '--objective', 'mse' if args.stage == 'router3_rmse' else 'log_rmse',
-                 '--region-expert', 'refined' if args.stage == 'router3_aligned' else 'raw']
+                 '--region-expert', variant]
             launch(cmd,spec,dry_run=args.dry_run)
         if not args.dry_run and not ck.is_file():
             raise RuntimeError('Three-expert Router calibration did not produce a checkpoint')

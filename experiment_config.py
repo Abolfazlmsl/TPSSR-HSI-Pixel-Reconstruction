@@ -345,6 +345,13 @@ def spectral_validation_cores(spec: ExperimentSpec) -> tuple[str, str]:
 
 def selected_lineaware_region(spec: ExperimentSpec, router: str) -> bool:
     """True only for the evaluated final SWIR 8x2 learned-router configuration."""
+    if router in ('learned_router3_lineaware', 'learned_router3_lineaware_mse', 'learned_router3_lineaware_rankcv', 'learned_router3_lineaware_regretcv', 'learned_router2_lineaware'):
+        allowed = {
+            ('SWIR5','SWIR10'): ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9'),
+            ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10'): ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5'),
+            ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5'): ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10'),
+        }
+        return spec.sensor == 'SWIR' and spec.train == allowed.get(spec.tests)
     if router != 'learned_router3_aligned':
         return False
     swir8 = (spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')
@@ -368,7 +375,14 @@ def selected_results_folder(spec: ExperimentSpec, router: str) -> str:
         'learned_router3':'tpssr_learned_router3',
         'learned_router3_rmse':'tpssr_learned_router3_rmse',
         'learned_router3_aligned':'tpssr_learned_router3_aligned',
+        'learned_router3_lineaware':'tpssr_learned_router3_lineaware',
+        'learned_router3_lineaware_mse':'tpssr_learned_router3_lineaware_mse',
+        'learned_router3_lineaware_rankcv':'tpssr_learned_router3_lineaware_rankcv',
+        'learned_router3_lineaware_regretcv':'tpssr_learned_router3_lineaware_regretcv',
+        'learned_router2_lineaware':'tpssr_learned_router2_lineaware',
     }[router]
+    if router in ('learned_router3_lineaware', 'learned_router3_lineaware_mse', 'learned_router3_lineaware_rankcv', 'learned_router3_lineaware_regretcv', 'learned_router2_lineaware'):
+        return base
     if (os.environ.get('TPSSR_A2B_LINEAWARE_TEST') == '1'
             and spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5')
             and spec.tests == ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10')):

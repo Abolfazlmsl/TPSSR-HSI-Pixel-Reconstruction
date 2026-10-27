@@ -27,7 +27,7 @@ def main():
     add_experiment_args(parser)
     parser.add_argument("--data-only", action="store_true",
                         help="Verify all training/test arrays and test masks before GPU training")
-    parser.add_argument("--router", choices=("learned_router3_aligned", "v23"),
+    parser.add_argument("--router", choices=("learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware", "v23"),
                         default="learned_router3_aligned",
                         help="Checkpoint set to verify; defaults to the final learned router")
     a = parser.parse_args()
@@ -92,11 +92,16 @@ def main():
             lineaware_root / f'geometry_{tag}' / 'best_model.pt']
         groups['Final line-aware Topology checkpoint'] = [
             lineaware_root / f'topology_{tag}' / 'best_model.pt']
-    if a.router == 'learned_router3_aligned':
+    if a.router in ('learned_router3_aligned', 'learned_router3_lineaware', 'learned_router3_lineaware_mse', 'learned_router3_lineaware_rankcv', 'learned_router3_lineaware_regretcv'):
         groups['Learned neighbor fusion checkpoint'] = [
             root / 'neighbor_fusion' / 'best_model.pt']
+        router_folder = ('learned_router3_lineaware_regretcv' if a.router == 'learned_router3_lineaware_regretcv'
+                         else 'learned_router3_lineaware_rankcv' if a.router == 'learned_router3_lineaware_rankcv'
+                         else 'learned_router3_lineaware_mse' if a.router == 'learned_router3_lineaware_mse'
+                         else 'learned_router3_lineaware' if a.router == 'learned_router3_lineaware'
+                         else 'learned_router3_aligned')
         groups['Learned three-expert router checkpoint'] = [
-            root / 'learned_router3_aligned' / 'best_model.joblib']
+            root / router_folder / 'best_model.joblib']
     for name in spec.tests:
         for short, file in (('reflectance', 'calibrated_reflectance.npy'),
                             ('invalid mask', 'invalid_mask.npy'),
@@ -140,6 +145,35 @@ def main():
                     missing.append('Line-aware Geometry/Topology normalization differs: ' + field)
             if not missing:
                 print('OK      Line-aware Geometry and Topology normalization provenance')
+    if not missing and a.router in ('learned_router3_lineaware', 'learned_router3_lineaware_mse', 'learned_router3_lineaware_rankcv', 'learned_router3_lineaware_regretcv'):
+        from training.three_expert_router import load_checkpoint
+        trial = root / 'region_lineaware_trial_v1'
+        try:
+            load_checkpoint(root / ('learned_router3_lineaware_regretcv' if a.router == 'learned_router3_lineaware_regretcv'
+                                    else 'learned_router3_lineaware_rankcv' if a.router == 'learned_router3_lineaware_rankcv'
+                                    else 'learned_router3_lineaware_mse' if a.router == 'learned_router3_lineaware_mse'
+                                    else 'learned_router3_lineaware') / 'best_model.joblib',
+                            gate, root / 'neighbor_fusion' / 'best_model.pt',
+                            trial / f'geometry_{tag}' / 'best_model.pt',
+                            trial / f'topology_{tag}' / 'best_model.pt',
+                            validation, objective='regret_cv' if a.router == 'learned_router3_lineaware_regretcv'
+                            else 'rank_cv' if a.router == 'learned_router3_lineaware_rankcv'
+                            else 'mse' if a.router == 'learned_router3_lineaware_mse' else 'log_rmse',
+                            region_expert='lineaware')
+            print('OK      Router3 checkpoint SHA256 provenance for final Line-aware Region')
+        except Exception as exc:
+            missing.append(f'Router3 checkpoint provenance: {exc}')
+    if not missing and a.router == 'learned_router2_lineaware':
+        from training.three_expert_router import load_binary_checkpoint, binary_path
+        trial = root / 'region_lineaware_trial_v1'
+        try:
+            load_binary_checkpoint(binary_path(ROOT / 'trained_models' / spec.experiment_name),
+                 gate, root / 'neighbor_fusion' / 'best_model.pt',
+                 trial / f'geometry_{tag}' / 'best_model.pt',
+                 trial / f'topology_{tag}' / 'best_model.pt', validation)
+            print('OK      Binary Router and frozen Line-aware expert provenance')
+        except Exception as exc:
+            missing.append(f'Binary Router checkpoint: {exc}')
     print('\n', len(missing), 'issue(s).', sep='')
     if missing:
         sys.exit(2)

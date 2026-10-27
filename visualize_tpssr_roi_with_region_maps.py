@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent
 CORE = ROOT / "core"
 ROI_SIZE = 128
 DEFECT_SIZE = 31
-ROUTER = "learned_router3_aligned"
+ROUTER = "learned_router3_lineaware_rankcv"
 SCENARIOS = (
     "spatial_patch", "spatio_spectral_block", "whole_spectrum_pixels",
     "mixed_saturation", "band_wide_saturation", "consecutive_spectral_bands",
@@ -46,6 +46,9 @@ def arguments():
     p.add_argument("--whole-spectrum-size", type=int, default=None,
                    help="Spatial side length for whole_spectrum_pixels. Default matches the benchmark: "
                         "S1..S5 = 1,3,5,9,15. Use 19 to reproduce the previous visualizer S5.")
+    p.add_argument("--router", choices=("learned_router3_lineaware_rankcv", "learned_router3_lineaware",
+                                         "learned_router3_aligned"), default=ROUTER,
+                   help="Select the trained Router; defaults to accepted SWIR 8x2 RankCV")
     p.add_argument("--gpus", type=int, choices=(1, 2), default=2)
     p.add_argument("--band", type=int, default=None, help="Zero-based band index; default: middle band")
     p.add_argument("--seed", type=int, default=4207)
@@ -60,8 +63,13 @@ def arguments():
     p.add_argument("--preview-max-height", type=int, default=1300)
     p.add_argument("--preview-max-width", type=int, default=1000)
     p.add_argument("--select-only", action="store_true", help="Save a selection/mask preview; do not run the model")
-    p.add_argument("--region-figure", action="store_true",
-                   help="Also export REAL trained Geometry/Topology feature maps for the selected ROI and mask")
+    p.add_argument("--maps-from-output", type=Path, default=None,
+                   help="Recover the eight trained Region maps from a completed ROI output folder. "
+                        "Does not repeat ROI selection or full TPSSR reconstruction.")
+    p.add_argument("--region-figure", dest="region_figure", action="store_true", default=True,
+                   help="Export real Geometry/Topology maps, including eight architecture maps (default)")
+    p.add_argument("--no-region-figure", dest="region_figure", action="store_false",
+                   help="Skip trained Region feature-map export")
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
@@ -385,9 +393,14 @@ def run_worker(args):
         np.savez_compressed(work / f"rank_{rank}.npz", indices=take, values=np.empty(0, np.float32), routes=np.empty(0, np.int8))
         return
     print(f"GPU {local}: loading trained TPSSR | {len(take)} voxels", flush=True)
+    router_flags = {
+        "learned_router3_aligned": "learned_router3_aligned",
+        "learned_router3_lineaware": "learned_router3_lineaware",
+        "learned_router3_lineaware_rankcv": "learned_router3_lineaware_rankcv",
+    }
     pipeline = load_pipeline(
         device, region_batch=args.region_batch, verify_region_batch=True,
-        learned_fusion=True, learned_router3_aligned=True,
+        learned_fusion=True, **{router_flags[args.router]: True},
     )
     with torch.inference_mode():
         result = predict_mask_learned_router3(
@@ -450,7 +463,7 @@ def save_reconstruction(out, band, wavelengths, coords, values, routes, params):
     e = values.astype(np.float64) - original_target
     stats = {
         **params,
-        "router": ROUTER,
+        "router": params["router"],
         "target_voxels": int(len(coords)),
         "masked_spatial_pixels": int(np.count_nonzero(np.any(valid_target, axis=2))),
         "coverage": 1.0,
@@ -615,7 +628,132 @@ def save_orientation_line_view(path, observed, angle, confidence, mask=None):
     plt.close(fig)
     return rgb, used
 
-def save_region_architecture_maps(out, band, wavelengths):
+EIGHT_MAP_NAMES = (
+    "01_edge.png", "02_orientation.png", "03_contrast_hint.png", "04_skeleton.png",
+    "05_width.png", "06_tangent.png", "07_polarity.png", "08_contrast_magnitude.png",
+)
+
+
+def check_eight_maps(out):
+    folder = Path(out) / "region_architecture_maps" / "eight_native_maps"
+    wanted = ("00_eight_maps_overview.png",) + EIGHT_MAP_NAMES
+    missing = [name for name in wanted if not (folder / name).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Incomplete Region diagnostic export in {folder}. Missing: {', '.join(missing)}")
+    print(f"[OK] All 8 trained Region maps exported: {folder}", flush=True)
+    print(f"[OK] Eight-panel figure: {folder / '00_eight_maps_overview.png'}", flush=True)
+    return folder
+
+
+def export_eight_native_maps(folder, arrays, observed, missing, wavelengths, band):
+    """Export eight native learned heads without making up structural labels.
+
+    Geometry orientation is an undirected edge NORMAL in doubled-angle encoding.
+    Topology tangent is a distinct two-component LINE direction learned by Stage B.
+    The two fields must not be plotted with the same derived angle.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import colors
+
+    required = ("edge_prob", "orientation", "contrast_hint", "skeleton_prob",
+                "width_expected", "tangent", "polarity", "contrast_mag")
+    missing_keys = [name for name in required if name not in arrays]
+    if missing_keys:
+        raise RuntimeError("Trained Region model did not return: " + ", ".join(missing_keys))
+
+    folder.mkdir(parents=True, exist_ok=True)
+    raw_dir = folder / "native_arrays"
+    raw_dir.mkdir(exist_ok=True)
+    names = {
+        "edge_prob": "01_edge", "orientation": "02_orientation",
+        "contrast_hint": "03_contrast_hint", "skeleton_prob": "04_skeleton",
+        "width_expected": "05_width", "tangent": "06_tangent",
+        "polarity": "07_polarity", "contrast_mag": "08_contrast_magnitude",
+    }
+    for source, name in names.items():
+        np.save(raw_dir / f"{name}.npy", np.asarray(arrays[source], dtype=np.float32))
+
+    edge = arrays["edge_prob"][0]
+    skeleton = arrays["skeleton_prob"][0]
+    orient = arrays["orientation"]
+    tangent = arrays["tangent"]
+    h, w = observed.shape
+    for key in ("edge_prob", "skeleton_prob", "width_expected", "contrast_hint",
+                "polarity", "contrast_mag"):
+        if arrays[key].shape != (1, h, w):
+            raise ValueError(f"Unexpected trained {key} shape: {arrays[key].shape}")
+    if orient.shape != (2, h, w) or tangent.shape != (2, h, w):
+        raise ValueError("Geometry normal and Topology tangent must have native (2,H,W) fields")
+
+    normal_angle = np.mod(0.5 * np.arctan2(orient[1], orient[0]), np.pi)
+    tangent_angle = np.mod(np.arctan2(tangent[1], tangent[0]), np.pi)
+    np.save(raw_dir / "02_geometry_normal_angle_radians.npy", normal_angle.astype(np.float32))
+    np.save(raw_dir / "06_topology_tangent_angle_radians.npy", tangent_angle.astype(np.float32))
+
+    # Orientation is a Geometry-predicted normal. Tangent is a Topology-predicted
+    # line direction. Each is visualized with its OWN native angle and confidence.
+    def direction_rgb(angle, strength):
+        hsv = np.zeros((h, w, 3), dtype=np.float32)
+        hsv[..., 0] = angle / np.pi
+        hsv[..., 1] = 0.88
+        hsv[..., 2] = 0.94
+        directional = colors.hsv_to_rgb(hsv)
+        alpha = np.clip(strength, 0.0, 1.0)[..., None] * 0.83
+        bg = np.repeat(np.clip(observed[..., None], 0, 1), 3, axis=-1)
+        return np.clip(bg * (1.0 - alpha) + directional * alpha, 0, 1)
+
+    displays = [
+        ("01_edge", "Edge (Geometry probability)", edge, "gray", 0, 1),
+        ("02_orientation", "Orientation (Geometry NORMAL)",
+         direction_rgb(normal_angle, edge), None, None, None),
+        ("03_contrast_hint", "Contrast Hint (Geometry, signed)",
+         arrays["contrast_hint"][0], "coolwarm", -1, 1),
+        ("04_skeleton", "Skeleton (Topology probability)", skeleton, "magma", 0, 1),
+        ("05_width", "Width (Topology scale)", arrays["width_expected"][0], "viridis", 0, 1),
+        ("06_tangent", "Tangent (Topology LINE direction)",
+         direction_rgb(tangent_angle, skeleton), None, None, None),
+        ("07_polarity", "Polarity (dark - / bright +)",
+         arrays["polarity"][0], "coolwarm", -1, 1),
+        ("08_contrast_magnitude", "Contrast Magnitude (Topology)",
+         arrays["contrast_mag"][0], "magma", 0, 4),
+    ]
+
+    def draw(ax, data, title, cmap, vmin, vmax):
+        # Image only: no titles, borders, axes, or margins in the saved figures.
+        ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, origin="upper", interpolation="nearest")
+        ax.axis("off")
+
+    for name, title, data, cmap, vmin, vmax in displays:
+        fig = plt.figure(figsize=(5, 5), dpi=300)
+        ax = fig.add_axes([0, 0, 1, 1])
+        draw(ax, data, title, cmap, vmin, vmax)
+        fig.savefig(folder / f"{name}.png", dpi=300, pad_inches=0)
+        plt.close(fig)
+
+    # Label-free eight-panel contact sheet, with no whitespace between panels.
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10), dpi=150)
+    fig.subplots_adjust(left=0, right=1, bottom=0, top=1, wspace=0, hspace=0)
+    for ax, (_name, title, data, cmap, vmin, vmax) in zip(axes.flat, displays):
+        draw(ax, data, title, cmap, vmin, vmax)
+    fig.savefig(folder / "00_eight_maps_overview.png", dpi=300, pad_inches=0)
+    plt.close(fig)
+    (folder / "README.txt").write_text(
+        "All eight maps are forward outputs of the trained Geometry + Topology models.\n"
+        "Geometry Orientation = predicted edge NORMAL from (cos2theta,sin2theta).\n"
+        "Topology Tangent = separately learned line-direction vector.\n"
+        "Orientation/Tangent PNGs colorize directions, blended by native edge/skeleton confidence.\n"
+        "Raw native tensors and decoded angles are in native_arrays/.\n"
+        "The gap is NOT blanked: learned maps predict features INSIDE missing pixels.\n"
+        "All eight saved PNGs and their overview are title-free and border-free.\n"
+        "Missing-region outlines are omitted from the exported maps; no hidden target values enter the model.\n"
+        "Width is a learned normalized scale, not measured physical thickness in pixels.\n",
+        encoding="utf-8",
+    )
+    return folder / "00_eight_maps_overview.png"
+
+
+def save_region_architecture_maps(out, band, wavelengths, preset):
     """Export native intermediate features of the trained Region branch.
 
     This diagnostic forward pass is independent of the learned router's chosen
@@ -645,11 +783,9 @@ def save_region_architecture_maps(out, band, wavelengths):
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     # This diagnostic uses the same final Region as the three-expert pipeline.
-    if args.preset == 'swir_8x2':
-        from src.lineaware_region import load_lineaware_region
-        topo, ck, geom, _gck, topo_path, geom_path = load_lineaware_region(device, wavelengths)
-    else:
-        topo, ck, geom, _gck, topo_path, geom_path = spatial_inference.load_models(device)
+    from src.lineaware_region import load_lineaware_region
+    topo, ck, geom, _gck, topo_path, geom_path = load_lineaware_region(
+        device, wavelengths, full_split=True)
     ps = int(ck.get("patch_size", 65))
     if ps > min(roi.shape[:2]):
         raise ValueError(f"Model patch {ps} exceeds ROI dimensions")
@@ -672,7 +808,8 @@ def save_region_architecture_maps(out, band, wavelengths):
             topology = topo(structure=geometry, **batch)
     combined = dict(geometry)
     combined.update(topology)
-    expected = ("edge_prob", "orientation", "skeleton_prob", "support_prob",
+    expected = ("edge_prob", "orientation", "contrast_hint", "skeleton_prob",
+                "width_expected", "tangent", "polarity", "contrast_mag", "support_prob",
                 "transported", "transport_confidence", "radiometry", "detail", "prediction")
     absent = [key for key in expected if key not in combined]
     if absent:
@@ -713,7 +850,10 @@ def save_region_architecture_maps(out, band, wavelengths):
     np.save(folder / "05_geometry_orientation_native_cos2_sin2.npy", arrays["orientation"])
     orientation_lines, line_count = save_orientation_line_view(
         folder / "05_geometry_orientation_lines.png",
-        observed, smooth_angle, angle_confidence, synthetic
+        observed, smooth_angle, angle_confidence, mask=None
+    )
+    eight_figure = export_eight_native_maps(
+        folder / "eight_native_maps", arrays, observed, synthetic, wavelengths, band
     )
     np.save(folder / "05_geometry_orientation_line_confidence.npy", angle_confidence.astype(np.float32))
     print(f"Geometry orientation: drawn {line_count} confidence-filtered direction segments.", flush=True)
@@ -765,6 +905,8 @@ def save_region_architecture_maps(out, band, wavelengths):
 
     (folder / "metadata.json").write_text(json.dumps({
         "source": "Trained Geometry + Topology checkpoints",
+        "model_preset": preset,
+        "eight_maps_overview": str(eight_figure),
         "geometry_checkpoint": str(geom_path),
         "topology_checkpoint": str(topo_path),
         "band": int(band),
@@ -778,10 +920,107 @@ def save_region_architecture_maps(out, band, wavelengths):
                 "Display normalization is for visualization only."
     }, indent=2), encoding="utf-8")
     print(f"Saved trained Region maps: {folder}", flush=True)
+    print(f"Saved eight native maps: {eight_figure}", flush=True)
+
+
+
+def restore_region_work_from_output(out, cube, invalid):
+    """Restore the exact ROI corruption input saved by earlier visualizer runs.
+
+    We use the original calibrated cube and the already-saved synthetic mask,
+    rather than the TPSSR reconstruction, to avoid leaking reconstructed values
+    or the ground-truth values of missing pixels into the network input.
+    """
+    required = ("roi_ground_truth.npy", "roi_corrupted.npy", "roi_synthetic_mask.npy")
+    absent = [name for name in required if not (out / name).is_file()]
+    if absent:
+        raise FileNotFoundError(
+            f"Cannot regenerate the Region maps from {out}: missing {absent}. "
+            "The previous ROI reconstruction must have saved its output arrays.")
+    roi = np.asarray(np.load(out / "roi_ground_truth.npy"), dtype=np.float32)
+    corrupted = np.asarray(np.load(out / "roi_corrupted.npy"), dtype=np.float32)
+    synthetic = np.asarray(np.load(out / "roi_synthetic_mask.npy"), dtype=bool)
+    invalid_roi = np.asarray(invalid, dtype=bool)
+    if roi.shape != corrupted.shape or roi.shape != synthetic.shape or roi.shape != invalid_roi.shape:
+        raise ValueError("Saved ROI arrays and original invalid mask have incompatible shapes")
+    if roi.ndim != 3 or roi.shape[0:2] != (ROI_SIZE, ROI_SIZE):
+        raise ValueError("Expected original fixed 128x128 ROI with spectral bands")
+    model_mask = synthetic | invalid_roi | ~np.isfinite(roi)
+    if not np.array_equal(~np.isfinite(corrupted), model_mask):
+        raise RuntimeError(
+            "Saved corrupted ROI is inconsistent with the synthetic/invalid masks; "
+            "refusing to generate maps from an altered input")
+    work = out / "_work"
+    existed = work.exists()
+    work.mkdir(exist_ok=True)
+    outputs = {
+        "roi_cube.npy": roi,
+        "roi_invalid.npy": invalid_roi,
+        "synthetic_mask.npy": synthetic,
+        "model_mask.npy": model_mask,
+    }
+    for filename, values in outputs.items():
+        dest = work / filename
+        if dest.exists():
+            previous = np.load(dest, mmap_mode="r")
+            if previous.shape != values.shape or not np.array_equal(previous, values, equal_nan=True):
+                raise RuntimeError(f"Existing {dest} differs from the saved ROI")
+        else:
+            np.save(dest, values)
+    return work, not existed
+
+
+def regenerate_region_maps(existing_output):
+    """Re-run ONLY Geometry/Topology diagnostics, not whole-image reconstruction."""
+    from experiment_config import resolve_experiment
+    from _launcher_common import env_for
+    out = Path(existing_output).expanduser().resolve()
+    metadata_path = out / "selection.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Could not find {metadata_path}. Pass the ROI run's output directory.")
+    meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+    preset = meta.get("model_preset", meta.get("preset"))
+    if preset != "swir_8x2":
+        raise ValueError(f"This eight-map recovery uses SWIR 8x2 Line-aware weights, got {preset!r}")
+    ds = str(meta["dataset"]).upper()
+    band = int(meta["display_band"])
+
+    # Reproduce the very same experiment configuration/checkpoint identity.
+    args = argparse.Namespace(preset=preset, dataset=None, active_test=None,
+                              train_datasets=None, test_datasets=None, experiment_name=None)
+    spec = resolve_experiment(args)
+    os.environ.update(env_for(spec, spec.active_test))
+    if str(CORE) not in sys.path:
+        sys.path.insert(0, str(CORE))
+    from src.evaluation_utils import load_dataset
+    cube, invalid, _split, wavelengths = load_dataset(ds)
+    y = int(meta["roi_y_in_full_image"])
+    x = int(meta["roi_x_in_full_image"])
+    invalid_roi = invalid[y:y + ROI_SIZE, x:x + ROI_SIZE]
+    if invalid_roi.shape != (ROI_SIZE, ROI_SIZE, len(wavelengths)):
+        raise RuntimeError("The original source ROI is no longer accessible at its saved coordinates")
+    saved_truth = np.load(out / "roi_ground_truth.npy", mmap_mode="r")
+    source_truth = cube[y:y+ROI_SIZE, x:x+ROI_SIZE]
+    if not np.array_equal(saved_truth, source_truth, equal_nan=True):
+        raise RuntimeError("Calibrated source data changed since the original ROI visualization")
+    del cube, source_truth
+
+    work, created = restore_region_work_from_output(out, saved_truth, invalid_roi)
+    print("[MAPS ONLY] Reusing the saved crop and missing-data mask; no TPSSR rerun.", flush=True)
+    try:
+        save_region_architecture_maps(out, band, wavelengths, preset)
+        check_eight_maps(out)
+    finally:
+        if created:
+            shutil.rmtree(work)
+    return out
 
 
 def main():
     args = arguments()
+    if args.maps_from_output is not None:
+        regenerate_region_maps(args.maps_from_output)
+        return
     from experiment_config import PRESETS, resolve_experiment, sensor_of, SUPPORTED_DATASETS
     from _launcher_common import env_for
 
@@ -801,6 +1040,10 @@ def main():
         raise SystemExit(f"Cannot visualize {display_dataset} with {args.preset}: sensor mismatch.")
     if display_dataset not in (*spec.train, *spec.tests):
         raise SystemExit(f"{display_dataset} is not part of the selected model experiment {args.preset}.")
+    if args.region_figure and not args.preset.startswith("swir_"):
+        raise SystemExit("These Line-aware Region maps are currently supported for SWIR models only.")
+    if args.region_figure and args.router == "learned_router3_aligned":
+        raise SystemExit("Eight native maps require a Line-aware Router checkpoint; use --router learned_router3_lineaware_rankcv")
     role = "held-out test" if display_dataset in spec.tests else "model training/validation"
     print(f"Visualizing {display_dataset} ({role}) with the trained {args.preset} model.", flush=True)
     if display_dataset in spec.train:
@@ -909,7 +1152,8 @@ def main():
         "image_role_in_model_experiment": role,
         "image_scope": "test-block" if use_test_block else "full",
         "model_preset": args.preset,
-        "region_backend": "lineaware" if args.preset == "swir_8x2" else "original",
+        "region_backend": "lineaware" if args.router != "learned_router3_aligned" else "aligned_default",
+        "router": args.router,
         "model_primary_test": spec.primary_test,
         "model_training_datasets": list(spec.train),
         "model_held_out_datasets": list(spec.tests),
@@ -955,14 +1199,15 @@ def main():
     if args.gpus == 2:
         cmd += ["-m", "torch.distributed.run", "--standalone", "--nproc_per_node=2"]
     cmd += [str(Path(__file__).resolve()), "--preset", args.preset, "--dataset", args.dataset,
-            "--scenario", args.scenario, "--severity", str(args.severity),
+            "--router", args.router, "--scenario", args.scenario, "--severity", str(args.severity),
             "--outdir", str(out), "--region-batch", str(args.region_batch), "--worker"]
-    print(f"Running trained {ROUTER} on {args.gpus} GPU(s)...", flush=True)
+    print(f"Running trained {args.router} on {args.gpus} GPU(s)...", flush=True)
     subprocess.run(cmd, cwd=ROOT, env=model_env, check=True)
     coords, values, routes = merge_outputs(out, args.gpus)
     stats = save_reconstruction(out, band, waves, coords, values, routes, params)
     if args.region_figure:
-        save_region_architecture_maps(out, band, waves)
+        save_region_architecture_maps(out, band, waves, args.preset)
+        check_eight_maps(out)
     shutil.rmtree(work)
     print(f"Complete | RMSE={stats['RMSE']:.6f} | MAE={stats['MAE']:.6f} | coverage=100%", flush=True)
     print(f"Comparison figure: {out / '03_tpssr_comparison.png'}", flush=True)

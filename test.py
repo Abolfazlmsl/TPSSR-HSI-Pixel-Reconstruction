@@ -46,7 +46,9 @@ def parse_args():
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--no-verify-region-batch", action="store_true")
     p.add_argument("--force", action="store_true", help="Recompute completed masks")
-    p.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned"], default="learned_router3_aligned",
+    p.add_argument("--region-fixed-eval", action="store_true",
+                   help="Use the cache-compatible fixed full evaluation-coordinate Region tiling protocol")
+    p.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware"], default="learned_router3_aligned",
                    help="Select original V2.3, fixed Neighbor V1/V2, or learned spectral fusion")
     p.add_argument("--focus-band-guard", action="store_true",
                    help="Evaluate only the 12 mask cases where V2 band guard was activated")
@@ -57,6 +59,18 @@ def parse_args():
 
 
 def launch_all_tests(args, spec):
+    if args.region_fixed_eval and args.router not in (
+            'learned_router3_aligned',
+            'learned_router3_lineaware', 'learned_router3_lineaware_mse',
+            'learned_router3_lineaware_rankcv', 'learned_router3_lineaware_regretcv', 'learned_router2_lineaware'):
+        raise ValueError('--region-fixed-eval is supported for Router3 Aligned and Line-aware Router3/Router2 only')
+    # The legacy baseline comparison must load original Region weights, not the
+    # optional B-to-A Line-aware trial activated through an environment variable.
+    if args.region_fixed_eval and args.router == 'learned_router3_aligned':
+        if tuple(spec.train) != ('SWIR6', 'SWIR7', 'SWIR8', 'SWIR9', 'SWIR10') or tuple(spec.tests) != ('SWIR1', 'SWIR2', 'SWIR3', 'SWIR4', 'SWIR5'):
+            raise ValueError('Fixed-union legacy baseline comparison is supported only for SWIR B-to-A')
+        if selected_lineaware_region(spec, args.router):
+            raise ValueError('Legacy baseline must use original Region; unset TPSSR_B2A_LINEAWARE_TEST')
     if args.focus_band_guard and args.router != 'learned_fusion_guarded':
         raise ValueError('--focus-band-guard requires --router learned_fusion_guarded')
     print(describe(spec))
@@ -90,6 +104,8 @@ def launch_all_tests(args, spec):
             common.append("--no-verify-region-batch")
         if args.force:
             common.append("--force")
+        if args.region_fixed_eval:
+            common.append("--region-fixed-eval")
         if args.focus_band_guard:
             common.append("--focus-band-guard")
 
@@ -162,7 +178,11 @@ if torch.cuda.is_available():
 else:
     DEVICE = torch.device("cpu")
 
-OUTDIR = Path(config.RESULTS_DIR) / selected_results_folder(SPEC, ARGS.router)
+# Distinct output tree: never accidentally resume or merge routed-only test
+# metrics with fixed-union Region metrics.
+RESULT_FOLDER = selected_results_folder(SPEC, ARGS.router) + (
+    '__fixed_union_region' if ARGS.region_fixed_eval else '')
+OUTDIR = Path(config.RESULTS_DIR) / RESULT_FOLDER
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -197,15 +217,20 @@ def evaluate_worker(mask_files):
         DEVICE,
         region_batch=ARGS.region_batch,
         verify_region_batch=not ARGS.no_verify_region_batch,
-        learned_fusion=(ARGS.router in ("learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned")),
+        learned_fusion=(ARGS.router in ("learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware")),
         learned_router=(ARGS.router == "learned_router"),
         learned_router3=(ARGS.router == "learned_router3"),
         learned_router3_rmse=(ARGS.router == "learned_router3_rmse"),
         learned_router3_aligned=(ARGS.router == "learned_router3_aligned"),
+        learned_router3_lineaware=(ARGS.router == "learned_router3_lineaware"),
+        learned_router3_lineaware_mse=(ARGS.router == "learned_router3_lineaware_mse"),
+        learned_router3_lineaware_rankcv=(ARGS.router == "learned_router3_lineaware_rankcv"),
+        learned_router3_lineaware_regretcv=(ARGS.router == "learned_router3_lineaware_regretcv"),
+        learned_router2_lineaware=(ARGS.router == "learned_router2_lineaware"),
     )
     if selected_lineaware_region(SPEC, ARGS.router):
         from src.lineaware_region import checkpoint_paths
-        geometry_ck, topology_ck = checkpoint_paths()
+        geometry_ck, topology_ck = checkpoint_paths(full_split=ARGS.router in ('learned_router3_lineaware', 'learned_router3_lineaware_mse', 'learned_router3_lineaware_rankcv', 'learned_router3_lineaware_regretcv', 'learned_router2_lineaware'))
         if (Path(pipeline.geometry_path).resolve() != geometry_ck.resolve() or
                 Path(pipeline.topology_path).resolve() != topology_ck.resolve()):
             raise RuntimeError('Incorrect Region checkpoints loaded: refusing inference')
@@ -277,19 +302,14 @@ def evaluate_worker(mask_files):
                          "learned_fusion": predict_mask_learned_fusion,
                          "learned_fusion_guarded": predict_mask_learned_fusion_guarded,
                          "learned_router": predict_mask_learned_router,
-                         "learned_router3": predict_mask_learned_router3, "learned_router3_rmse": predict_mask_learned_router3, "learned_router3_aligned": predict_mask_learned_router3}[ARGS.router]
-            out = predictor(
-                pipeline,
-                test_cube,
-                mask,
-                coords,
-                preview_progress=(
-                    f"{DATASET} GPU{RANK} Mask {mask_index}/{total_global} previews"
-                ),
-                region_progress=(
-                    f"{DATASET} GPU{RANK} Mask {mask_index}/{total_global} Region"
-                ),
+                         "learned_router3": predict_mask_learned_router3, "learned_router3_rmse": predict_mask_learned_router3, "learned_router3_aligned": predict_mask_learned_router3, "learned_router3_lineaware": predict_mask_learned_router3, "learned_router3_lineaware_mse": predict_mask_learned_router3, "learned_router3_lineaware_rankcv": predict_mask_learned_router3, "learned_router3_lineaware_regretcv": predict_mask_learned_router3, "learned_router2_lineaware": predict_mask_learned_router3}[ARGS.router]
+            predict_kwargs = dict(
+                preview_progress=f"{DATASET} GPU{RANK} Mask {mask_index}/{total_global} previews",
+                region_progress=f"{DATASET} GPU{RANK} Mask {mask_index}/{total_global} Region",
             )
+            if ARGS.region_fixed_eval:
+                predict_kwargs['region_full_eval'] = True
+            out = predictor(pipeline, test_cube, mask, coords, **predict_kwargs)
             pred = out["prediction"]
             band_predictions = sparse_band_predictions(coords, pred)
             metrics = evaluate_reconstruction(
@@ -322,6 +342,8 @@ def evaluate_worker(mask_files):
                 "dataset": DATASET,
                 "experiment": config.EXPERIMENT_NAME,
                 "eval_protocol": EVAL_PROTOCOL,
+                "region_tiling_protocol": ("fixed_union_of_sampled_coordinates_v1"
+                                           if ARGS.region_fixed_eval else "router_selected_coordinates"),
                 "router_variant": ARGS.router,
                 **({f"candidate_{k}_voxels": v for k, v in out.get("candidate_method_voxels", {}).items()} if ARGS.router != "v23" else {}),
                 **({f"candidate_{k}": v for k, v in out.get("candidate_policy_audit", {}).items()} if ARGS.router != "v23" else {}),
@@ -338,7 +360,7 @@ def evaluate_worker(mask_files):
                 "mean_gate_probability": float(np.nanmean(out["gate_probability"])),
                 "component_count": int(len(out["component_records"])),
                 "routing_mode": ARGS.router,
-                "router_policy": "learned_three_expert_quality" if ARGS.router in ("learned_router3", "learned_router3_rmse", "learned_router3_aligned") else "mask_geometry_and_local_consistency",
+                "router_policy": "spectral_binary_with_region_fallback" if ARGS.router == "learned_router2_lineaware" else "learned_three_expert_quality" if ARGS.router in ("learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv") else "mask_geometry_and_local_consistency",
                 "stage1_spectral_override_components": int(sum(r["stage1_spectral_override"] for r in out["component_records"])),
                 "spectral_safe_override_components": int(safe_override_count),
                 "spectral_safe_override_component_fraction": float(safe_override_count / component_count),
@@ -378,6 +400,8 @@ def evaluate_worker(mask_files):
                 "dataset": DATASET,
                 "experiment": config.EXPERIMENT_NAME,
                 "eval_protocol": EVAL_PROTOCOL,
+                "region_tiling_protocol": ("fixed_union_of_sampled_coordinates_v1"
+                                           if ARGS.region_fixed_eval else "router_selected_coordinates"),
                 "mask_file": mask_path.name,
                 "scenario": "",
                 "severity": "",

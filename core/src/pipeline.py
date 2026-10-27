@@ -134,14 +134,14 @@ def _hybrid_replace_spectral_only(pipeline, test_cube, mask, spectral_coords):
     values=pixel_pred[inv,coords[:,2]]
     return values,np.isfinite(values)
 
-def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fusion=False, learned_router=False, learned_router3=False, learned_router3_rmse=False, learned_router3_aligned=False):
+def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fusion=False, learned_router=False, learned_router3=False, learned_router3_rmse=False, learned_router3_aligned=False, learned_router3_lineaware=False, learned_router3_lineaware_mse=False, learned_router3_lineaware_rankcv=False, learned_router3_lineaware_regretcv=False, learned_router2_lineaware=False):
     """Load the spectral and topology-guided spatial experts."""
     hybrid, mean, std, wave, gate_path, backbone_path = _load_accepted_spectral_hybrid_v2(device)
     topology, checkpoint, geometry, _geometry_checkpoint, topology_path, geometry_path = (
         load_final_region_models(device)
     )
     fusion_model, fusion_path = None, None
-    if (learned_router or learned_router3 or learned_router3_rmse or learned_router3_aligned) and not learned_fusion:
+    if (learned_router or learned_router3 or learned_router3_rmse or learned_router3_aligned or learned_router3_lineaware or learned_router3_lineaware_mse or learned_router3_lineaware_rankcv or learned_router3_lineaware_regretcv or learned_router2_lineaware) and not learned_fusion:
         raise ValueError('Learned Router requires learned fusion')
     if learned_fusion:
         from training.neighbor_fusion import checkpoint_path, load_fusion_checkpoint
@@ -171,16 +171,36 @@ def load_pipeline(device, region_batch=32, verify_region_batch=True, learned_fus
         router_payload = load_router_checkpoint(router_path, gate_path, fusion_path,
                                                  tuple(VALID_CORES))
     router3_payload = None
-    if learned_router3 or learned_router3_rmse or learned_router3_aligned:
+    if learned_router3 or learned_router3_rmse or learned_router3_aligned or learned_router3_lineaware or learned_router3_lineaware_mse or learned_router3_lineaware_rankcv or learned_router3_lineaware_regretcv or learned_router2_lineaware:
         from training.three_expert_router import load_checkpoint, path_for
         from training.spectral_gate import VALID_CORES
-        objective = 'mse' if learned_router3_rmse else 'log_rmse'
-        region_expert = 'refined' if learned_router3_aligned else 'raw'
-        path = path_for(config.MODELS_DIR, objective=objective, region_expert=region_expert)
+        objective = ('regret_cv' if learned_router3_lineaware_regretcv else
+                     'rank_cv' if learned_router3_lineaware_rankcv else
+                     'mse' if (learned_router3_rmse or learned_router3_lineaware_mse) else 'log_rmse')
+        region_expert = ('lineaware' if (learned_router3_lineaware or learned_router3_lineaware_mse or learned_router3_lineaware_rankcv or learned_router3_lineaware_regretcv) else
+                         'refined' if learned_router3_aligned else 'raw')
+        if learned_router2_lineaware:
+            from training.three_expert_router import binary_path, load_binary_checkpoint
+            path = binary_path(config.MODELS_DIR)
+        else:
+            path = path_for(config.MODELS_DIR, objective=objective, region_expert=region_expert)
         if not path.is_file():
             raise FileNotFoundError('Three-expert router checkpoint missing: ' + str(path))
-        router3_payload = load_checkpoint(path, gate_path, fusion_path,
-                            geometry_path, topology_path, tuple(VALID_CORES), objective=objective, region_expert=region_expert)
+        if learned_router3_lineaware or learned_router3_lineaware_mse or learned_router3_lineaware_rankcv or learned_router3_lineaware_regretcv or learned_router2_lineaware:
+            from src.lineaware_region import load_lineaware_region
+            waves = np.asarray(np.load(Path(config.PROCESSED_DATA_ROOT) /
+                str(config.TEST_DATASET_FOLDER) / 'wavelengths_nm.npy'), dtype=np.float32)
+            del topology, geometry
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            topology, checkpoint, geometry, _geom_ck, topology_path, geometry_path = (
+                load_lineaware_region(device, waves, full_split=True))
+        if learned_router2_lineaware:
+            router3_payload = load_binary_checkpoint(path, gate_path, fusion_path,
+                geometry_path, topology_path, tuple(VALID_CORES))
+        else:
+            router3_payload = load_checkpoint(path, gate_path, fusion_path,
+                geometry_path, topology_path, tuple(VALID_CORES), objective=objective, region_expert=region_expert)
     # Accepted SWIR 8x2 inference uses the line-aware Region trained on the
     # same eight sources. The router checkpoint is validated against the
     # original Region first; no spectral or routing weights are changed.
@@ -1044,7 +1064,8 @@ def predict_mask_learned_router(pipeline, test_cube, mask, eval_coords,
 
 @torch.inference_mode()
 def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
-                                 preview_progress=None, region_progress=None):
+                                 preview_progress=None, region_progress=None,
+                                 region_full_eval=False):
     """Three-way learned routing; no V2 component routing or band-guard policy."""
     from training.neighbor_fusion import crop_at
     from training.three_expert_router import features_for_pixel, predict_risks
@@ -1076,7 +1097,11 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
         fusion_all.append(fusion)
     eligible = np.asarray([[a is not None, b is not None, True]
                            for a,b in zip(interp_all,fusion_all)], bool)
-    risks = predict_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
+    if pipeline.router3_checkpoint.get('architecture') == 'spectral_binary_router_with_region_fallback_v1':
+        from training.three_expert_router import predict_binary_risks
+        risks = predict_binary_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
+    else:
+        risks = predict_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
     decisions = np.argmin(risks, axis=1)
 
     n = len(coords)
@@ -1089,10 +1114,14 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
         prediction[i] = source[band]
     region_indices = np.flatnonzero(selected == 2)
     if region_indices.size:
+        # The counterfactual cache computes Region on the full, fixed evaluation
+        # coordinate union.  Using the same support fixes tile centres and makes
+        # Region predictions independent of the Router's selected subset.
+        region_input_coords = coords if region_full_eval else coords[region_indices]
         reconstructed, _ = reconstruct_final_region(
             pipeline.topology_model, pipeline.topology_checkpoint,
             pipeline.geometry_model, cube, mask, pipeline.device,
-            eval_coords=coords[region_indices], batch_size=pipeline.region_batch,
+            eval_coords=region_input_coords, batch_size=pipeline.region_batch,
             verify_batch=pipeline.verify_region_batch,
             progress_desc=region_progress or 'Learned Router3 Region')
         region_lookup = {(int(y),int(xx),int(b)):float(val)
@@ -1100,7 +1129,7 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
                          for (y,xx),val in zip(yx,values)}
         for i in region_indices:
             prediction[i] = region_lookup.get(tuple(map(int,coords[i])),np.nan)
-        if pipeline.router3_checkpoint.get('region_expert', 'raw') == 'refined':
+        if pipeline.router3_checkpoint.get('region_expert', 'raw') in ('refined', 'lineaware'):
             from training.three_expert_router import refine_region
             prediction[region_indices], n_refined = refine_region(
                 cube, mask, coords[region_indices], prediction[region_indices])

@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 from _launcher_common import ROOT, CORE, env_for
-from experiment_config import resolve_experiment
+from experiment_config import resolve_experiment, add_experiment_args
 from train import geometry_training_metadata
 
 
@@ -28,7 +28,7 @@ def paths(spec):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--preset", choices=["swir_8x2", "swir_region_a_to_b", "swir_region_b_to_a", "vnir_8x2"], required=True)
+    add_experiment_args(p)
     p.add_argument("--stage", choices=["all", "geometry", "topology"], default="all")
     p.add_argument("--gpus", type=int, choices=[2], default=2)
     p.add_argument("--geometry-train-samples", type=int, default=None)
@@ -46,13 +46,11 @@ def main():
     if not (0 <= a.fine_line_probability <= 1) or not (0 <= a.hard_val_weight <= 1):
         p.error("Probability and validation weight must be between zero and one")
     # The fixed preset requires no environment overrides from earlier custom runs.
-    import argparse as ap
     old = {k: os.environ.pop(k, None) for k in (
         "HSI_TRAIN_DATASETS", "HSI_TEST_DATASETS", "HSI_ACTIVE_TEST_DATASET",
         "HSI_EXPERIMENT_NAME", "HSI_TEST_DATASET")}
     try:
-        spec = resolve_experiment(ap.Namespace(preset=a.preset, dataset=None, active_test=None,
-                        train_datasets=None, test_datasets=None, experiment_name=None))
+        spec = resolve_experiment(a)
     finally:
         for k,v in old.items():
             if v is not None: os.environ[k] = v
@@ -95,7 +93,7 @@ def main():
     for name in ("train_geometry.py", "train_topology.py"):
         if not (METHODS / name).is_file():
             raise FileNotFoundError(METHODS / name)
-    print("Line-aware Region training", a.preset, ", ".join(spec.train), flush=True)
+    print("Line-aware Region training", spec.experiment_name, ", ".join(spec.train), flush=True)
     print("HELD OUT", ", ".join(spec.tests), flush=True)
     print("Trial checkpoints", base, flush=True)
     print("Geometry", "EXISTS" if geometry_ck.is_file() else "MISSING", geometry_ck, flush=True)

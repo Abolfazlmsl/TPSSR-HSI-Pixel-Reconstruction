@@ -74,12 +74,19 @@ def parse_args():
     parser.add_argument("--region-batch", type=int, default=32)
     parser.add_argument("--crop-size", type=int, default=128)
     parser.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned"], default="learned_router3_aligned")
+    parser.add_argument("--region-fixed-eval", action="store_true",
+                        help="Read results produced by test.py --region-fixed-eval")
+    parser.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware"], default="learned_router3_aligned")
     return parser.parse_args()
 
 
-def combine(spec, router="v23") -> None:
-    folder = selected_results_folder(spec, router)
+def results_folder(spec, router, region_fixed_eval=False):
+    return selected_results_folder(spec, router) + (
+        '__fixed_union_region' if region_fixed_eval else '')
+
+
+def combine(spec, router="v23", region_fixed_eval=False) -> None:
+    folder = results_folder(spec, router, region_fixed_eval)
     all_rows = []
     seen = set()
     for dataset in spec.tests:
@@ -136,13 +143,13 @@ def evaluate_one(spec, args):
         predict_mask = predict_mask_learned_fusion_guarded
     elif args.router == "learned_router":
         predict_mask = predict_mask_learned_router
-    elif args.router in ("learned_router3", "learned_router3_rmse", "learned_router3_aligned"):
+    elif args.router in ("learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware"):
         predict_mask = predict_mask_learned_router3
     # The visual export functions resolve these names in this module's globals.
     globals().update(load_dataset=load_dataset, split_blocks=split_blocks,
                      list_mask_files=list_mask_files, load_test_mask=load_test_mask,
                      load_pipeline=load_pipeline, predict_mask=predict_mask)
-    OUTDIR = Path(config.RESULTS_DIR) / selected_results_folder(spec, args.router)
+    OUTDIR = Path(config.RESULTS_DIR) / results_folder(spec, args.router, args.region_fixed_eval)
     METRICS = OUTDIR / "test_metrics.csv"
     VISDIR = OUTDIR / "visuals"
     if not METRICS.exists():
@@ -203,11 +210,16 @@ def export_visuals(n_visuals):
         device,
         region_batch=ARGS.region_batch,
         verify_region_batch=True,
-        learned_fusion=(ARGS.router in ("learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned")),
+        learned_fusion=(ARGS.router in ("learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware")),
         learned_router=(ARGS.router == "learned_router"),
         learned_router3=(ARGS.router == "learned_router3"),
         learned_router3_rmse=(ARGS.router == "learned_router3_rmse"),
         learned_router3_aligned=(ARGS.router == "learned_router3_aligned"),
+        learned_router3_lineaware=(ARGS.router == "learned_router3_lineaware"),
+        learned_router3_lineaware_mse=(ARGS.router == "learned_router3_lineaware_mse"),
+        learned_router3_lineaware_rankcv=(ARGS.router == "learned_router3_lineaware_rankcv"),
+        learned_router3_lineaware_regretcv=(ARGS.router == "learned_router3_lineaware_regretcv"),
+        learned_router2_lineaware=(ARGS.router == "learned_router2_lineaware"),
     )
     cube, _, split, wavelengths = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
@@ -247,6 +259,7 @@ def export_visuals(n_visuals):
             f"[{DATASET}] Visual {number}/{n_visuals}: {scenario} "
             f"S{severity} R{repeat} | band {band} | {len(coords)} masked pixels"
         )
+        kw = dict(region_full_eval=True) if ARGS.region_fixed_eval else {}
         out = predict_mask(
             pipeline,
             test_cube,
@@ -254,6 +267,7 @@ def export_visuals(n_visuals):
             coords,
             preview_progress=f"{DATASET} Visual {number}/{n_visuals} previews",
             region_progress=f"{DATASET} Visual {number}/{n_visuals} Region",
+            **kw,
         )
         original = np.asarray(test_cube[y0:y1, x0:x1, band], dtype=np.float32).copy()
         corrupted = original.copy()
@@ -315,8 +329,10 @@ def main():
                    "--region-batch", str(args.region_batch),
                    "--crop-size", str(args.crop_size),
                    "--router", args.router, "--single"]
+        if args.region_fixed_eval:
+            command.append('--region-fixed-eval')
         subprocess.run(command, cwd=ROOT, env=env_for(spec, dataset), check=True)
-    combine(spec, args.router)
+    combine(spec, args.router, args.region_fixed_eval)
 
 
 if __name__ == "__main__":
