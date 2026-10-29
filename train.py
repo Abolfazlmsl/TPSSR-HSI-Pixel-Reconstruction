@@ -31,6 +31,20 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def rejected_band_gate_is_complete(gate_dir: Path) -> bool:
+    """True only for a completed, explicitly REJECTED band-gate validation.
+
+    Diagnostic checkpoints must never be passed off as accepted models.
+    """
+    summary = gate_dir.parent / 'GATE_SUMMARY.txt'
+    diagnostic = gate_dir / 'diagnostic_best_val.pt'
+    if not summary.is_file() or not diagnostic.is_file():
+        return False
+    report = summary.read_text(encoding='utf-8')
+    return any(line.strip().startswith('band: accepted=False;')
+               for line in report.splitlines())
+
+
 def geometry_training_metadata(spec, folder: Path) -> Path:
     """Cache finite/valid reflectance stats from TRAIN rows only, never test.
 
@@ -387,8 +401,17 @@ def main():
         if not args.dry_run and not (backbone.exists() or diagnostic.exists()):
             raise RuntimeError('Spectral training did not produce an accepted or diagnostic checkpoint.')
 
-        if gate.exists():
+        # VNIR may legitimately reject both trained gates. A completed rejected
+        # diagnostic is a final validation outcome, not a reason to re-train it.
+        rejected_vnir_gate = (
+            spec.sensor == 'VNIR' and not gate.is_file() and
+            rejected_band_gate_is_complete(gate_dir)
+        )
+        if gate.is_file():
             print('SKIP band confidence gate: found', gate)
+        elif rejected_vnir_gate:
+            print('SKIP confidence gate: completed VNIR validation REJECTED the band gate.')
+            print('  Spectral interpolation remains the safe baseline; neither diagnostic gate is accepted.')
         else:
             print('STAGE 2/4: confidence gate with a frozen backbone')
             cmd = [sys.executable, '-m', 'training.spectral_gate', '--preset', args.preset, '--gpus', '2',
@@ -396,20 +419,26 @@ def main():
             if (gate_dir / 'last_model.pt').exists():
                 cmd.append('--resume')
             launch(cmd, spec, dry_run=args.dry_run)
-        if not args.dry_run and not gate.is_file():
-            raise RuntimeError('Band confidence gate has no accepted best_model.pt. '
-                               'The inference code refuses diagnostic-only gates; inspect gate validation.')
 
         if not args.dry_run:
-            import torch
-            ck = torch.load(gate, map_location='cpu', weights_only=False)
-            if ck.get('gate_variant') != 'band':
-                raise RuntimeError('Checkpoint is not a band confidence gate.')
-            want_hash = ck.get('backbone_sha256')
-            if not any(p.is_file() and sha256(p) == want_hash for p in (backbone, diagnostic)):
-                raise RuntimeError('Confidence gate backbone SHA256 mismatch or backbone missing. '
-                                   'Do NOT retrain the backbone in-place; restore its original checkpoint.')
-            print('CHECKED: gate and spectral backbone SHA256 match.')
+            if gate.is_file():
+                import torch
+                ck = torch.load(gate, map_location='cpu', weights_only=False)
+                if ck.get('gate_variant') != 'band':
+                    raise RuntimeError('Checkpoint is not a band confidence gate.')
+                want_hash = ck.get('backbone_sha256')
+                if not any(p.is_file() and sha256(p) == want_hash for p in (backbone, diagnostic)):
+                    raise RuntimeError('Confidence gate backbone SHA256 mismatch or backbone missing. '
+                                       'Do NOT retrain the backbone in-place; restore its original checkpoint.')
+                print('CHECKED: gate and spectral backbone SHA256 match.')
+            elif spec.sensor == 'VNIR' and rejected_band_gate_is_complete(gate_dir):
+                rejected_vnir_gate = True
+                print('VNIR GATE REJECTED: keeping diagnostic checkpoints for analysis only.', flush=True)
+                print('  No accepted gate checkpoint was created. Do NOT run Fusion/Router/test.py yet.', flush=True)
+                print('  Geometry and Topology can be trained independently.', flush=True)
+            else:
+                raise RuntimeError('Band confidence gate has no accepted best_model.pt and no confirmed '
+                                   'completed VNIR rejection report. Inspect gate validation.')
 
     if args.stage in ('all', 'region'):
         if topology.is_file() and geometry_checkpoint is None:
@@ -446,7 +475,13 @@ def main():
             raise RuntimeError('Topology Completion did not produce best_model.pt.')
 
     print('\nDONE.' if not args.dry_run else '\nDRY-RUN PLAN FINISHED.')
-    if not args.dry_run and args.stage == 'all':
+    if not args.dry_run and args.stage in ('all', 'hybrid') and (
+        spec.sensor == 'VNIR' and not gate.is_file() and rejected_band_gate_is_complete(gate_dir)
+    ):
+        print('VNIR STATUS: spectral gate rejected; original interpolation is the reference.')
+        print('  This training stage is complete, but Fusion/Router/inference still require an')
+        print('  explicitly implemented and verified no-gate fallback. No fake gate was saved.')
+    elif not args.dry_run and args.stage == 'all':
         print('Inference: python test.py --preset ' + str(args.preset) + ' --gpus 2 '
               '--routing-mode tpssr --max-masks 200')
 
