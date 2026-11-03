@@ -408,6 +408,12 @@ def load_checkpoint(path, gate_path, fusion_path, region_geometry_path, region_t
         raise RuntimeError('Three-expert Region definition mismatch')
     if tuple(payload.get('source_cores',())) != tuple(expected_cores):
         raise RuntimeError('Three-expert router provenance mismatch')
+    from training.spectral_reference import source_mode_for_path
+    if payload.get('spectral_source_mode') is not None:
+        if payload['spectral_source_mode'] != source_mode_for_path(gate_path):
+            raise RuntimeError('Three-expert Router spectral source mode mismatch')
+    elif Path(gate_path).name == 'diagnostic_best_val.pt':
+        raise RuntimeError('VNIR Router lacks explicit interpolation source provenance')
     return payload
 
 
@@ -646,7 +652,9 @@ def train(args):
             eligible=np.stack([s[3] for s in combined])
             fitted=fit_models(features,err,eligible,cores,val,objective=args.objective,
                               case_meta=[(s[4],s[5]) for s in combined])
+            from training.spectral_reference import source_mode_for_path
             fitted.update(region_expert=args.region_expert,
+                spectral_source_mode=source_mode_for_path(gate_path),
                 gate_sha256=sha(gate_path),fusion_sha256=sha(fusion_path),
                 region_geometry_sha256=sha(final_gpath),
                 region_topology_sha256=sha(final_tpath),
@@ -1002,7 +1010,8 @@ def train_rank_from_cache(args):
         raise FileExistsError('Refusing to overwrite a fitted RankCV checkpoint: ' + str(target))
     base = Path(config.MODELS_DIR) / 'tpssr'
     tag = spec.model_tag
-    gate = base / 'spectral_gate' / 'band' / 'best_model.pt'
+    from training.spectral_reference import select_spectral_source_checkpoint
+    gate, spectral_mode = select_spectral_source_checkpoint(base, spec.sensor)
     fusion = base / 'neighbor_fusion' / 'best_model.pt'
     final_root = base / 'region_lineaware_trial_v1'
     geometry = final_root / f'geometry_{tag}' / 'best_model.pt'
@@ -1046,7 +1055,7 @@ def train_rank_from_cache(args):
     # calibration acquisitions to fit the deployment router. The reported
     # OOF scores are model-selection diagnostics, not final test estimates.
     final = _fit_rank_family(winner, x, err, present)
-    final.update(region_expert='lineaware',
+    final.update(region_expert='lineaware', spectral_source_mode=spectral_mode,
         source_cores=list(validation), fit_cores=list(validation),
         crossfit_cores=list(validation), selected_family=winner,
         gate_sha256=sha(gate), fusion_sha256=sha(fusion),
@@ -1272,6 +1281,213 @@ def train_regret_from_cache(args):
         print('Candidate:',entry,flush=True)
     print('Checkpoint:',target,flush=True)
 
+def _spatial_source_case(cube, invalid, rng, scenario, severity, mean, std, wave,
+                         hybrid, fusion, region, device, region_batch, router):
+    """Evaluate neighboring pixels under a shared source-only synthetic mask."""
+    from src.pipeline import spatial_consistent_router_choices
+    h, w, bands = cube.shape
+    for attempt in range(20):
+        y = int(rng.integers(49, h - 49)) if h > 98 else h // 2
+        x = int(rng.integers(49, w - 49)) if w > 98 else w // 2
+        y0, y1 = max(0, y - 48), min(h, y + 49)
+        x0, x1 = max(0, x - 48), min(w, x + 49)
+        gt = np.asarray(cube[y0:y1, x0:x1], np.float32).copy()
+        bad = np.asarray(invalid[y0:y1, x0:x1], bool) | ~np.isfinite(gt)
+        cy, cx = y - y0, x - x0
+        artificial, _, _ = generate_training_mask(gt.shape, rng, scenario=scenario,
+            severity=severity, center=(cy, cx), band_center=int(rng.integers(bands)))
+        targets = artificial & ~bad
+        # A contiguous local window retains genuine 4-connected relationships.
+        ys, xs = np.where(np.any(targets, axis=2))
+        candidates = np.column_stack((ys, xs))
+        # Vary the local window between block interiors and borders so the
+        # source calibration sees both homogeneous and transition regions.
+        center_y, center_x = cy, cx
+        if len(candidates) >= 25:
+            center_y += int(rng.integers(-10, 11))
+            center_x += int(rng.integers(-10, 11))
+        close = ((np.abs(candidates[:, 0] - center_y) <= 2) &
+                 (np.abs(candidates[:, 1] - center_x) <= 2))
+        candidates = candidates[close]
+        if not len(candidates):
+            continue
+        # A compact 5x5 region caps expensive Region counterfactual work.
+        mask = bad | artificial
+        corrupted = gt.copy()
+        corrupted[mask] = np.nan
+        features, pred_i, pred_f, present = [], [], [], []
+        voxels, pix_coords, weights = [], [], []
+        for py, px in candidates:
+            bands_missing = np.flatnonzero(targets[py, px])
+            if not len(bands_missing):
+                continue
+            patch, damaged, ry, rx = crop_at(corrupted, mask, int(py), int(px), radius=35)
+            feat, ip, fp = features_for_pixel(patch, damaged, ry, rx,
+                mean, std, wave, fusion, hybrid, device)
+            features.append(feat)
+            pred_i.append(ip)
+            pred_f.append(fp)
+            present.append([ip is not None, fp is not None, True])
+            pix_coords.append((int(py), int(px)))
+            weights.append(len(bands_missing))
+            voxels.extend((int(py), int(px), int(bb)) for bb in bands_missing)
+        if not features:
+            continue
+        coords = np.asarray(voxels, np.int64)
+        rp = _lookup_region(region, corrupted, mask, coords, device, region_batch)
+        rp, _ = refine_region(corrupted, mask, coords, rp)
+        if not np.isfinite(rp).all():
+            continue
+        errors = np.full((len(features), 3), np.inf, np.float64)
+        pos = 0
+        for i, ((py, px), count) in enumerate(zip(pix_coords, weights)):
+            wanted = coords[pos:pos + count, 2]
+            truth = gt[py, px, wanted]
+            if pred_i[i] is not None:
+                errors[i, 0] = float(np.sqrt(np.mean((pred_i[i][wanted] - truth)**2)))
+            if pred_f[i] is not None:
+                errors[i, 1] = float(np.sqrt(np.mean((pred_f[i][wanted] - truth)**2)))
+            errors[i, 2] = float(np.sqrt(np.mean((rp[pos:pos + count] - truth)**2)))
+            pos += count
+        present = np.asarray(present, bool)
+        risks = predict_risks(router, np.stack(features), present)
+        pix = np.asarray(pix_coords, np.int64)
+        weights = np.asarray(weights, np.float64)
+        if not np.isfinite(errors[present]).all():
+            raise RuntimeError('Invalid source-only expert errors')
+        return (pix, risks, errors, weights, str(scenario), int(severity))
+    raise RuntimeError(f'Unable to generate source spatial calibration case: {scenario} S{severity}')
+
+
+def _score_spatial_calibration(samples, weight):
+    from src.pipeline import spatial_consistent_router_choices
+    by_case = []
+    total_changes = 0
+    for pixels, risks, errors, counts, _scenario, _severity in samples:
+        labels = spatial_consistent_router_choices(pixels, risks, weight)
+        baseline = np.argmin(risks, axis=1)
+        total_changes += int(np.count_nonzero(labels != baseline))
+        if not np.isfinite(errors[np.arange(len(labels)), labels]).all():
+            raise RuntimeError('Spatial selector chose unavailable expert')
+        rmse = np.sqrt(np.average(errors[np.arange(len(labels)), labels]**2,
+                                  weights=counts))
+        by_case.append(float(rmse))
+    return float(np.mean(by_case)), total_changes
+
+
+def train_spatial_from_source(args):
+    """Fit only the spatial prior; do not retrain any expert or Router weights.
+
+    The two source-core folds use leave-one-core-out risk models. Every
+    calibration case contains truly adjacent pixels sharing one corruption.
+    """
+    from src.pipeline import _load_accepted_spectral_hybrid_v2
+    from training.spectral_reference import select_spectral_source_checkpoint
+    spec = resolve_experiment(args)
+    validation = tuple(spectral_validation_cores(spec))
+    world = int(os.environ.get('WORLD_SIZE', '1'))
+    rank = int(os.environ.get('RANK', '0'))
+    local = int(os.environ.get('LOCAL_RANK', '0'))
+    if world != 2 or not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        raise RuntimeError('Source spatial calibration requires torchrun with two CUDA GPUs')
+    torch.cuda.set_device(local)
+    torch.set_num_threads(1)
+    device = torch.device('cuda', local)
+    dist.init_process_group('nccl')
+    try:
+        base = Path(config.MODELS_DIR) / 'tpssr'
+        rank_path = path_for(config.MODELS_DIR, objective='rank_cv', region_expert='lineaware')
+        target = rank_path.parent / 'spatial_consistency.joblib'
+        if target.exists():
+            raise FileExistsError('Refusing to overwrite source spatial calibration: ' + str(target))
+        gate_path, _ = select_spectral_source_checkpoint(base, spec.sensor)
+        fusion_path = base / 'neighbor_fusion' / 'best_model.pt'
+        region_dir = base / 'region_lineaware_trial_v1'
+        gpath = region_dir / f'geometry_{spec.model_tag}' / 'best_model.pt'
+        tpath = region_dir / f'topology_{spec.model_tag}' / 'best_model.pt'
+        rank_router = load_checkpoint(rank_path, gate_path, fusion_path, gpath,
+            tpath, validation, objective='rank_cv', region_expert='lineaware')
+        original = path_for(config.MODELS_DIR, 'log_rmse', 'lineaware')
+        labels_path = original.parent / 'calibration_labels.npz'
+        if sha(labels_path) != rank_router.get('calibration_source_sha256'):
+            raise RuntimeError('RankCV calibration source checksum mismatch')
+        with np.load(labels_path, allow_pickle=False) as saved:
+            x = np.asarray(saved['x'], np.float32)
+            err = np.asarray(saved['err'], np.float64)
+            present = np.asarray(saved['present'], bool)
+            core = np.asarray(saved['core'], np.int64)
+        # Cross-fit the risk estimators; final RankCV trained on BOTH source
+        # calibration cores cannot be used for objective calibration.
+        oof_model = _fit_rank_family(rank_router['model_family'], x[core != rank],
+                                     err[core != rank], present[core != rank])
+        _, _, _, cubes, invalids, waves = load_core_data(spec, validation)
+        hybrid, mean, std, _, loaded_gate, backbone = _load_accepted_spectral_hybrid_v2(device)
+        if Path(loaded_gate).resolve() != Path(gate_path).resolve():
+            raise RuntimeError('Spectral calibration checkpoint mismatch')
+        fusion, saved_f = load_fusion_checkpoint(fusion_path, device, gate_path,
+                                                 waves, mean, std)
+        if tuple(saved_f['validation_cores']) != validation or saved_f.get('backbone_sha256') != sha(backbone):
+            raise RuntimeError('Fusion checkpoint provenance differs from router calibration')
+        topology, tck, geom, _, _ = load_shadow_lineaware_region(spec, validation,
+                                                                 waves, device)
+        for net in (hybrid, fusion, topology, geom):
+            net.eval()
+        samples = []
+        jobs = [(sc, severity, repeat) for sc in SCENARIOS for severity in range(1, 6)
+                for repeat in range(args.samples_per_case)]
+        for index, (scenario, severity, repeat) in enumerate(jobs):
+            rng = np.random.default_rng(args.seed + rank*1000000 + index*7919)
+            try:
+                item = _spatial_source_case(cubes[rank], invalids[rank], rng,
+                    scenario, severity, mean, std, waves, hybrid, fusion,
+                    (topology, tck, geom), device, args.region_batch, oof_model)
+            except RuntimeError as exc:
+                print(f'[GPU{rank}] skipped source case {scenario} S{severity}: {exc}', flush=True)
+                continue
+            samples.append(item)
+            if (index+1) % 10 == 0:
+                print(f'[GPU{rank}] spatial source cases: {index+1}/{len(jobs)}', flush=True)
+        gathered = [None, None]
+        dist.all_gather_object(gathered, samples)
+        if rank == 0:
+            if min(len(group) for group in gathered) < 25:
+                raise RuntimeError('Not enough spatial source cases for calibration')
+            both = [item for group in gathered for item in group]
+            grid = (0.0, 0.03, 0.06, 0.10, 0.20, 0.35, 0.60, 1.0)
+            records = []
+            for strength in grid:
+                global_score, count = _score_spatial_calibration(both, strength)
+                f0, _ = _score_spatial_calibration(gathered[0], strength)
+                f1, _ = _score_spatial_calibration(gathered[1], strength)
+                records.append(dict(strength=float(strength), mean_case_rmse=global_score,
+                                    source_core0_rmse=f0, source_core1_rmse=f1,
+                                    changed_pixels=count))
+            # Prefer the smallest regularization if the loss is indistinguishable.
+            winner = min(records, key=lambda record:(record['mean_case_rmse'],
+                                                     record['strength']))
+            payload = dict(architecture='spatial_consistency_source_cv_v1',
+                strength=winner['strength'], router_sha256=sha(rank_path),
+                calibration_source_sha256=sha(labels_path),
+                source_cores=list(validation), cases_per_core=[len(g) for g in gathered],
+                selection_objective='mean_per_case_masked_voxel_rmse',
+                calibration_grid=records, selected=winner,
+                protocol='4_connected_potts_log_predicted_rmse_5_checkerboard_passes',
+                note=('Source-only OOF risk models used for coherence calibration; '
+                      'Region counterfactuals from source-only shadow checkpoints. '
+                      'Spatial strength selected on these source cases; no held-out test used. '
+                      'No claim of independent validation from these same cases.'))
+            tmp = target.with_suffix('.joblib.tmp')
+            joblib.dump(payload, tmp)
+            os.replace(tmp, target)
+            (target.parent / 'SPATIAL_CALIBRATION.json').write_text(
+                json.dumps(payload, indent=2), encoding='utf-8')
+            print('Spatial source-only calibration:', records, flush=True)
+            print('Selected spatial strength:', winner, flush=True)
+            print('Checkpoint:', target, flush=True)
+    finally:
+        dist.destroy_process_group()
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     add_experiment_args(parser)
@@ -1284,10 +1500,14 @@ def main():
     parser.add_argument('--from-cache', action='store_true', help='Refit from verified source-only calibration labels')
     parser.add_argument('--rank-cv-from-cache', action='store_true', help='Crossfit a three-way rank router on source cached expert losses')
     parser.add_argument('--regret-cv-from-cache', action='store_true', help='Fit cost-sensitive three-expert router on source-only labels')
+    parser.add_argument('--spatial-consistency-from-source', action='store_true', help='Fit 4-connected spatial coherence on source-only masked patches')
     parser.add_argument('--region-expert', choices=('raw','refined','lineaware'),default='raw')
     args=parser.parse_args()
-    if args.samples_per_case<2:parser.error('Need at least 2 samples for each scenario and severity')
-    if args.regret_cv_from_cache:
+    if args.samples_per_case < (1 if args.spatial_consistency_from_source else 2):
+        parser.error('Insufficient samples per scenario/severity')
+    if args.spatial_consistency_from_source:
+        train_spatial_from_source(args)
+    elif args.regret_cv_from_cache:
         train_regret_from_cache(args)
     elif args.rank_cv_from_cache:
         train_rank_from_cache(args)

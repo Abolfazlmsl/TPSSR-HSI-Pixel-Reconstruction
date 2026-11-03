@@ -54,21 +54,27 @@ def _load_accepted_spectral_hybrid_v2(device):
     from training.spectral_gate import FrozenHybridGated, TRAIN_CORES, VALID_CORES, sha
 
     parent = Path(config.MODELS_DIR) / 'tpssr'
-    gate_path = parent / 'spectral_gate' / 'band' / 'best_model.pt'
-    if not gate_path.is_file():
-        raise FileNotFoundError('Accepted Hybrid V2 band checkpoint missing: ' + str(gate_path))
-    gate = torch_load(gate_path, 'cpu')
-    if gate.get('architecture') != 'spectral_only_hybrid_confidence_gate_v2' or gate.get('gate_variant') != 'band':
-        raise RuntimeError('Expected accepted BAND-wise Hybrid V2 checkpoint.')
-    if tuple(gate['run_config']['train_cores']) != tuple(TRAIN_CORES) or tuple(gate['run_config']['val_cores']) != tuple(VALID_CORES):
-        raise RuntimeError('Hybrid checkpoint train/validation split mismatch.')
-    # Validate both the V1 checkpoint and the resulting model wavelengths.
-    base_guess = parent / 'spectral_backbone' / 'hybrid' / 'diagnostic_best_val.pt'
-    candidates = [Path(gate.get('backbone_checkpoint') or base_guess), base_guess,
-                  base_guess.with_name('best_model.pt')]
-    backbone_path = next((p for p in candidates if p.is_file() and sha(p) == gate['backbone_sha256']), None)
-    if backbone_path is None:
-        raise FileNotFoundError('Frozen V1 backbone checkpoint missing or SHA256 mismatch: ' + str(base_guess))
+    from training.spectral_reference import (
+        select_spectral_source_checkpoint, ACCEPTED_GATE, FrozenInterpolation)
+    sensor = str(config.TEST_DATASET_FOLDER).upper().rstrip('0123456789')
+    gate_path, mode = select_spectral_source_checkpoint(parent, sensor)
+    gate = None
+    if mode == ACCEPTED_GATE:
+        gate = torch_load(gate_path, 'cpu')
+        if gate.get('architecture') != 'spectral_only_hybrid_confidence_gate_v2' or gate.get('gate_variant') != 'band':
+            raise RuntimeError('Expected accepted BAND-wise Hybrid V2 checkpoint.')
+        if tuple(gate['run_config']['train_cores']) != tuple(TRAIN_CORES) or tuple(gate['run_config']['val_cores']) != tuple(VALID_CORES):
+            raise RuntimeError('Hybrid checkpoint train/validation split mismatch.')
+        base_guess = parent / 'spectral_backbone' / 'hybrid' / 'diagnostic_best_val.pt'
+        candidates = [Path(gate.get('backbone_checkpoint') or base_guess), base_guess,
+                      base_guess.with_name('best_model.pt')]
+        backbone_path = next((p for p in candidates if p.is_file() and sha(p) == gate['backbone_sha256']), None)
+        if backbone_path is None:
+            raise FileNotFoundError('Frozen V1 backbone checkpoint missing or SHA256 mismatch: ' + str(base_guess))
+    else:
+        # The diagnostic checkpoint is used for normalization ONLY. Its
+        # rejected neural prediction weights are never activated.
+        backbone_path = gate_path
     source = torch_load(backbone_path, 'cpu')
     if source.get('architecture') != 'spectral_only_hybrid_residual_v1':
         raise RuntimeError('Wrong Hybrid V1 backbone architecture.')
@@ -81,17 +87,21 @@ def _load_accepted_spectral_hybrid_v2(device):
     waves = np.asarray(np.load(wavelength_path), np.float32)
     if len(waves) != int(source['model_params']['bands']):
         raise RuntimeError('Hybrid backbone spectral band count differs from test cube.')
-    for ck in (source,gate):
+    for ck in ((source, gate) if gate is not None else (source,)):
         if not np.allclose(np.asarray(ck['wavelengths_nm'],np.float32), waves, rtol=0, atol=.5):
             raise RuntimeError('Hybrid backbone/gate wavelength grid differs from test cube.')
     avg = np.asarray(source['band_mean'],np.float32)
     sd = np.asarray(source['band_std'],np.float32)
     if avg.shape != waves.shape or sd.shape != waves.shape or not np.isfinite(avg).all() or not np.isfinite(sd).all() or (sd<=0).any():
         raise RuntimeError('Invalid Hybrid backbone normalization statistics.')
-    prm=source['model_params']
-    model=FrozenHybridGated(len(waves),int(prm['width']),int(prm['heads']),int(prm['layers']),variant='band')
-    model.base.load_state_dict(source['model_state_dict'],strict=True)
-    model.gate.load_state_dict(gate['gate_state_dict'],strict=True)
+    if mode == ACCEPTED_GATE:
+        prm=source['model_params']
+        model=FrozenHybridGated(len(waves),int(prm['width']),int(prm['heads']),int(prm['layers']),variant='band')
+        model.base.load_state_dict(source['model_state_dict'],strict=True)
+        model.gate.load_state_dict(gate['gate_state_dict'],strict=True)
+    else:
+        model=FrozenInterpolation()
+        print('[TPSSR] VNIR spectral source: observed-band INTERPOLATION (gate rejected)', flush=True)
     model=model.to(device).eval()
     wn=(waves-waves[0])/max(float(waves[-1]-waves[0]),1e-6)
     return model,avg,sd,wn,gate_path,backbone_path
@@ -1062,10 +1072,245 @@ def predict_mask_learned_router(pipeline, test_cube, mask, eval_coords,
     return out
 
 
+def spatial_consistent_router_choices(pixels, risks, strength, passes=5):
+    """Minimize learned unary risk plus a 4-connected Potts prior.
+
+    The regularization weight must be calibrated on source-core data. This
+    function never uses the masked reference, damage scenario, or severity.
+    Zero strength is the original trained router, bit-for-bit.
+    """
+    pixels = np.asarray(pixels, dtype=np.int64)
+    risks = np.asarray(risks, dtype=np.float64)
+    if pixels.ndim != 2 or pixels.shape[1] != 2 or risks.shape != (len(pixels), 3):
+        raise ValueError('Spatial router input shape mismatch')
+    if not np.isfinite(strength) or strength < 0 or passes < 1:
+        raise ValueError('Invalid spatial router calibration')
+    if len(pixels) != len(np.unique(pixels, axis=0)):
+        raise ValueError('Spatial router requires unique pixels')
+    if not np.isfinite(np.min(risks, axis=1)).all():
+        raise ValueError('Spatial router has no available expert for a pixel')
+    original = np.argmin(risks, axis=1)
+    if strength == 0 or len(pixels) < 2:
+        return original
+
+    # Log relative risk has a common dimensionless scale for the three models.
+    # Invalid experts remain forbidden, regardless of neighborhood labels.
+    minrisk = np.min(risks, axis=1)
+    unary = np.log(np.maximum(risks, 1e-12)) - np.log(np.maximum(minrisk[:, None], 1e-12))
+    unary[~np.isfinite(risks)] = np.inf
+    lookup = {tuple(row): i for i, row in enumerate(pixels)}
+    neighbors = [[] for _ in range(len(pixels))]
+    for i, (y, x) in enumerate(pixels):
+        for q in ((int(y)-1, int(x)), (int(y)+1, int(x)),
+                  (int(y), int(x)-1), (int(y), int(x)+1)):
+            j = lookup.get(q)
+            if j is not None:
+                neighbors[i].append(j)
+    labels = original.copy()
+    # Checkerboard coordinate updates make the output independent of the
+    # order in which eval_coords happened to be provided.
+    for _ in range(passes):
+        changed = 0
+        for color in (0, 1):
+            for i, (y, x) in enumerate(pixels):
+                if (int(y) + int(x)) % 2 != color or not neighbors[i]:
+                    continue
+                local = unary[i].copy()
+                nearby = labels[neighbors[i]]
+                for k in range(3):
+                    local[k] += strength * int(np.count_nonzero(nearby != k))
+                new = int(np.argmin(local))
+                if new != labels[i]:
+                    labels[i] = new
+                    changed += 1
+        if not changed:
+            break
+    return labels
+
+
+def load_fusion_guard_calibration(pipeline):
+    """Load locked SOURCE-only calibration and verify trained model identities.
+
+    No target-core measurements are used to configure this correction.
+    """
+    import json
+    import hashlib
+    report_path = (Path(config.MODELS_DIR) / "tpssr" /
+                   "learned_router3_lineaware_rankcv" /
+                   "fusion_guard_calibration" / "FUSION_GUARD_CALIBRATION.json")
+    if not report_path.is_file():
+        raise FileNotFoundError(f"Fusion Guard calibration missing: {report_path}")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (report.get("architecture") != "source_cv_fusion_artifact_guard_candidate_v1"
+            or not report.get("activation_recommended")
+            or report.get("preset") != str(config.EXPERIMENT_NAME)
+            or set(report.get("source_only_cores", [])) != {"SWIR4", "SWIR9"}
+            or set(report.get("held_out_test_cores", [])) != {"SWIR5", "SWIR10"}):
+        raise RuntimeError("Fusion Guard calibration does not belong to the current SWIR 8x2 split")
+    def sha(path):
+        h = hashlib.sha256()
+        with Path(path).open("rb") as f:
+            for chunk in iter(lambda: f.read(1048576), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    for key, path in (("fusion_sha256", pipeline.fusion_checkpoint_path),
+                      ("gate_sha256", pipeline.hybrid_gate_checkpoint_path)):
+        if path is None or not Path(path).is_file() or sha(path) != report.get(key):
+            raise RuntimeError(f"Fusion Guard {key} differs from the source-calibrated checkpoint")
+    params = report.get("selected_parameters", {})
+    if not (float(params.get("contrast_factor", 0)) > 0 and
+            float(params.get("minimum_contrast", 0)) > 0 and
+            float(params.get("side_agreement_factor", 0)) > 0 and
+            0 <= float(params.get("blend", -1)) <= 1):
+        raise RuntimeError("Invalid Fusion Guard parameters")
+    return dict(params={k: float(params[k]) for k in
+                        ("contrast_factor", "minimum_contrast", "side_agreement_factor", "blend")},
+                report=str(report_path), report_sha256=sha(report_path))
+
+
+def _apply_sparse_fusion_guard(pipeline, cube, mask, coords, pixels, reverse,
+                               decisions, fusion_all, prediction, calibration, wave):
+    """Apply a locked Fusion-only stripe guard on sampled target voxels.
+
+    In contrast to ROI evaluation, the official mask test samples target pixels.
+    Independently predict horizontally adjacent masked Fusion *support* spectra
+    when they were not sampled, so source-only calibration and sparse inference
+    use equivalent local evidence.  Support predictions are NEVER scored.
+    """
+    from training.neighbor_fusion import crop_at
+    from training.three_expert_router import features_for_pixel
+    pars = calibration["params"]
+    h, w, bands = cube.shape
+    # The complete spectral estimates already evaluated by the three-expert Router.
+    support = {(int(y), int(x)): fusion_all[i]
+               for i, (y, x) in enumerate(pixels) if fusion_all[i] is not None}
+    # Index selected target voxels, avoiding a full H x W x B prediction buffer.
+    groups = [[] for _ in range(len(pixels))]
+    for i, pidx in enumerate(reverse):
+        groups[int(pidx)].append(i)
+    changed_pixels = 0
+    changed_voxels = 0
+    original_prediction = prediction.copy()
+    for pidx, (py, px) in enumerate(pixels):
+        if int(decisions[pidx]) != 1 or not groups[pidx]:
+            continue
+        y, x = int(py), int(px)
+        if x <= 0 or x >= w-1:
+            continue
+        indices = np.asarray(groups[pidx], np.int64)
+        target_bands = coords[indices, 2]
+        # The guard is calibrated only for bands masked at all three pixels.
+        if len(target_bands) < 20 or not (np.all(mask[y, x-1, target_bands]) and
+                                             np.all(mask[y, x+1, target_bands])):
+            continue
+        anchor = (~mask[y, x] & ~mask[y, x-1] & ~mask[y, x+1] &
+                  np.isfinite(cube[y, x]) & np.isfinite(cube[y, x-1]) &
+                  np.isfinite(cube[y, x+1]))
+        if int(anchor.sum()) < 30:
+            continue
+        observed_contrast = float(np.median(np.abs(
+            cube[y, x, anchor] - (cube[y, x-1, anchor] + cube[y, x+1, anchor]) * .5)))
+        neighbors = []
+        for nx in (x-1, x+1):
+            key = (y, nx)
+            if key not in support:
+                patch, damaged, cy, cx = crop_at(cube, mask, y, nx, radius=35)
+                _, _, fusion = features_for_pixel(
+                    patch, damaged, cy, cx, pipeline.hybrid_mean, pipeline.hybrid_std,
+                    wave, pipeline.fusion_model, pipeline.hybrid_model, pipeline.device)
+                support[key] = fusion
+            neighbors.append(support[key])
+        if any(v is None for v in neighbors):
+            continue
+        left, right = neighbors
+        c = original_prediction[indices]
+        l = np.asarray(left)[target_bands]
+        r = np.asarray(right)[target_bands]
+        if not (np.isfinite(c).all() and np.isfinite(l).all() and np.isfinite(r).all()):
+            continue
+        estimate = .5 * (l + r)
+        pred_contrast = float(np.median(np.abs(c - estimate)))
+        spread = float(np.median(np.abs(l-r)))
+        if (pred_contrast > max(pars["minimum_contrast"],
+                                pars["contrast_factor"] * observed_contrast)
+                and pred_contrast > pars["side_agreement_factor"] * max(spread, .0004)):
+            prediction[indices] = ((1-pars["blend"]) * c +
+                                   pars["blend"] * estimate).astype(np.float32)
+            changed_pixels += 1
+            changed_voxels += len(indices)
+    return dict(fusion_guard_enabled=1, fusion_guard_changed_pixels=changed_pixels,
+                fusion_guard_changed_voxels=changed_voxels,
+                fusion_guard_calibration_sha256=calibration["report_sha256"])
+
+
+def rankcv_global_minority_choices(pixels, raw_choices, eligible, threshold=0.10,
+                                   counts_override=None, policy='threshold'):
+    """Apply an observed-only, whole-mask routing policy once.
+
+    threshold: replace every active expert whose share is <= threshold.
+    hybrid: if three experts are selected, remove the unique least-used
+    expert regardless of its share; if two are selected, remove the less-used
+    expert only when its share is strictly below threshold; if one, do nothing.
+    A tie for least-used expert is left unchanged to avoid arbitrary removal.
+    Replacement favors the globally most common surviving, eligible expert.
+    Counts concern damaged spatial pixels, never spectral voxels or GT values.
+    """
+    pixels = np.asarray(pixels, np.int64)
+    original = np.asarray(raw_choices, np.int64)
+    eligible = np.asarray(eligible, bool)
+    n = len(original)
+    if n == 0 or pixels.shape != (n, 2) or eligible.shape != (n, 3):
+        raise ValueError('RankCV minority input dimensions are inconsistent')
+    if not np.all((original >= 0) & (original < 3)):
+        raise ValueError('RankCV minority received an unknown expert choice')
+    if not (0.0 < float(threshold) < 0.5):
+        raise ValueError('Global minority threshold must be between 0 and 0.5')
+    if not np.all(eligible[np.arange(n), original]):
+        raise RuntimeError('RankCV selected an unavailable expert')
+    if counts_override is None:
+        counts = np.bincount(original, minlength=3)
+    else:
+        counts = np.asarray(counts_override, dtype=np.int64)
+        if counts.shape != (3,) or np.any(counts < 0) or int(counts.sum()) < n:
+            raise ValueError('Invalid global RankCV expert counts')
+    total = int(counts.sum())
+    active = [i for i in range(3) if counts[i] > 0]
+    if policy == 'threshold':
+        minority = {i for i in active if counts[i] / total <= threshold}
+    elif policy == 'hybrid':
+        minority = set()
+        if len(active) == 3:
+            least = min(int(counts[i]) for i in active)
+            lowest = [i for i in active if int(counts[i]) == least]
+            if len(lowest) == 1:
+                minority.add(lowest[0])
+        elif len(active) == 2:
+            less = min(active, key=lambda i: int(counts[i]))
+            if int(counts[less]) / total < threshold:
+                minority.add(less)
+    else:
+        raise ValueError(f'Unknown Global Minority policy: {policy}')
+    allowed = [i for i in active if i not in minority]
+    if not minority or not allowed:
+        return original.copy()
+    global_order = sorted(allowed, key=lambda k: (-int(counts[k]), k))
+    selected = original.copy()
+    for i in range(n):
+        if original[i] in minority:
+            for candidate in global_order:
+                if eligible[i, candidate]:
+                    selected[i] = candidate
+                    break
+    return selected
+
+
 @torch.inference_mode()
 def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
                                  preview_progress=None, region_progress=None,
-                                 region_full_eval=False):
+                                 region_full_eval=False, spatial_consistency=None,
+                                 fusion_guard=None, global_minority_threshold=None,
+                                 global_minority_counts=None, routing_only=False,
+                                 global_minority_policy='threshold'):
     """Three-way learned routing; no V2 component routing or band-guard policy."""
     from training.neighbor_fusion import crop_at
     from training.three_expert_router import features_for_pixel, predict_risks
@@ -1088,7 +1333,7 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
     x, interp_all, fusion_all = [], [], []
     # Compute only observed-only features; the reference truth is not queried.
     for y, xx in pixels:
-        patch, damaged, cy, cx = crop_at(cube, mask, int(y), int(xx), radius=32)
+        patch, damaged, cy, cx = crop_at(cube, mask, int(y), int(xx), radius=35)
         feat, interp, fusion = features_for_pixel(
             patch, damaged, cy, cx, pipeline.hybrid_mean, pipeline.hybrid_std,
             wave, pipeline.fusion_model, pipeline.hybrid_model, pipeline.device)
@@ -1102,7 +1347,28 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
         risks = predict_binary_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
     else:
         risks = predict_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
-    decisions = np.argmin(risks, axis=1)
+    independent_decisions = np.argmin(risks, axis=1)
+    if routing_only:
+        # Only observed-band features and learned RankCV risks are evaluated.
+        # Region reconstruction is deliberately skipped during the distributed
+        # count synchronization prepass.
+        return {'raw_route_counts': np.bincount(independent_decisions, minlength=3),
+                'evaluated_pixels': int(len(pixels))}
+    if global_minority_counts is not None and global_minority_threshold is None:
+        raise ValueError('Global expert counts require a minority threshold')
+    if spatial_consistency is not None and global_minority_threshold is not None:
+        raise ValueError('Spatial Consistency and Global Minority cannot be combined')
+    if global_minority_threshold is not None:
+        decisions = rankcv_global_minority_choices(
+            pixels, independent_decisions, eligible, global_minority_threshold,
+            counts_override=global_minority_counts, policy=global_minority_policy)
+    elif spatial_consistency is None:
+        decisions = independent_decisions
+    else:
+        if spatial_consistency.get('architecture') != 'spatial_consistency_source_cv_v1':
+            raise RuntimeError('Unknown spatial Router checkpoint architecture')
+        decisions = spatial_consistent_router_choices(
+            pixels, risks, float(spatial_consistency['strength']))
 
     n = len(coords)
     selected = decisions[reverse]
@@ -1137,6 +1403,15 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
             n_refined = 0
     else:
         n_refined = 0
+    fusion_guard_audit = dict(fusion_guard_enabled=0,
+                              fusion_guard_changed_pixels=0,
+                              fusion_guard_changed_voxels=0,
+                              fusion_guard_calibration_sha256="")
+    if fusion_guard is not None:
+        fusion_guard_audit = _apply_sparse_fusion_guard(
+            pipeline, cube, mask, coords, pixels, reverse, decisions,
+            fusion_all, prediction, fusion_guard, wave)
+
     if not np.isfinite(prediction).all():
         raise RuntimeError('Three-expert learned router failed to cover all evaluation voxels')
 
@@ -1190,5 +1465,17 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
             router3_interp_voxels=int(np.sum(selected==0)),
             router3_fusion_voxels=int(np.sum(selected==1)),
             router3_region_voxels=int(np.sum(selected==2)),
-            router3_region_refined_voxels=int(n_refined)),
+            router3_region_refined_voxels=int(n_refined),
+            spatial_consistency_enabled=int(spatial_consistency is not None),
+            spatial_consistency_strength=(float(spatial_consistency['strength'])
+                                          if spatial_consistency is not None else 0.0),
+            spatial_consistency_changed_pixels=(int(np.count_nonzero(
+                decisions != independent_decisions)) if spatial_consistency is not None else 0),
+            global_minority_enabled=int(global_minority_threshold is not None),
+            global_minority_policy=(global_minority_policy if global_minority_threshold is not None else 'off'),
+            global_minority_threshold_percent=(float(global_minority_threshold)*100.0
+                                               if global_minority_threshold is not None else 0.0),
+            global_minority_changed_pixels=int(np.count_nonzero(
+                decisions != independent_decisions)) if global_minority_threshold is not None else 0,
+            **fusion_guard_audit),
         routing_audit={'additional_region_voxels':0})

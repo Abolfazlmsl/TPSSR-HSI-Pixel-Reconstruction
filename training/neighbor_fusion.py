@@ -36,7 +36,10 @@ from training.spectral_data import load_core_data
 from training.spectral_gate import sha
 
 ARCH = 'local_neighbor_residual_fusion_v1'
-RADIUS = 14
+# Source-trained adaptive donor search; each successive radius is used only
+# when fewer than five qualified donors have been found at smaller radii.
+SEARCH_RADII = (4, 8, 14, 21, 28, 35)
+RADIUS = SEARCH_RADII[-1]
 MAX_DONORS = 8
 TRAIN_SCENARIOS = (
     'isolated_voxels', 'single_detector_line', 'multiple_detector_lines',
@@ -61,6 +64,80 @@ def crop_at(cube, mask, y, x, radius=RADIUS):
     return values, bad, y-y0, x-x0
 
 
+
+def _robust_observed_anchors(cube, mask, cy, cx, observed):
+    """Exclude isolated, implausible *observed* spectral spikes from donor matching.
+
+    A spike must disagree with both nearby observed bands of the SAME pixel
+    and with at least two currently observable adjacent spatial pixels. Only
+    the donor comparison uses the screened band set: no image value, valid mask,
+    target band or trained weight is altered. The screening is deliberately
+    conservative and cannot see artificially hidden ground truth.
+    """
+    observed = np.asarray(observed, bool)
+    valid = observed.copy()
+    spectrum = np.asarray(cube[cy, cx], np.float64)
+    n = spectrum.size
+    suspicious = []
+    # Check the two spatial axes separately. A vertical detector stripe may
+    # corrupt the entire column, including the up/down neighbors, so a median
+    # over all four neighbors would incorrectly hide the outlier.
+    axes = (((cy,cx-1),(cy,cx+1)),((cy-1,cx),(cy+1,cx)))
+    for band in np.flatnonzero(observed):
+        a, z = max(0, int(band)-4), min(n, int(band)+5)
+        local = np.flatnonzero(observed[a:z]) + a
+        local = local[local != band]
+        if local.size < 4:
+            continue
+        neighbor_spectrum = spectrum[local]
+        midpoint = float(np.median(neighbor_spectrum))
+        dev = abs(float(spectrum[band]) - midpoint)
+        mad = float(np.median(np.abs(neighbor_spectrum - midpoint)))
+        if dev <= max(.04, 8.0 * 1.4826 * mad):
+            continue
+        axis_agrees = False
+        for pair in axes:
+            spatial=[]
+            for y, x in pair:
+                if (0 <= y < cube.shape[0] and 0 <= x < cube.shape[1]
+                        and not mask[y, x, band]
+                        and np.isfinite(cube[y, x, band])):
+                    spatial.append(float(cube[y, x, band]))
+            if len(spatial) != 2:
+                continue
+            mid = .5 * (spatial[0] + spatial[1])
+            spread = abs(spatial[0] - spatial[1])
+            if (abs(float(spectrum[band])-mid) > max(.04, 8.0*spread)
+                    and spread < .25*dev):
+                axis_agrees=True
+                break
+        if not axis_agrees:
+            continue
+        suspicious.append((dev, int(band)))
+    if not suspicious:
+        return valid
+    # Never reject more than a tiny fraction of the available anchor spectrum.
+    # If anomalies are widespread, reject none: the detector is not designed for
+    # broad, physically meaningful spectral absorption features.
+    limit = max(1, int(.02 * observed.sum()))
+    if len(suspicious) > limit:
+        return valid
+    for _, band in suspicious:
+        valid[band] = False
+    if int(valid.sum()) < max(30, int(.9 * observed.sum())):
+        return observed.copy()
+    return valid
+
+
+def _matching_observations(cube, mask, cy, cx, observed):
+    mode = os.environ.get('TPSSR_FUSION_DONOR_MATCH', 'legacy').strip().lower()
+    if mode == 'legacy':
+        return np.asarray(observed, bool)
+    if mode != 'robust':
+        raise ValueError('TPSSR_FUSION_DONOR_MATCH must be legacy or robust')
+    return _robust_observed_anchors(cube, mask, cy, cx, observed)
+
+
 def neighbor_features(cube, mask, cy, cx, missing, observed, anchor, std):
     """Top-K observed-only curvature donors, using the V2 similarity criteria.
 
@@ -72,15 +149,16 @@ def neighbor_features(cube, mask, cy, cx, missing, observed, anchor, std):
     residual = np.zeros((MAX_DONORS, bands), np.float32)
     metadata = np.zeros((MAX_DONORS, 2), np.float32)
     valid = np.zeros(MAX_DONORS, np.float32)
-    reference = np.asarray(cube[cy, cx, observed], np.float64)
+    match_observed = _matching_observations(cube, mask, cy, cx, observed)
+    reference = np.asarray(cube[cy, cx, match_observed], np.float64)
     if reference.size < 30 or not missing.any():
         return residual, metadata, valid
     scale = max(float(np.std(reference)), 0.01)
-    minimum = max(30, int(0.7 * observed.sum()))
+    minimum = max(30, int(0.7 * match_observed.sum()))
     axis = np.arange(bands, dtype=np.float64)
     candidates = []
     previous_radius = 0
-    for radius in (4, 8, 14):
+    for radius in SEARCH_RADII:
         for yy in range(max(0, cy-radius), min(h, cy+radius+1)):
             for xx in range(max(0, cx-radius), min(w, cx+radius+1)):
                 dist = max(abs(yy-cy), abs(xx-cx))
@@ -90,7 +168,7 @@ def neighbor_features(cube, mask, cy, cx, missing, observed, anchor, std):
                 donor_valid = (~mask[yy, xx]) & np.isfinite(donor)
                 if not np.all(donor_valid[missing]):
                     continue
-                joint = donor_valid & observed
+                joint = donor_valid & match_observed
                 if int(joint.sum()) < minimum:
                     continue
                 nx = np.asarray(donor[joint], np.float64)
@@ -122,7 +200,7 @@ def neighbor_features(cube, mask, cy, cx, missing, observed, anchor, std):
     candidates.sort(key=lambda item:item[0])
     for k, (_rank, discrepancy, distance, correction) in enumerate(candidates[:MAX_DONORS]):
         residual[k] = correction
-        metadata[k] = (discrepancy, distance/14.0)
+        metadata[k] = (discrepancy, distance/float(RADIUS))
         valid[k] = 1.
     return residual, metadata, valid
 
@@ -159,7 +237,7 @@ def make_features(cube, mask, cy, cx, mean, std, wavelength):
     available[cy,cx] = False
     sy,sx = np.where(available)
     if sy.size:
-        distance = float(np.minimum(14,np.min(np.maximum(np.abs(sy-cy),np.abs(sx-cx)))))/14.
+        distance = float(np.minimum(RADIUS,np.min(np.maximum(np.abs(sy-cy),np.abs(sx-cx)))))/float(RADIUS)
     else:
         distance = 1.
     support_fraction = float(available.mean())
@@ -267,8 +345,22 @@ class FusionDataset(Dataset):
             original_valid=~bad[cy,cx]
             if original_valid.sum()<max(35,int(0.90*b)):
                 continue
+            band_center = int(rng.integers(b))
             artificial,_,_=generate_training_mask(raw.shape,rng,severity=severity,scenario=scenario,
-                                                  center=(cy,cx),band_center=int(rng.integers(b)))
+                                                  center=(cy,cx),band_center=band_center)
+            if severity == 5 and scenario in ('spatial_patch', 'spatio_spectral_block'):
+                # Standard test S5 uses a 41x41 hole. The older 27x27 local
+                # training mask left every target within 14 pixels of a donor,
+                # so distant-donor features were never exercised during fit.
+                # Only the Fusion training sampler is changed here; Region and
+                # other methods retain their original corruption protocols.
+                side = min(41, raw.shape[0], raw.shape[1])
+                width = min(31 if scenario == 'spatial_patch' else 63, b)
+                y0 = max(0, min(cy - side//2, raw.shape[0] - side))
+                x0 = max(0, min(cx - side//2, raw.shape[1] - side))
+                b0 = max(0, min(band_center - width//2, b - width))
+                artificial[:] = False
+                artificial[y0:y0+side, x0:x0+side, b0:b0+width] = True
             target_mask=artificial[cy,cx] & original_valid
             if not target_mask.any():
                 continue
@@ -344,8 +436,22 @@ def load_fusion_checkpoint(path, device, gate_path, wave, mean, std):
     saved=torch.load(path,map_location='cpu',weights_only=False)
     if saved.get('architecture')!=ARCH:
         raise RuntimeError('Unexpected fusion architecture')
+    settings = saved.get('settings') or {}
+    if (settings.get('radius') != RADIUS or
+            tuple(settings.get('search_radii', ())) != SEARCH_RADII or
+            settings.get('distance_scale') != RADIUS):
+        raise RuntimeError(
+            'Fusion checkpoint uses the previous donor-radius settings. '
+            'Archive the old Fusion and dependent Router checkpoints, then '
+            'retrain Fusion with radii 4,8,14,21,28,35 before inference.')
+    from training.spectral_reference import source_mode_for_path
     if saved.get('gate_sha256')!=sha(gate_path):
-        raise RuntimeError('Fusion training gate and inference gate differ')
+        raise RuntimeError('Fusion spectral source checkpoint fingerprint differs')
+    if saved.get('spectral_source_mode') is not None:
+        if saved['spectral_source_mode'] != source_mode_for_path(gate_path):
+            raise RuntimeError('Fusion spectral source mode mismatch')
+    elif Path(gate_path).name == 'diagnostic_best_val.pt':
+        raise RuntimeError('VNIR Fusion lacks explicit interpolation source provenance')
     if (not np.allclose(saved['wavelengths_nm'],wave,atol=.5,rtol=0) or
         not np.allclose(saved['band_mean'],mean,atol=1e-6,rtol=1e-5) or
         not np.allclose(saved['band_std'],std,atol=1e-6,rtol=1e-5)):
@@ -357,6 +463,7 @@ def load_fusion_checkpoint(path, device, gate_path, wave, mean, std):
 
 def run_training(args):
     from src.pipeline import _load_accepted_spectral_hybrid_v2
+    from training.spectral_reference import source_mode_for_path
     import config
     spec=resolve_experiment(args)
     validation=tuple(spectral_validation_cores(spec))
@@ -455,11 +562,14 @@ def run_training(args):
                              'wavelengths_nm':np.asarray(wave,np.float32),
                              'band_mean':mean,'band_std':std,
                              'gate_sha256':sha(gate_path),'backbone_sha256':sha(backbone_path),
+                             'spectral_source_mode':source_mode_for_path(gate_path),
                              'training_cores':list(training),'validation_cores':list(validation),
                              'experiment_name':spec.experiment_name,'epoch':epoch,'validation_rmse':rmse,
                              'val_spectral_rmse':baseline,'val_neighbor_v2_approx_rmse':ref_v2,'val_hybrid_rmse':ref_hybrid,
                              'settings':{'train_samples':args.train_samples,'val_samples':args.val_samples,
-                                         'batch_size':args.batch_size,'seed':args.seed,'radius':RADIUS}}
+                                         'batch_size':args.batch_size,'seed':args.seed,'radius':RADIUS,
+                                         'search_radii':list(SEARCH_RADII),'distance_scale':RADIUS,
+                                         's5_spatial_block_size':41}}
                     tmp=output/'best_model.pt.tmp'
                     torch.save(payload,tmp);os.replace(tmp,output/'best_model.pt')
         if rank==0:

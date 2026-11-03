@@ -42,7 +42,7 @@ def test_new_router_results_are_separate_for_all_swir_splits():
                           ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5'),
                           'SWIR1', 'b_to_a', 'SWIR')
     assert selected_lineaware_region(b2a, 'learned_router3_lineaware')
-    assert not selected_lineaware_region(_spec('vnir_8x2'), 'learned_router3_lineaware')
+    assert selected_lineaware_region(_spec('vnir_8x2'), 'learned_router3_lineaware')
     base = 'some_models'
     assert path_for(base, region_expert='lineaware').name == 'best_model.joblib'
     assert path_for(base, region_expert='lineaware').parent.name == 'learned_router3_lineaware'
@@ -364,4 +364,4 @@ def test_rankcv_is_a_distinct_swir_only_results_mode():
     spec=_spec('swir_8x2')
     assert selected_lineaware_region(spec, 'learned_router3_lineaware_rankcv')
     assert selected_results_folder(spec, 'learned_router3_lineaware_rankcv') == 'tpssr_learned_router3_lineaware_rankcv'
-    assert not selected_lineaware_region(_spec('vnir_8x2'), 'learned_router3_lineaware_rankcv')
+    assert selected_lineaware_region(_spec('vnir_8x2'), 'learned_router3_lineaware_rankcv')

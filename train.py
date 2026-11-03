@@ -132,10 +132,12 @@ def main():
     add_experiment_args(ap)
     ap.add_argument('--gpus', type=int, choices=[2], default=2)
     ap.add_argument('--dry-run', action='store_true', help='Show training plan without touching GPU/data')
-    ap.add_argument('--stage', choices=('all', 'hybrid', 'region', 'fusion', 'router', 'router3', 'router3_rmse', 'router3_aligned', 'router3_lineaware', 'router3_lineaware_mse', 'router3_lineaware_rankcv', 'router3_lineaware_regretcv', 'router2_lineaware'), default='all',
+    ap.add_argument('--stage', choices=('all', 'hybrid', 'region', 'fusion', 'router', 'router3', 'router3_rmse', 'router3_aligned', 'router3_lineaware', 'router3_lineaware_mse', 'router3_lineaware_rankcv', 'router3_lineaware_regretcv', 'router2_lineaware', 'spatial_router'), default='all',
                     help='Optionally restrict the training family; default trains all missing components')
     ap.add_argument('--router-samples', type=int, default=3200)
     ap.add_argument('--router3-samples-per-case', type=int, default=10)
+    ap.add_argument('--spatial-samples-per-case', type=int, default=1,
+                    help='Source-only spatial calibration repeats per scenario/severity')
     ap.add_argument('--router-batch-size', type=int, default=16)
     ap.add_argument('--fusion-epochs', type=int, default=8)
     ap.add_argument('--fusion-train-samples', type=int, default=6000)
@@ -154,6 +156,8 @@ def main():
     val_cores = spectral_validation_cores(spec) if args.stage != 'region' else ()
     if args.router3_samples_per_case < 2:
         ap.error('Need at least 2 samples per Router3 case and severity')
+    if args.spatial_samples_per_case < 1:
+        ap.error('Spatial calibration samples per case must be positive')
     if min(args.router_samples, args.router_batch_size, args.fusion_epochs, args.fusion_train_samples, args.fusion_val_samples, args.fusion_batch_size,
            args.hybrid_epochs, args.gate_epochs, args.topology_epochs,
            args.topology_min_epochs, args.topology_patience,
@@ -187,7 +191,9 @@ def main():
     if val_cores:
         print('Spectral validation cores:', ', '.join(val_cores))
     print('Checkpoint tag:', tag, '(folder label only, not training data)')
-    if args.stage in ('router3','router3_rmse','router3_aligned','router3_lineaware','router3_lineaware_mse','router3_lineaware_rankcv','router3_lineaware_regretcv'):
+    if args.stage == 'spatial_router':
+        print('Calibrating source-only spatial consistency of the frozen RankCV router.\n')
+    elif args.stage in ('router3','router3_rmse','router3_aligned','router3_lineaware','router3_lineaware_mse','router3_lineaware_rankcv','router3_lineaware_regretcv'):
         print('Training a learned selector among all three experts; source-only Region shadow.\n')
     elif args.stage == 'router2_lineaware':
         print('Training a learned two-spectral-expert selector; Region for unsupported spectra.\n')
@@ -206,6 +212,23 @@ def main():
             raise FileNotFoundError(f'Required V2.3 trainer is missing: {script}')
     if args.dry_run:
         print('DRY RUN: no dataset files are opened and no GPU jobs are submitted.\n')
+
+    if args.stage == 'spatial_router':
+        target = base / 'learned_router3_lineaware_rankcv' / 'spatial_consistency.joblib'
+        if target.exists():
+            print('SKIP spatial calibration: found', target)
+        else:
+            print('CALIBRATE spatially consistent RankCV on source-only cores (2 GPUs)')
+            cmd = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
+                   '--nproc_per_node=2', '-m', 'training.three_expert_router',
+                   '--preset', str(args.preset), '--region-expert', 'lineaware',
+                   '--spatial-consistency-from-source', '--samples-per-case',
+                   str(args.spatial_samples_per_case), '--region-batch',
+                   str(args.router_batch_size)]
+            launch(cmd, spec, dry_run=args.dry_run)
+        if not args.dry_run and not target.is_file():
+            raise RuntimeError('Source spatial calibration did not produce a checkpoint')
+        return
 
     if args.stage == 'router2_lineaware':
         if not args.preset:
@@ -246,10 +269,10 @@ def main():
 
     if args.stage == 'router3_lineaware_rankcv':
         if not args.preset:
-            raise RuntimeError('Use an explicit SWIR --preset')
+            raise RuntimeError('Use an explicit --preset')
         from experiment_config import selected_lineaware_region
         if not selected_lineaware_region(spec, 'learned_router3_lineaware_rankcv'):
-            raise RuntimeError('RankCV supports only the three defined SWIR splits')
+            raise RuntimeError('RankCV supports only the configured Line-aware splits')
         from training.three_expert_router import path_for
         checkpoint = path_for(ROOT / 'trained_models' / spec.experiment_name,
                               objective='rank_cv', region_expert='lineaware')
@@ -294,7 +317,7 @@ def main():
         if lineaware:
             from experiment_config import selected_lineaware_region
             if not selected_lineaware_region(spec, 'learned_router3_lineaware'):
-                raise RuntimeError('Router3 Line-aware requires one of the three defined SWIR splits')
+                raise RuntimeError('Router3 Line-aware requires a configured Line-aware split')
         shadow_root = ROOT / 'trained_models' / shadow_name / FAMILY
         shadow_base = shadow_root / TRIAL_NAME if lineaware else shadow_root
         shadow_geom = shadow_base / f'geometry_{val[0].lower()}' / 'best_model.pt'
@@ -304,8 +327,11 @@ def main():
                       objective='mse' if args.stage == 'router3_rmse' else 'log_rmse',
                       region_expert=variant)
         fusion_ck = base / 'neighbor_fusion' / 'best_model.pt'
-        if not args.dry_run and not all(p.is_file() for p in (gate,fusion_ck,geometry_candidates[0],topology)):
-            raise RuntimeError('Three-expert Router requires all accepted frozen experts first.')
+        if not args.dry_run:
+            from training.spectral_reference import select_spectral_source_checkpoint
+            select_spectral_source_checkpoint(base, spec.sensor)
+            if not all(p.is_file() for p in (fusion_ck,geometry_candidates[0],topology)):
+                raise RuntimeError('Three-expert Router requires Fusion and Geometry/Topology checkpoints first.')
         if lineaware:
             final_base = base / TRIAL_NAME
             final_checkpoints = (final_base / f'geometry_{tag}' / 'best_model.pt',
@@ -368,9 +394,22 @@ def main():
 
     if args.stage == 'fusion':
         fusion_ck = base / 'neighbor_fusion' / 'best_model.pt'
-        if not args.dry_run and (not gate.is_file() or not (backbone.is_file() or diagnostic.is_file())):
-            raise RuntimeError('Fusion needs the existing accepted gate and matching frozen backbone.')
+        if not args.dry_run:
+            from training.spectral_reference import select_spectral_source_checkpoint
+            select_spectral_source_checkpoint(base, spec.sensor)
+            if not (backbone.is_file() or diagnostic.is_file()):
+                raise RuntimeError('Fusion needs the completed frozen spectral backbone.')
         if fusion_ck.is_file():
+            if not args.dry_run:
+                import torch
+                from training.neighbor_fusion import RADIUS, SEARCH_RADII
+                old = torch.load(fusion_ck, map_location='cpu', weights_only=False)
+                opts = old.get('settings') or {}
+                if (opts.get('radius') != RADIUS or
+                        tuple(opts.get('search_radii', ())) != SEARCH_RADII or
+                        opts.get('distance_scale') != RADIUS):
+                    raise RuntimeError('Old Fusion checkpoint found with incompatible search radii. '
+                                       'Archive neighbor_fusion/ and the learned Router folders before retraining.')
             print('SKIP learned neighbor fusion: found', fusion_ck)
         else:
             print('TRAIN learned neighbor fusion (frozen spectral models, 2 GPUs)')

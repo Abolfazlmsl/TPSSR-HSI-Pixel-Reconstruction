@@ -2,9 +2,10 @@
 """Interactive ROI reconstruction with the trained TPSSR checkpoint.
 
 Choose a 128x128 ROI and move a fixed-size corruption mask inside it.
-For whole_spectrum_pixels, S1..S5 follow the evaluation-mask spatial sizes
-(1, 3, 5, 9, 15); other scenarios use the original 31x31 placement window.
-The exact same mask is used for TPSSR predictions and Region diagnostics.
+The interactive placement footprint is scenario-dependent. Representative
+spatial_patch and spatio_spectral_block use the evaluation component dimensions;
+whole_spectrum_pixels uses the evaluation S1..S5 square side lengths.
+The masks are local examples, not the complete multi-component test masks.
 """
 from __future__ import annotations
 
@@ -37,7 +38,12 @@ def arguments():
     p = argparse.ArgumentParser(description="Fixed 128x128 draggable ROI + real TPSSR reconstruction")
     p.add_argument("--preset", choices=("swir_8x2", "swir_region_a_to_b", "swir_region_b_to_a", "vnir_8x2"),
                    default="swir_8x2", help="Trained model experiment. Does not restrict the displayed image to test images.")
-    p.add_argument("--dataset", default="SWIR5", help="Image to display, e.g. SWIR1 through SWIR10")
+    p.add_argument("--dataset", default="SWIR5", help="Image to display, e.g. SWIR1..SWIR10 or VNIR1..VNIR10")
+    flip = p.add_mutually_exclusive_group()
+    flip.add_argument("--flip-x", dest="flip_x", action="store_true",
+                      help="Mirror previews and figures horizontally; display only")
+    flip.add_argument("--no-flip-x", dest="flip_x", action="store_false")
+    p.set_defaults(flip_x=None)
     p.add_argument("--image-scope", choices=("auto", "full", "test-block"), default="auto",
                    help="auto: full image for training acquisitions, last held-out block for test acquisitions; "
                         "full: entire image; test-block: last held-out block (test acquisitions only)")
@@ -50,6 +56,14 @@ def arguments():
                                          "learned_router3_aligned"), default=ROUTER,
                    help="Select the trained Router; defaults to accepted SWIR 8x2 RankCV")
     p.add_argument("--gpus", type=int, choices=(1, 2), default=2)
+    p.add_argument("--spatial-consistency", action="store_true",
+                   help="Legacy CV policy; incompatible with Global Minority")
+    p.add_argument("--global-minority-percent", type=float, default=None,
+                   help="Global minority percent across ALL evaluated ROI pixels")
+    p.add_argument("--minority-policy", choices=("threshold", "hybrid"), default="threshold",
+                   help="Hybrid: always remove unique least of three, or <10 percent of two")
+    p.add_argument("--fusion-guard", action="store_true",
+                   help="Apply source-calibrated Fusion Guard to eligible reconstructed pixels")
     p.add_argument("--band", type=int, default=None, help="Zero-based band index; default: middle band")
     p.add_argument("--seed", type=int, default=4207)
     p.add_argument("--outdir", default=None)
@@ -97,7 +111,7 @@ def preview_image(test_cube, invalid_cube, band, max_h=1300, max_w=1000):
     return image, step_y, step_x
 
 
-def select_box(image, height, width, step_y, step_x, dataset, band, area_label):
+def select_box(image, height, width, step_y, step_x, dataset, band, area_label, flip_x=False):
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
 
@@ -108,6 +122,8 @@ def select_box(image, height, width, step_y, step_x, dataset, band, area_label):
     state = {"y": ry, "x": rx, "drag": None, "confirmed": False}
     fig, ax = plt.subplots(figsize=(8, 10))
     ax.imshow(image, cmap="gray", vmin=0, vmax=1, interpolation="nearest", origin="upper")
+    if flip_x:
+        ax.invert_xaxis()
     r = Rectangle((rx / step_x - 0.5, ry / step_y - 0.5), ROI_SIZE / step_x,
                   ROI_SIZE / step_y, fill=False, lw=2.0, edgecolor="yellow")
     ax.add_patch(r)
@@ -167,13 +183,23 @@ def select_box(image, height, width, step_y, step_x, dataset, band, area_label):
 
 
 def missing_window_size(scenario, severity, whole_spectrum_size=None):
-    if scenario != "whole_spectrum_pixels":
-        return DEFECT_SIZE
-    sizes = (1, 3, 5, 9, 15)
-    side = sizes[int(severity) - 1] if whole_spectrum_size is None else int(whole_spectrum_size)
-    if not 1 <= side <= DEFECT_SIZE:
-        raise ValueError(f"Whole-spectrum size must be between 1 and {DEFECT_SIZE}")
-    return side
+    """Interactive defect footprint. Benchmark sizes for single compact components."""
+    level = int(severity) - 1
+    if scenario == "whole_spectrum_pixels":
+        size = (1, 3, 5, 9, 15)[level] if whole_spectrum_size is None else int(whole_spectrum_size)
+        if not 1 <= size <= ROI_SIZE:
+            raise ValueError(f"Whole-spectrum size must be in 1..{ROI_SIZE}")
+        return size
+    if scenario in {"spatial_patch", "spatio_spectral_block"}:
+        return (5, 9, 15, 25, 41)[level]
+    if scenario == "mixed_saturation":
+        # A local selection FOOTPRINT, not a claim of a square mixed mask.
+        # S5 contains several kinds of spatial and spectral defects.
+        return (15, 21, 25, 31, 41)[level]
+    # Narrow detector and spectral defects use a local placement region.
+    # For band-wide saturation this is a local illustrative sample, not a
+    # simulation of full-image band-wide loss.
+    return DEFECT_SIZE
 
 
 def make_local_mask(shape, scenario, severity, band, seed, missing_y=None, missing_x=None, whole_spectrum_size=None):
@@ -181,36 +207,67 @@ def make_local_mask(shape, scenario, severity, band, seed, missing_y=None, missi
         raise ValueError("Unexpected ROI dimensions")
     if not 0 <= band < shape[2]:
         raise ValueError("Band index outside cube")
-    if str(scenario) not in SCENARIOS:
+    if scenario not in SCENARIOS:
         raise ValueError("Invalid scenario")
     if not 1 <= int(severity) <= 5:
         raise ValueError("Invalid severity")
 
-    size = missing_window_size(scenario, severity, whole_spectrum_size)
-    start = (ROI_SIZE - size) // 2
+    side = missing_window_size(scenario, severity, whole_spectrum_size)
+    start = (ROI_SIZE - side) // 2
     y0 = start if missing_y is None else int(missing_y)
     x0 = start if missing_x is None else int(missing_x)
-    if not (0 <= y0 <= ROI_SIZE - size and 0 <= x0 <= ROI_SIZE - size):
-        raise ValueError(f"Missing window ({size}x{size}) must remain inside the {ROI_SIZE}x{ROI_SIZE} ROI")
+    if not (0 <= y0 <= ROI_SIZE - side and 0 <= x0 <= ROI_SIZE - side):
+        raise ValueError(f"Missing window ({side}x{side}) must remain inside the {ROI_SIZE}x{ROI_SIZE} ROI")
+
     mask = np.zeros(shape, dtype=bool)
     if scenario == "whole_spectrum_pixels":
-        mask[y0:y0 + size, x0:x0 + size, :] = True
+        mask[y0:y0 + side, x0:x0 + side, :] = True
+    elif scenario in {"spatial_patch", "spatio_spectral_block"}:
+        # One spatial-spectral component at the exact benchmark S-level dimensions.
+        widths = ((1, 3, 7, 15, 31) if scenario == "spatial_patch"
+                  else (5, 11, 21, 41, 63))
+        width = min(widths[int(severity) - 1], shape[2])
+        b0 = max(0, min(band - width // 2, shape[2] - width))
+        mask[y0:y0 + side, x0:x0 + side, b0:b0 + width] = True
+    elif scenario == "mixed_saturation" and int(severity) == 5:
+        # A compact illustrative mixture of benchmark-S5 COMPONENTS on one
+        # user-selected location. The actual benchmark places components at
+        # independent locations throughout the complete test image.
+        b63 = min(63, shape[2])
+        z63 = max(0, min(band - b63 // 2, shape[2] - b63))
+        mask[y0:y0 + side, x0:x0 + side, z63:z63 + b63] = True
+        # Whole-spectrum S5 component: 15x15, centered within the selected area.
+        c = side // 2
+        half = 15 // 2
+        mask[y0+c-half:y0+c-half+15, x0+c-half:x0+c-half+15, :] = True
+        # Several additional detector failures, corresponding to the mixed
+        # mode's line components. Keep them reproducible for a chosen seed.
+        rng = np.random.default_rng(seed)
+        for _ in range(10):
+            col = int(rng.integers(x0, x0 + side))
+            spectral_band = int(rng.integers(shape[2]))
+            mask[y0:y0 + side, col, spectral_band] = True
+        # Full-band S3 component is also represented within the local footprint
+        # (7 bands); these channels are already contained in the 63-band mask.
     else:
+        # For other compound/line defects, use the existing local training-style
+        # generator. The placement square need not equal the deletion area.
         from src.training_corruptions import generate_training_mask
         rng = np.random.default_rng(seed)
         local, _, _ = generate_training_mask(
-            (size, size, shape[2]), rng, scenario=scenario, severity=severity,
-            center=(size // 2, size // 2), band_center=band,
+            (side, side, shape[2]), rng, scenario=scenario, severity=severity,
+            center=(side // 2, side // 2), band_center=band,
         )
-        mask[y0:y0 + size, x0:x0 + size] = local
+        mask[y0:y0 + side, x0:x0 + side] = local
     return mask
 
 
-def select_missing_window(roi, invalid_roi, scenario, severity, band, seed, whole_spectrum_size=None):
+def select_missing_window(roi, invalid_roi, scenario, severity, band, seed, whole_spectrum_size=None, flip_x=False):
     """Move the exact fixed-size synthetic corruption footprint inside the ROI.
 
-    For whole-spectrum pixels the outlined square matches the actual deleted
-    pixels. For other scenarios it is the 31x31 local generation window.
+    For whole-spectrum and compact patch scenarios, the yellow square marks
+    the exact spatial footprint. For other scenarios it is the local placement
+    region: the mask may contain lines, spectral gaps, or a mixture.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
@@ -254,7 +311,7 @@ def select_missing_window(roi, invalid_roi, scenario, severity, band, seed, whol
     outline = Rectangle((start - 0.5, start - 0.5), size, size,
                         edgecolor="#ffe44d", lw=2.1, fill=False, zorder=3)
     ax.add_patch(outline)
-    ax.set_xlim(-0.5, ROI_SIZE - 0.5)
+    ax.set_xlim((ROI_SIZE - 0.5, -0.5) if flip_x else (-0.5, ROI_SIZE - 0.5))
     ax.set_ylim(ROI_SIZE - 0.5, -0.5)
     ax.set_aspect("equal", adjustable="box")
     ax.set_title("Choose the Missing location within the ROI\n"
@@ -338,11 +395,13 @@ def get_display_limits(cube_band, valid):
     return float(lo), float(max(hi, lo + 1e-6))
 
 
-def save_selection(out, preview, y, x, sy, sx, image_offset, gt, synthetic, model_mask, band):
+def save_selection(out, preview, y, x, sy, sx, image_offset, gt, synthetic, model_mask, band, flip_x=False):
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
     fig, ax = plt.subplots(figsize=(8, 9))
     ax.imshow(preview, cmap="gray", vmin=0, vmax=1, origin="upper")
+    if flip_x:
+        ax.invert_xaxis()
     ax.add_patch(Rectangle((x / sx - .5, y / sy - .5), ROI_SIZE / sx, ROI_SIZE / sy,
                            fill=False, edgecolor="yellow", lw=2))
     ax.set_title(f"Selected ROI | original cube y={image_offset + y}:{image_offset + y + ROI_SIZE}")
@@ -358,6 +417,8 @@ def save_selection(out, preview, y, x, sy, sx, image_offset, gt, synthetic, mode
     overlay[affected] = 0.4 * overlay[affected] + 0.6 * np.array([1, 0.1, 0.1])
     fig, ax = plt.subplots(figsize=(6.5, 6.5))
     ax.imshow(overlay, vmin=0, vmax=1)
+    if flip_x:
+        ax.invert_xaxis()
     ax.set_title("Masked location (red) | fixed ROI")
     ax.axis("off")
     fig.tight_layout()
@@ -365,9 +426,44 @@ def save_selection(out, preview, y, x, sy, sx, image_offset, gt, synthetic, mode
     plt.close(fig)
 
 
-def split_indices(coords, world_size, rank):
+def split_indices(coords, world_size, rank, spatial_consistency=False):
     pixels, inverse = np.unique(coords[:, :2], axis=0, return_inverse=True)
-    return np.flatnonzero((inverse % world_size) == rank)
+    if not spatial_consistency:
+        return np.flatnonzero((inverse % world_size) == rank)
+
+    # A spatial consistency decision needs *all* four-connected target pixels.
+    # Split only at disconnected components, never through one damaged patch.
+    lookup = {tuple(row): i for i, row in enumerate(pixels)}
+    visited = np.zeros(len(pixels), dtype=bool)
+    counts = np.bincount(inverse, minlength=len(pixels))
+    groups = []
+    for i in range(len(pixels)):
+        if visited[i]:
+            continue
+        visited[i] = True
+        stack = [i]
+        component = []
+        while stack:
+            j = stack.pop()
+            component.append(j)
+            y, x = map(int, pixels[j])
+            for neighbor in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                q = lookup.get(neighbor)
+                if q is not None and not visited[q]:
+                    visited[q] = True
+                    stack.append(q)
+        groups.append(np.asarray(component, dtype=np.int64))
+    assigned = np.full(len(pixels), -1, dtype=np.int8)
+    totals = np.zeros(world_size, dtype=np.int64)
+    for component in sorted(groups, key=lambda g: -int(counts[g].sum())):
+        gpu = int(np.argmin(totals))
+        assigned[component] = gpu
+        totals[gpu] += counts[component].sum()
+    assert np.all(assigned >= 0)
+    if rank == 0:
+        print(f"[SPATIAL ROUTER] {len(groups)} connected ROI component(s) allocated "
+              f"across {world_size} GPU(s); target voxels by GPU: {totals.tolist()}", flush=True)
+    return np.flatnonzero(assigned[inverse] == rank)
 
 
 def run_worker(args):
@@ -388,25 +484,90 @@ def run_worker(args):
     cube = np.load(work / "roi_cube.npy", mmap_mode="r")
     mask = np.load(work / "model_mask.npy", mmap_mode="r")
     coords = np.load(work / "coords.npy")
-    take = split_indices(coords, world, rank)
-    if not len(take):
-        np.savez_compressed(work / f"rank_{rank}.npz", indices=take, values=np.empty(0, np.float32), routes=np.empty(0, np.int8))
+    take = split_indices(coords, world, rank, args.spatial_consistency)
+    # Empty ranks must participate in the global-count reduction. This occurs,
+    # for example, when a single-pixel S1 mask is split across two GPUs.
+    distributed = world > 1 and args.global_minority_percent is not None
+    if distributed:
+        import torch.distributed as dist
+        dist.init_process_group(backend="gloo")
+    if not len(take) and not distributed:
+        np.savez_compressed(work / f"rank_{rank}.npz", indices=take,
+                            values=np.empty(0, np.float32), routes=np.empty(0, np.int8))
         return
-    print(f"GPU {local}: loading trained TPSSR | {len(take)} voxels", flush=True)
+    if len(take):
+        print(f"GPU {local}: loading trained TPSSR | {len(take)} voxels", flush=True)
     router_flags = {
         "learned_router3_aligned": "learned_router3_aligned",
         "learned_router3_lineaware": "learned_router3_lineaware",
         "learned_router3_lineaware_rankcv": "learned_router3_lineaware_rankcv",
     }
-    pipeline = load_pipeline(
+    pipeline = (load_pipeline(
         device, region_batch=args.region_batch, verify_region_batch=True,
         learned_fusion=True, **{router_flags[args.router]: True},
-    )
+    ) if len(take) else None)
+    spatial_ck = None
+    if args.spatial_consistency:
+        if args.router != "learned_router3_lineaware_rankcv":
+            raise ValueError("--spatial-consistency requires the RankCV Router")
+        import joblib
+        from training.spectral_gate import sha
+        ckdir = Path(__import__("config").MODELS_DIR) / "tpssr" / "learned_router3_lineaware_rankcv"
+        ckfile = ckdir / "spatial_consistency.joblib"
+        if not ckfile.is_file():
+            raise FileNotFoundError(f"Spatial Router checkpoint not found: {ckfile}")
+        spatial_ck = joblib.load(ckfile)
+        if (spatial_ck.get("architecture") != "spatial_consistency_source_cv_v1"
+                or spatial_ck.get("router_sha256") != sha(ckdir / "best_model.joblib")):
+            raise RuntimeError("Spatial Router calibration is incompatible with current RankCV checkpoint")
+        print(f"GPU {local}: spatial consistency enabled, calibrated strength "
+              f"{spatial_ck['strength']}", flush=True)
+    if args.fusion_guard and len(take):
+        from src.pipeline import load_fusion_guard_calibration
+        fusion_guard_ck = load_fusion_guard_calibration(pipeline)
+    else:
+        fusion_guard_ck = None
+    global_counts = None
+    if args.global_minority_percent is not None:
+        local_counts = np.zeros(3, dtype=np.int64)
+        if len(take):
+            with torch.inference_mode():
+                routing = predict_mask_learned_router3(
+                    pipeline, cube, mask, coords[take], routing_only=True)
+            local_counts = np.asarray(routing["raw_route_counts"], np.int64)
+        if distributed:
+            from torch.distributed import all_reduce, ReduceOp
+            counts_tensor = torch.from_numpy(local_counts.copy())
+            all_reduce(counts_tensor, op=ReduceOp.SUM)
+            global_counts = counts_tensor.numpy().copy()
+        else:
+            global_counts = local_counts
+        if int(global_counts.sum()) != len(np.unique(coords[:, :2], axis=0)):
+            raise RuntimeError("Global Minority did not count every evaluated ROI pixel exactly once")
+        if rank == 0:
+            print(f"[GLOBAL MINORITY] raw Expert counts={global_counts.tolist()} | "
+                  f"threshold={args.global_minority_percent:g}%", flush=True)
+    if not len(take):
+        np.savez_compressed(work / f"rank_{rank}.npz", indices=take,
+                            values=np.empty(0, np.float32), routes=np.empty(0, np.int8))
+        if distributed:
+            from torch.distributed import destroy_process_group
+            destroy_process_group()
+        return
     with torch.inference_mode():
         result = predict_mask_learned_router3(
             pipeline, cube, mask, coords[take],
             region_progress=f"GPU {local} Region reconstruction",
+            spatial_consistency=spatial_ck,
+            fusion_guard=fusion_guard_ck,
+            global_minority_threshold=(args.global_minority_percent / 100.0
+                                       if args.global_minority_percent is not None else None),
+            global_minority_counts=global_counts,
+            global_minority_policy=args.minority_policy,
         )
+    if distributed:
+        from torch.distributed import destroy_process_group
+        destroy_process_group()
     values = np.asarray(result["prediction"], dtype=np.float32)
     route_map = {"router3_interp": 0, "router3_fusion": 1, "router3_region": 2}
     routes = np.asarray([route_map[str(s)] for s in result["candidate_method"]], np.int8)
@@ -1018,6 +1179,21 @@ def regenerate_region_maps(existing_output):
 
 def main():
     args = arguments()
+    if args.spatial_consistency and args.router != "learned_router3_lineaware_rankcv":
+        raise SystemExit("--spatial-consistency requires --router learned_router3_lineaware_rankcv")
+    if args.global_minority_percent is None and args.minority_policy == 'hybrid':
+        raise SystemExit("--minority-policy hybrid requires --global-minority-percent")
+    if args.global_minority_percent is not None:
+        os.environ["TPSSR_FUSION_DONOR_MATCH"] = "robust"
+        if args.router != "learned_router3_lineaware_rankcv":
+            raise SystemExit("Global Minority requires the RankCV Line-aware Router")
+        if not 0 < args.global_minority_percent < 50:
+            raise SystemExit("--global-minority-percent must be between 0 and 50")
+        if args.spatial_consistency or args.fusion_guard:
+            raise SystemExit("Global Minority is incompatible with Spatial Consistency and Fusion Guard")
+    if args.fusion_guard and (args.router != "learned_router3_lineaware_rankcv"
+                              or not args.spatial_consistency or args.preset != "swir_8x2"):
+        raise SystemExit("--fusion-guard requires swir_8x2 RankCV with --spatial-consistency")
     if args.maps_from_output is not None:
         regenerate_region_maps(args.maps_from_output)
         return
@@ -1027,6 +1203,8 @@ def main():
     # --dataset selects an image for visualization, not the checkpoint family.
     # Keep the trained model's original train/test split and checkpoint tag.
     display_dataset = args.dataset.upper()
+    if args.flip_x is None:
+        args.flip_x = display_dataset.startswith("VNIR")
     if display_dataset not in SUPPORTED_DATASETS:
         raise SystemExit(f"Unsupported dataset {display_dataset}. Choose SWIR1..SWIR10 (or VNIR1..VNIR10 with vnir_8x2).")
     args.dataset = None
@@ -1086,7 +1264,8 @@ def main():
     if (args.roi_y is None) != (args.roi_x is None):
         raise SystemExit("Pass both --roi-y and --roi-x, or neither for interactive selection")
     if args.roi_y is None:
-        y, x = select_box(preview, height, width, sy, sx, args.dataset, band, area_label)
+        y, x = select_box(preview, height, width, sy, sx, args.dataset, band, area_label,
+                          flip_x=args.flip_x)
     else:
         y, x = boundaries(args.roi_y, args.roi_x, height, width)
     roi = np.array(test_cube[y:y + ROI_SIZE, x:x + ROI_SIZE], dtype=np.float32, copy=True)
@@ -1095,7 +1274,8 @@ def main():
         raise SystemExit("Pass both --missing-y and --missing-x, or neither for the second interactive window")
     if args.missing_y is None:
         missing_y, missing_x = select_missing_window(
-            roi, invalid_roi, args.scenario, args.severity, band, args.seed, args.whole_spectrum_size)
+            roi, invalid_roi, args.scenario, args.severity, band, args.seed, args.whole_spectrum_size,
+            flip_x=args.flip_x)
     else:
         missing_y, missing_x = int(args.missing_y), int(args.missing_x)
     synthetic = make_local_mask(
@@ -1111,8 +1291,13 @@ def main():
     coords = np.argwhere(target).astype(np.int32)
     if len(coords) < 1:
         raise SystemExit("No valid masked pixels in this ROI. Move the square onto valid sediment.")
-    if len(coords) > 250000 or np.count_nonzero(np.any(target, axis=2)) > 1200:
+    if len(coords) > 250000 or np.count_nonzero(np.any(target, axis=2)) > 2500:
         raise SystemExit("The requested mask is too large for this visual test. Try another scenario or severity.")
+    if args.scenario == "band_wide_saturation":
+        print("NOTE: this is a LOCAL band-wide visual example, not full-image band-wide saturation.", flush=True)
+    elif args.scenario == "mixed_saturation":
+        print("NOTE: mixed_saturation uses a LOCAL, centered composite for visual comparison; "
+              "it does not replicate the independently placed full-image benchmark components.", flush=True)
     out = (Path(args.outdir) if args.outdir else ROOT / "roi_visuals" / (args.dataset + ("_lineaware" if args.preset == "swir_8x2" else "")) /
            f"{args.scenario}_S{args.severity}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     out = out.resolve()
@@ -1127,15 +1312,24 @@ def main():
     np.save(work / "synthetic_mask.npy", synthetic)
     np.save(work / "model_mask.npy", model_mask)
     np.save(work / "coords.npy", coords)
-    save_selection(out, preview, y, x, sy, sx, image_offset, roi, synthetic, model_mask, band)
+    save_selection(out, preview, y, x, sy, sx, image_offset, roi, synthetic, model_mask, band,
+                   flip_x=args.flip_x)
     params = {
         "dataset": args.dataset, "preset": args.preset,
+        "spatial_consistency": bool(args.spatial_consistency),
+        "global_minority_percent": args.global_minority_percent,
+        "global_minority_policy": (args.minority_policy if args.global_minority_percent is not None else 'off'),
+        "fusion_donor_match": os.environ.get("TPSSR_FUSION_DONOR_MATCH", "legacy"),
+        "fusion_guard": bool(args.fusion_guard),
+        "display_flip_x": bool(args.flip_x),
         "scenario": args.scenario, "severity": args.severity,
-        "visual_mask_source": ("benchmark_size_manual_placement" if args.scenario == "whole_spectrum_pixels"
+        "visual_mask_source": ("single_benchmark_size_component" if args.scenario in
+                               {"whole_spectrum_pixels", "spatial_patch", "spatio_spectral_block"}
+                               else "compact_benchmark_S5_components" if args.scenario == "mixed_saturation" and args.severity == 5
                                else "src.training_corruptions.generate_training_mask"),
-        "visual_mask_note": ("One manually placed component with the benchmark's component size; "
-                             "not the complete three-component S5 benchmark mask" if args.scenario == "whole_spectrum_pixels"
-                             else "Local synthetic training-style mask; not one of the 200 benchmark masks"),
+        "visual_mask_note": ("One local representative corruption; NOT a full standardized evaluation mask. "
+                             "Compound/line masks use the local training-style generator; "
+                             "the placement square is not necessarily the missing area."),
         "whole_spectrum_size": (int((1, 3, 5, 9, 15)[args.severity-1])
                                 if args.whole_spectrum_size is None else int(args.whole_spectrum_size))
                                if args.scenario == "whole_spectrum_pixels" else None,
@@ -1201,6 +1395,11 @@ def main():
     cmd += [str(Path(__file__).resolve()), "--preset", args.preset, "--dataset", args.dataset,
             "--router", args.router, "--scenario", args.scenario, "--severity", str(args.severity),
             "--outdir", str(out), "--region-batch", str(args.region_batch), "--worker"]
+    if args.spatial_consistency:
+        cmd.append("--spatial-consistency")
+    if args.global_minority_percent is not None:
+        cmd.extend(["--global-minority-percent", str(args.global_minority_percent),
+                    "--minority-policy", args.minority_policy])
     print(f"Running trained {args.router} on {args.gpus} GPU(s)...", flush=True)
     subprocess.run(cmd, cwd=ROOT, env=model_env, check=True)
     coords, values, routes = merge_outputs(out, args.gpus)

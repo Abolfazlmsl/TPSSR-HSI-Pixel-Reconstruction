@@ -46,6 +46,14 @@ def parse_args():
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--no-verify-region-batch", action="store_true")
     p.add_argument("--force", action="store_true", help="Recompute completed masks")
+    p.add_argument("--spatial-consistency", action="store_true",
+                   help="Apply source-calibrated spatial coherence to RankCV decisions")
+    p.add_argument("--global-minority-percent", type=float, default=None,
+                   help="Share threshold in percent; in hybrid mode used only when two experts are active")
+    p.add_argument("--minority-policy", choices=("threshold", "hybrid"), default="threshold",
+                   help="threshold: replace all low-share experts; hybrid: least of three, or <threshold of two")
+    p.add_argument("--fusion-guard", action="store_true",
+                   help="Apply locked source-calibrated Fusion stripe correction (SWIR 8x2 RankCV only)")
     p.add_argument("--region-fixed-eval", action="store_true",
                    help="Use the cache-compatible fixed full evaluation-coordinate Region tiling protocol")
     p.add_argument("--router", choices=["v23", "neighbor_v1", "neighbor_v2", "learned_fusion", "learned_fusion_guarded", "learned_router", "learned_router3", "learned_router3_rmse", "learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware"], default="learned_router3_aligned",
@@ -58,7 +66,26 @@ def parse_args():
 
 
 
+def validate_minority_flags(args):
+    if args.global_minority_percent is None:
+        if args.minority_policy != 'threshold':
+            raise ValueError('--minority-policy hybrid requires --global-minority-percent')
+        return
+    if args.router != 'learned_router3_lineaware_rankcv':
+        raise ValueError('--global-minority-percent requires RankCV Line-aware Router')
+    if args.spatial_consistency or args.fusion_guard:
+        raise ValueError('Global Minority cannot be combined with Spatial Consistency or Fusion Guard')
+    if not (0 < args.global_minority_percent < 50):
+        raise ValueError('--global-minority-percent must be strictly between 0 and 50')
+
+
 def launch_all_tests(args, spec):
+    validate_minority_flags(args)
+    if args.spatial_consistency and args.router != 'learned_router3_lineaware_rankcv':
+        raise ValueError('--spatial-consistency requires learned_router3_lineaware_rankcv')
+    if args.fusion_guard and (args.router != 'learned_router3_lineaware_rankcv'
+                              or not args.spatial_consistency or args.preset != 'swir_8x2'):
+        raise ValueError('--fusion-guard requires swir_8x2 RankCV with --spatial-consistency')
     if args.region_fixed_eval and args.router not in (
             'learned_router3_aligned',
             'learned_router3_lineaware', 'learned_router3_lineaware_mse',
@@ -104,6 +131,13 @@ def launch_all_tests(args, spec):
             common.append("--no-verify-region-batch")
         if args.force:
             common.append("--force")
+        if args.spatial_consistency:
+            common.append("--spatial-consistency")
+        if args.global_minority_percent is not None:
+            common.extend(["--global-minority-percent", str(args.global_minority_percent),
+                           "--minority-policy", args.minority_policy])
+        if args.fusion_guard:
+            common.append("--fusion-guard")
         if args.region_fixed_eval:
             common.append("--region-fixed-eval")
         if args.focus_band_guard:
@@ -140,6 +174,10 @@ def launch_all_tests(args, spec):
 
 
 ARGS = parse_args()
+validate_minority_flags(ARGS)
+DONOR_MATCH_MODE = os.environ.get('TPSSR_FUSION_DONOR_MATCH', 'legacy').strip().lower()
+if DONOR_MATCH_MODE not in ('legacy', 'robust'):
+    raise ValueError('TPSSR_FUSION_DONOR_MATCH must be legacy or robust')
 SPEC = resolve_experiment(ARGS)
 if not ARGS.worker:
     launch_all_tests(ARGS, SPEC)
@@ -155,6 +193,10 @@ if str(CORE) not in sys.path:
     sys.path.insert(0, str(CORE))
 
 import torch
+if DONOR_MATCH_MODE == 'robust':
+    from training.neighbor_fusion import _matching_observations
+    if '_robust_observed_anchors' not in _matching_observations.__code__.co_names:
+        raise RuntimeError('Robust donor code not installed. Replace training/neighbor_fusion.py from the provided package.')
 from tqdm import tqdm
 import config
 from src.evaluation_utils import (
@@ -166,7 +208,8 @@ from src.evaluation_utils import (
     benchmark_case_index,
     experiment_progress,
 )
-from src.pipeline import load_pipeline, predict_mask, predict_mask_candidate, predict_mask_candidate_v2, predict_mask_learned_fusion, predict_mask_learned_fusion_guarded, predict_mask_learned_router, predict_mask_learned_router3, sparse_band_predictions, subset_rmse
+from training.spectral_reference import source_mode_for_path as spectral_source_mode
+from src.pipeline import load_pipeline, predict_mask, predict_mask_candidate, predict_mask_candidate_v2, predict_mask_learned_fusion, predict_mask_learned_fusion_guarded, predict_mask_learned_router, predict_mask_learned_router3, load_fusion_guard_calibration, sparse_band_predictions, subset_rmse
 from src.spatial_inference import evaluate_reconstruction
 
 RANK = int(os.environ.get("RANK", "0"))
@@ -181,7 +224,12 @@ else:
 # Distinct output tree: never accidentally resume or merge routed-only test
 # metrics with fixed-union Region metrics.
 RESULT_FOLDER = selected_results_folder(SPEC, ARGS.router) + (
-    '__fixed_union_region' if ARGS.region_fixed_eval else '')
+    '__fixed_union_region' if ARGS.region_fixed_eval else '') + (
+    '__spatialcv' if ARGS.spatial_consistency else '') + (
+    ('__minority' + ('hybrid' if ARGS.minority_policy == 'hybrid' else 'global') +
+     format(ARGS.global_minority_percent, 'g').replace('.', 'p') + 'pct')
+    if ARGS.global_minority_percent is not None else '') + ('__fusionguard' if ARGS.fusion_guard else '') + ( 
+    '__robustdonor' if DONOR_MATCH_MODE == 'robust' else '')
 OUTDIR = Path(config.RESULTS_DIR) / RESULT_FOLDER
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -238,6 +286,21 @@ def evaluate_worker(mask_files):
     cube, _, split, _ = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
 
+    spatial_ck = None
+    if ARGS.spatial_consistency:
+        import joblib
+        from training.spectral_gate import sha
+        ckdir = Path(config.MODELS_DIR) / 'tpssr' / 'learned_router3_lineaware_rankcv'
+        ckfile = ckdir / 'spatial_consistency.joblib'
+        if not ckfile.is_file():
+            raise FileNotFoundError('Train spatial consistency first: ' + str(ckfile))
+        spatial_ck = joblib.load(ckfile)
+        if (spatial_ck.get('architecture') != 'spatial_consistency_source_cv_v1'
+                or spatial_ck.get('router_sha256') != sha(ckdir / 'best_model.joblib')):
+            raise RuntimeError('Spatial consistency calibration is stale or incompatible')
+        print(f'[TPSSR][GPU {RANK}] Source-calibrated spatial strength: '
+              f'{spatial_ck["strength"]}', flush=True)
+
     assigned = [
         (i, p)
         for i, p in enumerate(mask_files, start=1)
@@ -272,6 +335,10 @@ def evaluate_worker(mask_files):
         leave=True,
     )
 
+    fusion_guard_ck = load_fusion_guard_calibration(pipeline) if ARGS.fusion_guard else None
+    if fusion_guard_ck:
+        print(f'[TPSSR][GPU {RANK}] Fusion Guard enabled; locked calibration: '
+              f'{fusion_guard_ck["report"]}', flush=True)
     consecutive_errors = 0
     total_global = len(mask_files)
     for mask_index, mask_path in bar:
@@ -309,6 +376,13 @@ def evaluate_worker(mask_files):
             )
             if ARGS.region_fixed_eval:
                 predict_kwargs['region_full_eval'] = True
+            if ARGS.spatial_consistency:
+                predict_kwargs['spatial_consistency'] = spatial_ck
+            if ARGS.global_minority_percent is not None:
+                predict_kwargs['global_minority_threshold'] = ARGS.global_minority_percent / 100.0
+                predict_kwargs['global_minority_policy'] = ARGS.minority_policy
+            if ARGS.fusion_guard:
+                predict_kwargs['fusion_guard'] = fusion_guard_ck
             out = predictor(pipeline, test_cube, mask, coords, **predict_kwargs)
             pred = out["prediction"]
             band_predictions = sparse_band_predictions(coords, pred)
@@ -345,6 +419,7 @@ def evaluate_worker(mask_files):
                 "region_tiling_protocol": ("fixed_union_of_sampled_coordinates_v1"
                                            if ARGS.region_fixed_eval else "router_selected_coordinates"),
                 "router_variant": ARGS.router,
+                "fusion_donor_match": DONOR_MATCH_MODE,
                 **({f"candidate_{k}_voxels": v for k, v in out.get("candidate_method_voxels", {}).items()} if ARGS.router != "v23" else {}),
                 **({f"candidate_{k}": v for k, v in out.get("candidate_policy_audit", {}).items()} if ARGS.router != "v23" else {}),
                 "mask_file": mask_path.name,
@@ -446,9 +521,15 @@ def evaluate_worker(mask_files):
         "rank": RANK,
         "device": str(DEVICE),
         "routing_mode": ARGS.router,
+        "fusion_donor_match": DONOR_MATCH_MODE,
+        "fusion_guard": bool(ARGS.fusion_guard),
+        "spatial_consistency": bool(ARGS.spatial_consistency),
+        "global_minority_percent": ARGS.global_minority_percent,
+        "global_minority_policy": ARGS.minority_policy if ARGS.global_minority_percent is not None else 'off',
         "routing_parameters": __import__("src.routing_policy", fromlist=["policy_spec"]).policy_spec(),
         "spectral_backbone_checkpoint": str(pipeline.hybrid_backbone_checkpoint_path),
         "spectral_gate_checkpoint": str(pipeline.hybrid_gate_checkpoint_path),
+        "spectral_source_mode": spectral_source_mode(pipeline.hybrid_gate_checkpoint_path),
         "topology_checkpoint": str(pipeline.topology_path),
         "geometry_stage_a_checkpoint": str(pipeline.geometry_path),
         "region_variant": "lineaware" if selected_lineaware_region(SPEC, ARGS.router) else "original",
@@ -500,6 +581,8 @@ def merge(mask_files):
     ok = sum(r.get("status") == "ok" for r in rows)
     print(f"\n{DATASET} test complete: {ok}/{len(mask_files)} masks successful")
     print("Saved:", path)
+    if ok != len(mask_files):
+        raise RuntimeError(f'{DATASET}: {len(mask_files)-ok} masks failed; aborting chained experiment')
 
 
 def main_worker():
@@ -519,8 +602,16 @@ def main_worker():
         print("Active held-out dataset:", DATASET)
         print("Training datasets:", ", ".join(config.TRAIN_DATASET_FOLDERS))
         print("TPSSR: spectral backbone, geometry guidance, topology completion")
-        print("Routing: observed-only spectral-gap policy with local consistency checks")
+        if ARGS.global_minority_percent is not None:
+            print(f"Routing: learned RankCV + Global Minority {ARGS.minority_policy} "
+                  f"(two-expert threshold={ARGS.global_minority_percent:g}%)")
+        else:
+            print("Routing:", ARGS.router)
         print("Allocated masks for this acquisition:", len(mask_files), "| GPUs:", WORLD_SIZE)
+        print("Fusion donor matching:", DONOR_MATCH_MODE)
+        print("Fusion Guard:", 'enabled' if ARGS.fusion_guard else 'disabled')
+        print("Global Minority threshold (%):", ARGS.global_minority_percent)
+        print("Results path:", OUTDIR)
         if int(ARGS.max_masks) > 0:
             print("GLOBAL experiment mask budget:", int(ARGS.max_masks))
         print("=" * 94)

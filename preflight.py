@@ -30,7 +30,11 @@ def main():
     parser.add_argument("--router", choices=("learned_router3_aligned", "learned_router3_lineaware", "learned_router3_lineaware_mse", "learned_router3_lineaware_rankcv", "learned_router3_lineaware_regretcv", "learned_router2_lineaware", "v23"),
                         default="learned_router3_aligned",
                         help="Checkpoint set to verify; defaults to the final learned router")
+    parser.add_argument('--spatial-consistency', action='store_true',
+                        help='Check source-calibrated spatial RankCV checkpoint')
     a = parser.parse_args()
+    if a.spatial_consistency and a.router != 'learned_router3_lineaware_rankcv':
+        parser.error('Spatial consistency requires learned_router3_lineaware_rankcv')
     spec = resolve_experiment(a)
     from experiment_config import spectral_validation_cores
     validation = spectral_validation_cores(spec)
@@ -75,14 +79,20 @@ def main():
         root / 'spectral_backbone/hybrid/best_model.pt',
         root / 'spectral_backbone/hybrid/diagnostic_best_val.pt',
     ]
-    gate = root / 'spectral_gate/band/best_model.pt'
+    from training.spectral_reference import select_spectral_source_checkpoint, ACCEPTED_GATE
+    try:
+        spectral_source, spectral_mode = select_spectral_source_checkpoint(root, spec.sensor)
+    except (RuntimeError, FileNotFoundError) as exc:
+        print('Spectral source validation:', exc)
+        spectral_source, spectral_mode = root / 'spectral_gate/band/best_model.pt', None
+    gate = spectral_source
     geometry_options = [
         root / f'geometry_{tag}/best_model.pt',
     ]
     topology = root / f'topology_{tag}/best_model.pt'
     groups = {
         'Spectral backbone checkpoint': backbone_options,
-        'Band confidence gate checkpoint': [gate],
+        'Spectral source (' + str(spectral_mode or 'unresolved') + ')': [gate],
         'Geometry guidance checkpoint': geometry_options,
         'Topology completion checkpoint': [topology],
     }
@@ -102,6 +112,9 @@ def main():
                          else 'learned_router3_aligned')
         groups['Learned three-expert router checkpoint'] = [
             root / router_folder / 'best_model.joblib']
+    if a.spatial_consistency:
+        groups['Source-calibrated spatial coherence checkpoint'] = [
+            root / 'learned_router3_lineaware_rankcv' / 'spatial_consistency.joblib']
     for name in spec.tests:
         for short, file in (('reflectance', 'calibrated_reflectance.npy'),
                             ('invalid mask', 'invalid_mask.npy'),
@@ -116,7 +129,7 @@ def main():
               '->', found if found else ' OR '.join(str(x) for x in options))
         if found is None:
             missing.append(label)
-    if not missing and gate.is_file():
+    if not missing and gate.is_file() and spectral_mode == ACCEPTED_GATE:
         import torch
         g = torch.load(gate, map_location='cpu', weights_only=False)
         if g.get('architecture') != 'spectral_only_hybrid_confidence_gate_v2' or g.get('gate_variant') != 'band':
@@ -128,6 +141,21 @@ def main():
             missing.append('Spectral backbone does not match gate SHA256')
         else:
             print('OK      SHA256 of frozen spectral backbone')
+    if not missing and spectral_mode is None:
+        missing.append('Missing valid spectral source provenance')
+    if not missing and a.router != 'v23':
+        import torch
+        from training.neighbor_fusion import RADIUS, SEARCH_RADII
+        fpath = root / 'neighbor_fusion' / 'best_model.pt'
+        if fpath.is_file():
+            fck = torch.load(fpath, map_location='cpu', weights_only=False)
+            opts = fck.get('settings') or {}
+            if (opts.get('radius') != RADIUS or
+                    tuple(opts.get('search_radii', ())) != SEARCH_RADII or
+                    opts.get('distance_scale') != RADIUS):
+                missing.append('Fusion checkpoint has stale donor-radius configuration')
+            else:
+                print('OK      Fusion donor radii:', SEARCH_RADII)
     if not missing and selected_lineaware_region(spec, a.router):
         import torch
         from pathlib import Path
@@ -163,6 +191,21 @@ def main():
             print('OK      Router3 checkpoint SHA256 provenance for final Line-aware Region')
         except Exception as exc:
             missing.append(f'Router3 checkpoint provenance: {exc}')
+    if not missing and a.spatial_consistency:
+        try:
+            import joblib
+            ckdir = root / 'learned_router3_lineaware_rankcv'
+            content = joblib.load(ckdir / 'spatial_consistency.joblib')
+            if content.get('architecture') != 'spatial_consistency_source_cv_v1':
+                raise RuntimeError('Unexpected spatial checkpoint schema')
+            if content.get('router_sha256') != sha256(ckdir / 'best_model.joblib'):
+                raise RuntimeError('Spatial calibration is not for the current Router')
+            weight = float(content['strength'])
+            if not np.isfinite(weight) or weight < 0:
+                raise RuntimeError('Invalid calibrated spatial strength')
+            print('OK      Source-only spatial consistency calibration; strength:', weight)
+        except Exception as exc:
+            missing.append(f'Spatial checkpoint provenance: {exc}')
     if not missing and a.router == 'learned_router2_lineaware':
         from training.three_expert_router import load_binary_checkpoint, binary_path
         trial = root / 'region_lineaware_trial_v1'

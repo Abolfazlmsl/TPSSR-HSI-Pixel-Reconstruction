@@ -237,4 +237,11 @@ swir_png_exports/
 # Local interactive reconstruction figures
 roi_visuals/
 
+roi_comparison/
+
 figures/
+checkpoint_backups/
+fusion_donor_audit/
+fusion_donor_column_audit/
+router_rankcv_minority_vnir_40/
+router_rankcv_minority_vnir_40_cached/
