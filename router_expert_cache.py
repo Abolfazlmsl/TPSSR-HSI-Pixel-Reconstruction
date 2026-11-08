@@ -131,7 +131,7 @@ def build_case(pipeline, cube, mask, coords, wave, mask_path, spec, dataset, met
 
     # Exactly the feature/expert-input path used by predict_mask_learned_router3.
     for i, (yy, xx) in enumerate(pixels):
-        patch, damaged, cy, cx = crop_at(cube, mask, int(yy), int(xx), radius=32)
+        patch, damaged, cy, cx = crop_at(cube, mask, int(yy), int(xx), radius=35)
         feat, interp, fusion = features_for_pixel(
             patch, damaged, cy, cx, pipeline.hybrid_mean, pipeline.hybrid_std,
             wave, pipeline.fusion_model, pipeline.hybrid_model, pipeline.device,

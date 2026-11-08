@@ -46,12 +46,16 @@ def parse_args():
     p.add_argument("--region-batch", type=int, default=32)
     p.add_argument("--no-verify-region-batch", action="store_true")
     p.add_argument("--force", action="store_true", help="Recompute completed masks")
+    p.add_argument("--cache-mode", choices=("lazy", "replay_only", "off"), default="lazy",
+                   help="Persistent expert cache; replay_only refuses uncomputed predictions")
     p.add_argument("--spatial-consistency", action="store_true",
                    help="Apply source-calibrated spatial coherence to RankCV decisions")
     p.add_argument("--global-minority-percent", type=float, default=None,
                    help="Share threshold in percent; in hybrid mode used only when two experts are active")
-    p.add_argument("--minority-policy", choices=("threshold", "hybrid"), default="threshold",
-                   help="threshold: replace all low-share experts; hybrid: least of three, or <threshold of two")
+    p.add_argument("--minority-policy", choices=("threshold", "hybrid", "hybrid_gap"), default="threshold",
+                   help="hybrid_gap: keep smallest of three unless clearly below second-smallest")
+    p.add_argument("--three-expert-min-gap-percent", type=float, default=10.0,
+                   help="hybrid_gap only: minimum percentage-point share gap from second-smallest (default 10)")
     p.add_argument("--fusion-guard", action="store_true",
                    help="Apply locked source-calibrated Fusion stripe correction (SWIR 8x2 RankCV only)")
     p.add_argument("--region-fixed-eval", action="store_true",
@@ -69,7 +73,7 @@ def parse_args():
 def validate_minority_flags(args):
     if args.global_minority_percent is None:
         if args.minority_policy != 'threshold':
-            raise ValueError('--minority-policy hybrid requires --global-minority-percent')
+            raise ValueError('Hybrid minority policies require --global-minority-percent')
         return
     if args.router != 'learned_router3_lineaware_rankcv':
         raise ValueError('--global-minority-percent requires RankCV Line-aware Router')
@@ -77,6 +81,8 @@ def validate_minority_flags(args):
         raise ValueError('Global Minority cannot be combined with Spatial Consistency or Fusion Guard')
     if not (0 < args.global_minority_percent < 50):
         raise ValueError('--global-minority-percent must be strictly between 0 and 50')
+    if not (0 <= args.three_expert_min_gap_percent < 100):
+        raise ValueError('--three-expert-min-gap-percent must be between 0 and 100')
 
 
 def launch_all_tests(args, spec):
@@ -131,11 +137,13 @@ def launch_all_tests(args, spec):
             common.append("--no-verify-region-batch")
         if args.force:
             common.append("--force")
+        common.extend(["--cache-mode", args.cache_mode])
         if args.spatial_consistency:
             common.append("--spatial-consistency")
         if args.global_minority_percent is not None:
             common.extend(["--global-minority-percent", str(args.global_minority_percent),
-                           "--minority-policy", args.minority_policy])
+                           "--minority-policy", args.minority_policy,
+                           "--three-expert-min-gap-percent", str(args.three_expert_min_gap_percent)])
         if args.fusion_guard:
             common.append("--fusion-guard")
         if args.region_fixed_eval:
@@ -226,10 +234,15 @@ else:
 RESULT_FOLDER = selected_results_folder(SPEC, ARGS.router) + (
     '__fixed_union_region' if ARGS.region_fixed_eval else '') + (
     '__spatialcv' if ARGS.spatial_consistency else '') + (
-    ('__minority' + ('hybrid' if ARGS.minority_policy == 'hybrid' else 'global') +
+    ('__minorityhybridgap' + format(ARGS.three_expert_min_gap_percent, 'g').replace('.', 'p')
+     + 'pp_two' + format(ARGS.global_minority_percent, 'g').replace('.', 'p') + 'pct'
+     if ARGS.minority_policy == 'hybrid_gap' else
+     '__minority' + ('hybrid' if ARGS.minority_policy == 'hybrid' else 'global') +
      format(ARGS.global_minority_percent, 'g').replace('.', 'p') + 'pct')
     if ARGS.global_minority_percent is not None else '') + ('__fusionguard' if ARGS.fusion_guard else '') + ( 
-    '__robustdonor' if DONOR_MATCH_MODE == 'robust' else '')
+    '__robustdonor' if DONOR_MATCH_MODE == 'robust' else '') + (
+    '__lazycachev1' if ARGS.cache_mode != 'off'
+    and ARGS.router == 'learned_router3_lineaware_rankcv' else '')
 OUTDIR = Path(config.RESULTS_DIR) / RESULT_FOLDER
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -285,6 +298,12 @@ def evaluate_worker(mask_files):
         print(f'[TPSSR][{DATASET}][GPU {RANK}] line-aware Region checkpoints verified', flush=True)
     cube, _, split, _ = load_dataset(DATASET)
     _, _, test_cube = split_blocks(cube, split)
+    cache_signature = None
+    if ARGS.router == 'learned_router3_lineaware_rankcv' and ARGS.cache_mode != 'off':
+        from src.routing_cache import MaskCache, source_signature
+        cache_signature = source_signature(pipeline, DATASET)
+        cache_root = Path(config.RESULTS_DIR) / '_expert_cache_v1'
+        print(f'[CACHE] mode={ARGS.cache_mode} root={cache_root}', flush=True)
 
     spatial_ck = None
     if ARGS.spatial_consistency:
@@ -381,9 +400,20 @@ def evaluate_worker(mask_files):
             if ARGS.global_minority_percent is not None:
                 predict_kwargs['global_minority_threshold'] = ARGS.global_minority_percent / 100.0
                 predict_kwargs['global_minority_policy'] = ARGS.minority_policy
+                predict_kwargs['three_expert_min_gap'] = ARGS.three_expert_min_gap_percent / 100.0
             if ARGS.fusion_guard:
                 predict_kwargs['fusion_guard'] = fusion_guard_ck
+            if cache_signature is not None:
+                cache = MaskCache(cache_root, cache_signature, mask_path, mask, coords,
+                                  mode=ARGS.cache_mode)
+                predict_kwargs['routing_cache'] = cache
             out = predictor(pipeline, test_cube, mask, coords, **predict_kwargs)
+            if cache_signature is not None:
+                region_status = ('HIT' if cache.region_hit else
+                                 'COMPUTED' if cache.region_used else 'NOT_NEEDED')
+                print(f'[CACHE][{DATASET}] {mask_path.name}: '
+                      f'features={"HIT" if cache.feature_hit else "COMPUTED"}, '
+                      f'Region={region_status}', flush=True)
             pred = out["prediction"]
             band_predictions = sparse_band_predictions(coords, pred)
             metrics = evaluate_reconstruction(
@@ -526,6 +556,8 @@ def evaluate_worker(mask_files):
         "spatial_consistency": bool(ARGS.spatial_consistency),
         "global_minority_percent": ARGS.global_minority_percent,
         "global_minority_policy": ARGS.minority_policy if ARGS.global_minority_percent is not None else 'off',
+        "three_expert_min_gap_percent": ARGS.three_expert_min_gap_percent,
+        "lazy_cache_mode": ARGS.cache_mode,
         "routing_parameters": __import__("src.routing_policy", fromlist=["policy_spec"]).policy_spec(),
         "spectral_backbone_checkpoint": str(pipeline.hybrid_backbone_checkpoint_path),
         "spectral_gate_checkpoint": str(pipeline.hybrid_gate_checkpoint_path),
@@ -612,6 +644,7 @@ def main_worker():
         print("Fusion Guard:", 'enabled' if ARGS.fusion_guard else 'disabled')
         print("Global Minority threshold (%):", ARGS.global_minority_percent)
         print("Results path:", OUTDIR)
+        print("Expert cache mode:", ARGS.cache_mode)
         if int(ARGS.max_masks) > 0:
             print("GLOBAL experiment mask budget:", int(ARGS.max_masks))
         print("=" * 94)

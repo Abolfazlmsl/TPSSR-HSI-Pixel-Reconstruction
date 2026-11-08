@@ -1244,13 +1244,16 @@ def _apply_sparse_fusion_guard(pipeline, cube, mask, coords, pixels, reverse,
 
 
 def rankcv_global_minority_choices(pixels, raw_choices, eligible, threshold=0.10,
-                                   counts_override=None, policy='threshold'):
+                                   counts_override=None, policy='threshold',
+                                   three_expert_min_gap=0.10):
     """Apply an observed-only, whole-mask routing policy once.
 
     threshold: replace every active expert whose share is <= threshold.
-    hybrid: if three experts are selected, remove the unique least-used
-    expert regardless of its share; if two are selected, remove the less-used
-    expert only when its share is strictly below threshold; if one, do nothing.
+    hybrid: remove a unique least-used expert whenever three are active.
+    hybrid_gap: with three active experts, remove the unique least-used only
+    if its share is at least three_expert_min_gap below the SECOND least-used.
+    Both hybrid policies use threshold only when two experts are active.
+    One selected expert is never changed.
     A tie for least-used expert is left unchanged to avoid arbitrary removal.
     Replacement favors the globally most common surviving, eligible expert.
     Counts concern damaged spatial pixels, never spectral voxels or GT values.
@@ -1265,6 +1268,8 @@ def rankcv_global_minority_choices(pixels, raw_choices, eligible, threshold=0.10
         raise ValueError('RankCV minority received an unknown expert choice')
     if not (0.0 < float(threshold) < 0.5):
         raise ValueError('Global minority threshold must be between 0 and 0.5')
+    if not (0.0 <= float(three_expert_min_gap) < 1.0):
+        raise ValueError('Three-expert minimum gap must be in [0, 1)')
     if not np.all(eligible[np.arange(n), original]):
         raise RuntimeError('RankCV selected an unavailable expert')
     if counts_override is None:
@@ -1277,13 +1282,16 @@ def rankcv_global_minority_choices(pixels, raw_choices, eligible, threshold=0.10
     active = [i for i in range(3) if counts[i] > 0]
     if policy == 'threshold':
         minority = {i for i in active if counts[i] / total <= threshold}
-    elif policy == 'hybrid':
+    elif policy in ('hybrid', 'hybrid_gap'):
         minority = set()
         if len(active) == 3:
-            least = min(int(counts[i]) for i in active)
-            lowest = [i for i in active if int(counts[i]) == least]
-            if len(lowest) == 1:
-                minority.add(lowest[0])
+            ordered = sorted(active, key=lambda i: (int(counts[i]), i))
+            smallest, second = ordered[:2]
+            unique_least = int(counts[smallest]) < int(counts[second])
+            sufficient_gap = ((int(counts[second]) - int(counts[smallest])) / total
+                              >= float(three_expert_min_gap))
+            if unique_least and (policy == 'hybrid' or sufficient_gap):
+                minority.add(smallest)
         elif len(active) == 2:
             less = min(active, key=lambda i: int(counts[i]))
             if int(counts[less]) / total < threshold:
@@ -1310,7 +1318,8 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
                                  region_full_eval=False, spatial_consistency=None,
                                  fusion_guard=None, global_minority_threshold=None,
                                  global_minority_counts=None, routing_only=False,
-                                 global_minority_policy='threshold'):
+                                 global_minority_policy='threshold',
+                                 three_expert_min_gap=0.10, routing_cache=None):
     """Three-way learned routing; no V2 component routing or band-guard policy."""
     from training.neighbor_fusion import crop_at
     from training.three_expert_router import features_for_pixel, predict_risks
@@ -1330,24 +1339,39 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
     wave = np.asarray(np.load(Path(config.PROCESSED_DATA_ROOT) /
                        str(config.TEST_DATASET_FOLDER) / 'wavelengths_nm.npy'), np.float32)
     pixels, reverse = np.unique(coords[:,:2], axis=0, return_inverse=True)
-    x, interp_all, fusion_all = [], [], []
-    # Compute only observed-only features; the reference truth is not queried.
-    for y, xx in pixels:
-        patch, damaged, cy, cx = crop_at(cube, mask, int(y), int(xx), radius=35)
-        feat, interp, fusion = features_for_pixel(
-            patch, damaged, cy, cx, pipeline.hybrid_mean, pipeline.hybrid_std,
-            wave, pipeline.fusion_model, pipeline.hybrid_model, pipeline.device)
-        x.append(feat)
-        interp_all.append(interp)
-        fusion_all.append(fusion)
-    eligible = np.asarray([[a is not None, b is not None, True]
-                           for a,b in zip(interp_all,fusion_all)], bool)
-    if pipeline.router3_checkpoint.get('architecture') == 'spectral_binary_router_with_region_fallback_v1':
-        from training.three_expert_router import predict_binary_risks
-        risks = predict_binary_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
+    base_cache = (routing_cache.load_features(pixels, cube.shape[-1])
+                  if routing_cache is not None and not routing_only else None)
+    if base_cache is not None:
+        eligible = base_cache['eligible'].astype(bool)
+        risks = base_cache['risks']
+        independent_decisions = base_cache['raw_choices'].astype(np.int64)
+        interp_all = [base_cache['interp'][i] if eligible[i, 0] else None
+                      for i in range(len(pixels))]
+        fusion_all = [base_cache['fusion'][i] if eligible[i, 1] else None
+                      for i in range(len(pixels))]
     else:
-        risks = predict_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
-    independent_decisions = np.argmin(risks, axis=1)
+        x, interp_all, fusion_all = [], [], []
+        # Compute only observed-only features; the reference truth is not queried.
+        for y, xx in pixels:
+            patch, damaged, cy, cx = crop_at(cube, mask, int(y), int(xx), radius=35)
+            feat, interp, fusion = features_for_pixel(
+                patch, damaged, cy, cx, pipeline.hybrid_mean, pipeline.hybrid_std,
+                wave, pipeline.fusion_model, pipeline.hybrid_model, pipeline.device)
+            x.append(feat)
+            interp_all.append(interp)
+            fusion_all.append(fusion)
+        eligible = np.asarray([[a is not None, b is not None, True]
+                               for a,b in zip(interp_all,fusion_all)], bool)
+        if pipeline.router3_checkpoint.get('architecture') == 'spectral_binary_router_with_region_fallback_v1':
+            from training.three_expert_router import predict_binary_risks
+            risks = predict_binary_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
+        else:
+            risks = predict_risks(pipeline.router3_checkpoint, np.stack(x), eligible)
+        independent_decisions = np.argmin(risks, axis=1)
+        if routing_cache is not None and not routing_only:
+            routing_cache.save_features(
+                pixels, eligible, risks, independent_decisions,
+                interp_all, fusion_all, cube.shape[-1])
     if routing_only:
         # Only observed-band features and learned RankCV risks are evaluated.
         # Region reconstruction is deliberately skipped during the distributed
@@ -1361,7 +1385,8 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
     if global_minority_threshold is not None:
         decisions = rankcv_global_minority_choices(
             pixels, independent_decisions, eligible, global_minority_threshold,
-            counts_override=global_minority_counts, policy=global_minority_policy)
+            counts_override=global_minority_counts, policy=global_minority_policy,
+            three_expert_min_gap=three_expert_min_gap)
     elif spatial_consistency is None:
         decisions = independent_decisions
     else:
@@ -1380,27 +1405,40 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
         prediction[i] = source[band]
     region_indices = np.flatnonzero(selected == 2)
     if region_indices.size:
-        # The counterfactual cache computes Region on the full, fixed evaluation
-        # coordinate union.  Using the same support fixes tile centres and makes
-        # Region predictions independent of the Router's selected subset.
+        # The topology inference tiles large connected defects around the
+        # requested coordinates. Reuse a previous Region result ONLY if the
+        # whole requested coordinate set (and tiling settings) is identical.
+        # Per-pixel Region cache reuse across different sets would be wrong.
         region_input_coords = coords if region_full_eval else coords[region_indices]
-        reconstructed, _ = reconstruct_final_region(
-            pipeline.topology_model, pipeline.topology_checkpoint,
-            pipeline.geometry_model, cube, mask, pipeline.device,
-            eval_coords=region_input_coords, batch_size=pipeline.region_batch,
-            verify_batch=pipeline.verify_region_batch,
-            progress_desc=region_progress or 'Learned Router3 Region')
-        region_lookup = {(int(y),int(xx),int(b)):float(val)
-                         for b,(yx, values) in reconstructed.items()
-                         for (y,xx),val in zip(yx,values)}
-        for i in region_indices:
-            prediction[i] = region_lookup.get(tuple(map(int,coords[i])),np.nan)
-        if pipeline.router3_checkpoint.get('region_expert', 'raw') in ('refined', 'lineaware'):
-            from training.three_expert_router import refine_region
-            prediction[region_indices], n_refined = refine_region(
-                cube, mask, coords[region_indices], prediction[region_indices])
+        cache_hit = (routing_cache.load_region(
+            coords[region_indices], region_input_coords, region_full_eval,
+            pipeline.region_batch, pipeline.verify_region_batch)
+            if routing_cache is not None else None)
+        if cache_hit is not None:
+            prediction[region_indices], n_refined = cache_hit
         else:
-            n_refined = 0
+            reconstructed, _ = reconstruct_final_region(
+                pipeline.topology_model, pipeline.topology_checkpoint,
+                pipeline.geometry_model, cube, mask, pipeline.device,
+                eval_coords=region_input_coords, batch_size=pipeline.region_batch,
+                verify_batch=pipeline.verify_region_batch,
+                progress_desc=region_progress or 'Learned Router3 Region')
+            region_lookup = {(int(y),int(xx),int(b)):float(val)
+                             for b,(yx, values) in reconstructed.items()
+                             for (y,xx),val in zip(yx,values)}
+            for i in region_indices:
+                prediction[i] = region_lookup.get(tuple(map(int,coords[i])),np.nan)
+            if pipeline.router3_checkpoint.get('region_expert', 'raw') in ('refined', 'lineaware'):
+                from training.three_expert_router import refine_region
+                prediction[region_indices], n_refined = refine_region(
+                    cube, mask, coords[region_indices], prediction[region_indices])
+            else:
+                n_refined = 0
+            if routing_cache is not None and np.isfinite(prediction[region_indices]).all():
+                routing_cache.save_region(
+                    coords[region_indices], region_input_coords, region_full_eval,
+                    pipeline.region_batch, pipeline.verify_region_batch,
+                    prediction[region_indices], n_refined)
     else:
         n_refined = 0
     fusion_guard_audit = dict(fusion_guard_enabled=0,
@@ -1458,6 +1496,9 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
         candidate_method_voxels={key:int(np.sum(selected==i)) for i,key in enumerate(
             ('router3_interp','router3_fusion','router3_region'))},
         candidate_policy_audit=dict(
+            lazy_cache_features_hit=int(bool(routing_cache and routing_cache.feature_hit)),
+            lazy_cache_region_hit=int(bool(routing_cache and routing_cache.region_hit)),
+            lazy_cache_region_used=int(bool(routing_cache and routing_cache.region_used)),
             learned_router3=1,learned_three_expert_decisions=int(len(pixels)),
             router3_interp_pixels=int(np.sum(decisions==0)),
             router3_fusion_pixels=int(np.sum(decisions==1)),
@@ -1475,6 +1516,9 @@ def predict_mask_learned_router3(pipeline, test_cube, mask, eval_coords,
             global_minority_policy=(global_minority_policy if global_minority_threshold is not None else 'off'),
             global_minority_threshold_percent=(float(global_minority_threshold)*100.0
                                                if global_minority_threshold is not None else 0.0),
+            global_minority_three_expert_gap_percent=(float(three_expert_min_gap)*100.0
+                                                     if global_minority_policy == 'hybrid_gap'
+                                                     and global_minority_threshold is not None else 0.0),
             global_minority_changed_pixels=int(np.count_nonzero(
                 decisions != independent_decisions)) if global_minority_threshold is not None else 0,
             **fusion_guard_audit),

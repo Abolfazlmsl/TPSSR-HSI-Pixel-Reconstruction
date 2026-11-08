@@ -344,14 +344,15 @@ def spectral_validation_cores(spec: ExperimentSpec) -> tuple[str, str]:
 
 
 def selected_lineaware_region(spec: ExperimentSpec, router: str) -> bool:
-    """True only for the evaluated final SWIR 8x2 learned-router configuration."""
+    """Select split-specific Line-aware checkpoints for final TPSSR routing."""
     if router in ('learned_router3_lineaware', 'learned_router3_lineaware_mse', 'learned_router3_lineaware_rankcv', 'learned_router3_lineaware_regretcv', 'learned_router2_lineaware'):
         allowed = {
             ('SWIR5','SWIR10'): ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9'),
             ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10'): ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5'),
             ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5'): ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10'),
+            ('VNIR5','VNIR10'): ('VNIR1','VNIR2','VNIR3','VNIR4','VNIR6','VNIR7','VNIR8','VNIR9'),
         }
-        return spec.sensor == 'SWIR' and spec.train == allowed.get(spec.tests)
+        return spec.train == allowed.get(spec.tests)
     if router != 'learned_router3_aligned':
         return False
     swir8 = (spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')
