@@ -69,7 +69,7 @@ def test_fixed_protocol_result_folder_is_not_legacy_folder():
 
 def test_score_summary_measures_coverage_from_files(tmp_path, monkeypatch):
     import csv
-    import router_expert_cache as cache
+    from tools import router_expert_cache as cache
     spec = SimpleNamespace(tests=('SWIR1',), experiment_name='exp')
     monkeypatch.setattr(cache, 'cache_root', lambda spec: tmp_path)
     values = [dict(router='rankcv', dataset='SWIR1', count=2, filled_voxels=2,

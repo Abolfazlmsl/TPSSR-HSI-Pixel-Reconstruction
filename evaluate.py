@@ -70,6 +70,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     add_experiment_args(parser)
     parser.add_argument("--visuals", type=int, default=3)
+    parser.add_argument("--results-folder", default=None,
+                        help="Exact result directory from test.py, including routing suffixes")
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--region-batch", type=int, default=32)
     parser.add_argument("--crop-size", type=int, default=128)
@@ -80,13 +82,17 @@ def parse_args():
     return parser.parse_args()
 
 
-def results_folder(spec, router, region_fixed_eval=False):
+def results_folder(spec, router, region_fixed_eval=False, override=None):
+    if override is not None:
+        if Path(override).name != override or override in (".", ".."):
+            raise ValueError("--results-folder must be a single directory name")
+        return override
     return selected_results_folder(spec, router) + (
         '__fixed_union_region' if region_fixed_eval else '')
 
 
-def combine(spec, router="v23", region_fixed_eval=False) -> None:
-    folder = results_folder(spec, router, region_fixed_eval)
+def combine(spec, router="v23", region_fixed_eval=False, results_override=None) -> None:
+    folder = results_folder(spec, router, region_fixed_eval, results_override)
     all_rows = []
     seen = set()
     for dataset in spec.tests:
@@ -149,7 +155,7 @@ def evaluate_one(spec, args):
     globals().update(load_dataset=load_dataset, split_blocks=split_blocks,
                      list_mask_files=list_mask_files, load_test_mask=load_test_mask,
                      load_pipeline=load_pipeline, predict_mask=predict_mask)
-    OUTDIR = Path(config.RESULTS_DIR) / results_folder(spec, args.router, args.region_fixed_eval)
+    OUTDIR = Path(config.RESULTS_DIR) / results_folder(spec, args.router, args.region_fixed_eval, args.results_folder)
     METRICS = OUTDIR / "test_metrics.csv"
     VISDIR = OUTDIR / "visuals"
     if not METRICS.exists():
@@ -331,8 +337,10 @@ def main():
                    "--router", args.router, "--single"]
         if args.region_fixed_eval:
             command.append('--region-fixed-eval')
+        if args.results_folder is not None:
+            command.extend(["--results-folder", args.results_folder])
         subprocess.run(command, cwd=ROOT, env=env_for(spec, dataset), check=True)
-    combine(spec, args.router, args.region_fixed_eval)
+    combine(spec, args.router, args.region_fixed_eval, args.results_folder)
 
 
 if __name__ == "__main__":

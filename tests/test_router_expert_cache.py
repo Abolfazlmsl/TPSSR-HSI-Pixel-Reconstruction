@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import router_expert_cache as cache
+from tools import router_expert_cache as cache
 
 
 class FakeRegressor:

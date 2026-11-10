@@ -30,14 +30,6 @@ METHODS = {
         CORE / "reconstruction_methods" / "pca" / "train.py",
         CORE / "reconstruction_methods" / "pca" / "test.py",
     ),
-    "random_forest": (
-        CORE / "reconstruction_methods" / "random_forest" / "train.py",
-        CORE / "reconstruction_methods" / "random_forest" / "test.py",
-    ),
-    "pca_spatial": (
-        CORE / "reconstruction_methods" / "pca" / "train_spatial.py",
-        CORE / "reconstruction_methods" / "pca" / "test_spatial.py",
-    ),
     "random_forest_multiscale": (
         CORE / "reconstruction_methods" / "random_forest" / "train_multiscale.py",
         CORE / "reconstruction_methods" / "random_forest" / "test_multiscale.py",

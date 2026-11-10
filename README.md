@@ -1,163 +1,209 @@
-# TPSSR — Hyperspectral Pixel Reconstruction
+# TPSSR: Hyperspectral Pixel Reconstruction
 
-This source distribution uses the **Learned Router3 Aligned + Line-aware Region** configuration selected after the 200-mask SWIR 8×2 comparison. It combines three reconstruction experts: spectral interpolation, a learned spectral–neighbor fusion model, and geometry/topology-based Region reconstruction. A source-trained quality router selects among eligible experts using observed information only.
+**Missing-pixel reconstruction for hyperspectral sediment-core images.**
 
-The model also retains the frozen band-gated CNN/Transformer backbone and the refined Region output. The candidate Adaptive spectral gate and experimental Region Spectral Guidance are **not** included in the selected inference route.
+TPSSR combines three reconstruction experts with a learned, pixel-level expert
+router to recover missing or corrupted reflectance values while preserving
+sedimentary structures.
 
-## Installation without losing previous experiments
+The three experts are **Spectral Interpolation**, **Learned Neighbor Fusion**, and
+**Geometry/Topology-guided Region Reconstruction**. A learned RankCV router
+selects among them. The framework supports VNIR and SWIR imagery, including
+missing detector lines and large spatial–spectral defects.
 
-This is a **code-only distribution**. It does **not** contain `processed_data/`, `trained_models/`, `simulated_saturation/`, `input_raw/`, or `results/`. Checkpoint and result folders must remain in place. Save a backup of the running project before extracting this archive into the same project directory; files with matching code paths can replace the old versions.
+## Features
 
-No migration or download of checkpoint files is performed. For SWIR 8×2 inference, the
-selected Region files must already exist locally under
-`trained_models/<experiment>/tpssr/region_lineaware_trial_v1/geometry_swir5/best_model.pt`
-and `.../topology_swir5/best_model.pt`. The directory name is historical: these are
-the accepted Line-aware weights. The original `geometry_swir5` and
-`topology_swir5` files must also be retained because the frozen Router checkpoint
-verifies their identities before the line-aware weights are loaded.
-Other presets continue to use their independently trained Region checkpoints.
+- Ten synthetic corruption scenarios at five severity levels.
+- Split-aware training and evaluation with 200 test masks per experiment.
+- SWIR and VNIR experiments, including cross-region transfer.
+- Comparison with Spectral, Spatial, Spatio-Spectral, PCA, multiscale RF, DDS2M and PFGIN.
+- Visual reconstruction of selected regions and real missing SWIR detector lines.
+- RMSE, MAE, R² and spectral angle (SAM) evaluation.
 
-No migration of checkpoint files is performed. Checkpoints from different splits (SWIR 8×2, A→B, B→A) must not be exchanged. The existing experiment folders should remain intact, including the six-core shadow Region checkpoints used during router calibration.
+## Project structure
 
-The archived source has no cached bytecode, diagnostic probe scripts, or stored DDS2M trial logs. The independently authored external baseline implementations remain under `external/` with their documentation and must retain applicable attribution and licenses.
+```text
+TPSSR-HSI-Pixel-Reconstruction/
+├── tpssr.py                    # Main command-line entry point
+├── train.py                    # TPSSR training stages
+├── train_region_lineaware.py   # Geometry/topology expert training
+├── test.py                     # Evaluation on fixed synthetic masks
+├── prepare_dataset.py         # Reflectance calibration and mask generation
+├── evaluate.py                 # Results aggregation and optional figures
+├── benchmarks.py              # Five classical/reference benchmarks
+├── external_methods.py        # PFGIN and DDS2M adapters
+├── preflight.py                # Data and checkpoint checks
+├── experiment_config.py       # Data splits
+├── training/                    # Spectral, fusion and router training
+├── core/                        # Reconstruction models and evaluation code
+├── tools/                       # Figures, ROI and real-line reconstruction
+├── tests/                       # CPU-only regression tests
+├── docs/                        # Method and dependency notes
+├── external/                    # Cloned upstream methods (not tracked)
+├── input_raw/                   # Your source acquisitions (not tracked)
+├── processed_data/              # Prepared arrays (not tracked)
+├── trained_models/              # Checkpoints (not tracked)
+└── results/                     # Evaluation outputs (not tracked)
+```
 
-## Dataset splits
+## Installation
 
-| Preset | Source acquisitions | Held-out test acquisitions | Source calibration/validation acquisitions |
-|---|---|---|---|
-| `swir_8x2` | SWIR1–4 and SWIR6–9 | **SWIR5, SWIR10** | SWIR4, SWIR9 |
-| `swir_region_a_to_b` | SWIR1–5 | SWIR6–10 | SWIR4, SWIR5 |
-| `swir_region_b_to_a` | SWIR6–10 | SWIR1–5 | SWIR9, SWIR10 |
-| `vnir_8x2` | VNIR1–4 and VNIR6–9 | VNIR5, VNIR10 | VNIR4, VNIR9 |
-
-Under `swir_8x2`, the Router's auxiliary (shadow) Region experts are fitted on SWIR1–3 and SWIR6–8; their held-out source calibration cores are SWIR4 and SWIR9. **SWIR5 and SWIR10 never enter this fit.** The original eight-source Region model and the separately trained spectral models are retained. The Router's training labels use a refined Region prediction produced by the shadow model.
-
-For the main SWIR 8×2 test, a total budget of **200 masks** means **100 masks for SWIR5 and 100 for SWIR10**, not 200 for each. Preserve the existing deterministic mask files when conducting paired comparisons.
-
-## Verify the selected model (two GPUs)
-
-Run these commands at the project root, in the environment used for the accepted TPSSR checkpoints:
+Designed for Linux, Python 3.10+ and CUDA-capable PyTorch.
+Install the PyTorch build compatible with your GPU, then:
 
 ```bash
-python preflight.py --preset swir_8x2
-python test.py --preset swir_8x2 --router learned_router3_aligned --gpus 2 --max-masks 200
-python evaluate.py --preset swir_8x2 --router learned_router3_aligned --visuals 0
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-`preflight.py` checks the trained Line-aware and original Region checkpoints,
-as well as the learned fusion and three-expert router. The final inference uses
-Line-aware Geometry/Topology for SWIR 8×2 after validating the frozen Router
-against the original checkpoints. If Line-aware weights are missing, inference
-fails explicitly rather than reverting silently. The `test.py` and `evaluate.py` commands require `--router learned_router3_aligned`: the baseline V2.3 inference mode is still available explicitly for historical comparisons.
-
-The combined outputs are written under:
-
-```
-results/swir__train_1-2-3-4-6-7-8-9__test_5-10/combined/tpssr_learned_router3_aligned_lineaware/
-```
-
-Do not use `--force` unless the intention is to overwrite completed mask-level results.
-
-## Reuse the completed Line-aware 200-mask experiment
-
-There is no need to recompute the completed 200 masks merely to move them to
-the production result folder. For each of SWIR5 and SWIR10, copy the completed
-`test_metrics.csv`, rank shards and component decisions from the previous
-`tpssr_learned_router3_aligned_lineaware_region_exploratory/` folder into the
-new `tpssr_learned_router3_aligned_lineaware/` folder. Do not move/delete
-the earlier folder. Then run:
+For the regression tests:
 
 ```bash
-python evaluate.py --preset swir_8x2 --router learned_router3_aligned --visuals 0
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
-Only reuse those files when they were generated by the exact checked Line-aware
-Geometry/Topology pair and the same 200 deterministic test masks. Otherwise
-run `test.py` explicitly. Keep the original `tpssr_learned_router3_aligned/`
-results untouched. See `LINEAWARE_RELEASE.md` for commands.
+No data or trained TPSSR checkpoints are included in the source release.
 
-## Training on other splits
+## Prepare the data
 
-Use the existing split presets. Do **not** use the SWIR 8×2 Region weights for
-A→B, B→A, VNIR or a different spectral grid. Existing accepted model weights
-are preserved by default. To train an independent Line-aware Region with the
-same architecture and losses in its own checkpoint directory:
+Put the raw acquisitions under `input_raw/SWIR1`, ..., `input_raw/SWIR10`
+(and/or `VNIR1`, ..., `VNIR10`). Each acquisition needs the original ENVI data
+and its corresponding white and dark reference files. The loader discovers
+matching `.hdr` files; consult `core/src/envi_io.py` for the supported layout.
+
+Prepare the main SWIR experiment:
 
 ```bash
-python train_region_lineaware.py --preset swir_region_a_to_b --gpus 2 --dry-run
-python train_region_lineaware.py --preset swir_region_a_to_b --gpus 2
+python tpssr.py prepare --preset swir_8x2
+python tpssr.py preflight --preset swir_8x2 --data-only
 ```
 
-Replace `swir_region_a_to_b` with `swir_region_b_to_a` or `vnir_8x2` as
-appropriate. Both Geometry and Topology are trained with two GPUs, sequentially.
-The per-epoch training sample count scales with the number of training images:
-Geometry `550 * n_train`, Topology `1050 * n_train` by default. A hard-line
-sampling probability of 0.35, 200 dedicated hard validation samples, and an
-additional 0.25 weight for hard-validation checkpoint selection are defaults.
-All settings can be adjusted via the command-line options of
-`train_region_lineaware.py`. This protocol has been validated empirically only
-on the SWIR 8×2 data, **not** automatically on other splits or sensors.
+The preparation step writes `calibrated_reflectance.npy`, `invalid_mask.npy`
+and `wavelengths_nm.npy` under each `processed_data/<dataset>/`, and writes
+reproducible benchmark masks under `simulated_saturation/`.
 
-Other split checkpoints are not promoted to final inference automatically:
-first compare the newly trained Region on validation/source-only masks, check
-model provenance, and re-assess the router fitted against the original Region.
-For a new dataset beyond the named presets, extend dataset registration and the
-train/test split definitions before training and ensure all images have a
-compatible spectral grid.
+## Train TPSSR
 
-## Reference methods and paired comparisons
-
-The source tree retains the classical/reference benchmark entrypoints and the wrappers for PFGIN and DDS2M. Existing baseline runs should be reused rather than recomputed without a specific reason.
+For a new experiment, train its components in sequence:
 
 ```bash
-python benchmarks.py --preset swir_8x2 --method spectral --stage test --max-masks 200
-python plot_method_comparison.py --experiment-dir results/swir__train_1-2-3-4-6-7-8-9__test_5-10
+python tpssr.py train --preset swir_8x2 --stage all
+python tpssr.py train-region --preset swir_8x2
+python tpssr.py train --preset swir_8x2 --stage fusion
+python tpssr.py train --preset swir_8x2 --stage router3_lineaware
+python tpssr.py train --preset swir_8x2 --stage router3_lineaware_rankcv
 ```
 
-For the manual-gated comparator, use the same masks:
+The RankCV stage uses **source-only calibration labels** generated during the
+preceding router-training stage. Do not fit a router with held-out test data.
+Accepted checkpoints are reused rather than silently overwritten. The main
+training path uses **two GPUs**; training a model from scratch is substantial.
+
+If you already have the correctly trained models, restore the corresponding
+`trained_models/<experiment>/` folders and skip training.
+
+## Test and evaluate
 
 ```bash
-python test.py --preset swir_8x2 --router learned_fusion_guarded --gpus 2 --max-masks 200
-python evaluate.py --preset swir_8x2 --router learned_fusion_guarded --visuals 0
+python tpssr.py preflight --preset swir_8x2
+python tpssr.py test --preset swir_8x2
+python tpssr.py evaluate --preset swir_8x2 --visuals 0
 ```
 
-**Reference results from the completed 200-mask SWIR 8×2 tests (macro-averaged per mask):**
+`test` uses the final learned RankCV router, robust neighbor matching,
+hybrid-gap policy (10 percentage points), a 10% two-expert threshold, and
+lazy expert caching. It evaluates **200 masks in total**, shared across the
+held-out images. Use `--gpus 2` for the default two-GPU workflow.
 
-| Mode | RMSE | Coverage |
-|---|---:|---:|
-| TPSSR V2.3 | 0.007788 | 100% |
-| Learned Fusion Guarded (manual branch selection) | 0.005106 | 100% |
-| Learned Router3 Aligned (original Region) | 0.005119 | 100% |
-| **Learned Router3 Aligned + Line-aware Region** | **0.004935** | **100%** |
+The evaluation command reads the corresponding final result folder, including
+its routing-policy suffix. It aggregates metrics without regenerating images by
+default (`--visuals 0`); use the ROI tools for publication figures.
 
-The learned router with Line-aware Region achieved a lower macro-RMSE on
-this 200-mask protocol than the previously tested manual selector. Both sets of
-results were examined during iterative model development, so this is not an
-entirely untouched prospective holdout. The learned router is preferred for the selected architecture because branch selection is data-driven. Report the statistical protocol honestly: SWIR5 and SWIR10 are separate from weight fitting in the final 8×2 run, but their earlier results informed architecture development. This is **not** a never-seen independent dataset.
+## Other experiments
 
-Reported RMSE, MAE, R² and SAM aggregates in `COMBINED_SUMMARY.txt` are means of valid per-mask metrics, not voxel-pooled quantities. A method with incomplete coverage cannot be compared as if it made the same predictions as a 100%-coverage method. For the final paper, compare identical masks and common reconstructed voxels where relevant. TPSSR SSIM is reported only when its mask-specific calculation is valid.
+| Preset | Training images | Held-out test images |
+|---|---|---|
+| `swir_8x2` | SWIR1–4, SWIR6–9 | SWIR5, SWIR10 |
+| `swir_region_a_to_b` | SWIR1–5 | SWIR6–10 |
+| `swir_region_b_to_a` | SWIR6–10 | SWIR1–5 |
+| `vnir_8x2` | VNIR1–4, VNIR6–9 | VNIR5, VNIR10 |
 
-## Code map
+Replace the preset in the commands above to run another experiment. The same
+trained model is shared across the held-out acquisitions in a given split.
 
-- `train.py`: accepted spectral, base Geometry/Topology, neighbor fusion, and three-expert Router training.
-- `train_region_lineaware.py`: separate, non-overwriting Line-aware Region training for configured splits.
-- `core/src/lineaware_region.py`: validated SWIR 8×2 Line-aware checkpoint loading.
-- `training/neighbor_fusion.py`: learned spectral and local-donor fusion.
-- `training/three_expert_router.py`: source-only Router data/labels, fitting and checkpoint verification.
-- `core/src/pipeline.py`: frozen experts and selected inference routes.
-- `core/src/spatial_inference.py`: Geometry/Topology Region inference.
-- `test.py`: mask-level reconstruction and progress reporting (final router is default).
-- `visualize_tpssr_roi_with_region_maps.py`: draggable fixed ROI and mask inspection using the trained model.
-- `evaluate.py`: per-acquisition and combined metric summaries and visuals.
-- `preflight.py`: data and checkpoint layout validation.
-- `benchmarks.py`, `external_methods.py`: benchmark tools, not part of the final learned Router.
+## Benchmark methods
 
-## Software checks
+Five non-deep-learning baselines are included. `RF` is the multiscale
+spatio-spectral Random Forest, while `PCA` uses spectral PCA only.
 
 ```bash
-python -m compileall -q train.py test.py evaluate.py training core
-python -m pytest -q tests
-python train.py --preset swir_8x2 --stage router3_aligned --gpus 2 --dry-run
+python tpssr.py benchmarks --preset swir_8x2 --method all --stage both --max-masks 200
 ```
 
-These checks validate syntax, selected interfaces and the training plan. They do **not** reproduce the numerical results without the exact processed data, masks, checkpoints and server environment.
+PFGIN and DDS2M are optional and computationally expensive. Install the
+upstream repositories before running them:
+
+```bash
+python core/reconstruction_methods/pfgin/setup_official.py
+python core/reconstruction_methods/dds2m/setup_official.py
+python tpssr.py external --preset swir_8x2 --method all --stage both --max-masks 200
+```
+
+Read [Third-party methods](docs/THIRD_PARTY.md) for sources and licensing.
+
+## Figures and real missing lines
+
+To compare reconstructed ROIs in the benchmark:
+
+```bash
+python tpssr.py roi --preset swir_8x2 --dataset SWIR5 \
+  --scenario whole_spectrum_pixels --severity 5 --methods all --gpus 2
+```
+
+For a candidate list of genuine missing SWIR lines:
+
+```bash
+python tpssr.py real-lines --list-only
+```
+
+To reconstruct two selected lines and save full-band before/after images:
+
+```bash
+python tpssr.py real-lines --datasets SWIR5 SWIR10 \
+  --band-swir5 141 --line-x-swir5 141 \
+  --band-swir10 35 --line-x-swir10 183 --gpus 2 --dpi 400
+```
+
+The line tool preserves observed pixels and uses the same display settings
+for each before/after pair. It saves separate two-dimensional PNG/TIFF files.
+Real missing pixels have no ground truth, so no RMSE is reported for them.
+
+Other tools in `tools/` export hyperspectral cube figures, scenario boxplots
+and consolidated results. For example:
+
+```bash
+python tpssr.py boxplots --excel TPSSR_FINAL_ALL_RESULTS.xlsx \
+  --split SWIR_8x2 --outdir figures/scenario_boxplots --dpi 400
+```
+
+## Outputs and reproducibility
+
+`results/<experiment>/<test-image>/` stores reconstruction metrics. Published
+comparisons should distinguish per-method valid coverage from the shared-mask
+subset. The project reports RMSE, MAE, R² and SAM; SSIM is not used in the
+main numerical results.
+
+The scripts use the original image split and fixed synthetic-mask protocol.
+Default values are set in `core/config.py` and `experiment_config.py`.
+Because model weights and raw acquisitions are not distributed here, numeric
+paper results cannot be reproduced from this source archive alone.
+
+## License and citation
+
+Original TPSSR code is released under the [MIT License](LICENSE).
+For PFGIN and DDS2M, follow their upstream licenses and citation requirements.
+
+If you use this repository in research, please cite the associated TPSSR paper
+when it becomes available. Publication metadata can be added here after release.
