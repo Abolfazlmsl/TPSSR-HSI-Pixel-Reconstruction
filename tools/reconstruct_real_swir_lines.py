@@ -649,7 +649,9 @@ def raw_calibrated_display_band(dataset, target_band, shape, raw_dir):
     root = raw_dir if raw_dir is not None else ROOT / "input_raw"
     if raw_dir is None and not root.exists():
         root = ROOT / "Input_raw"
-    dataset_dir = root / dataset
+    dataset_dir = next((p for p in (root / "test" / dataset,
+                                   root / "train" / dataset,
+                                   root / dataset) if p.is_dir()), root / dataset)
     headers = sorted(dataset_dir.rglob("*.hdr")) + sorted(dataset_dir.rglob("*.HDR"))
     main_hdr = [p for p in headers if "whiteref" not in p.name.lower()
                 and "darkref" not in p.name.lower()]

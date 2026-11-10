@@ -48,7 +48,7 @@ def main():
     # The fixed preset requires no environment overrides from earlier custom runs.
     old = {k: os.environ.pop(k, None) for k in (
         "HSI_TRAIN_DATASETS", "HSI_TEST_DATASETS", "HSI_ACTIVE_TEST_DATASET",
-        "HSI_EXPERIMENT_NAME", "HSI_TEST_DATASET")}
+        "HSI_EXPERIMENT_NAME", "HSI_TEST_DATASET")} if a.preset not in (None, "custom") and not a.from_folders else {}
     try:
         spec = resolve_experiment(a)
     finally:

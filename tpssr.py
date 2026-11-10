@@ -20,6 +20,7 @@ COMMANDS = {
     "evaluate": "evaluate.py",
     "benchmarks": "benchmarks.py",
     "external": "external_methods.py",
+    "setup-external": "setup_external.py",
     "roi": "tools/visualize_roi_benchmark_comparison.py",
     "real-lines": "tools/reconstruct_real_swir_lines.py",
     "cube": "tools/render_hsi_cube_front.py",

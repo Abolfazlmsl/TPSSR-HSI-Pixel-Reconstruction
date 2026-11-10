@@ -20,8 +20,8 @@ def require_official_repo(config):
     missing = [p for p in required if not p.exists()]
     if missing:
         raise FileNotFoundError(
-            "Official PFGIN was not found. Run this first:\n"
-            "python reconstruction_methods/pfgin/setup_official.py\n\n"
+            "PFGIN is not installed under external/PFGIN. "
+            "Run: python tpssr.py setup-external\n\n"
             + "\n".join(str(p) for p in missing)
         )
     return repo

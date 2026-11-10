@@ -30,8 +30,11 @@ def checkpoint_paths(*, full_split=False):
         tuple(config.TRAIN_DATASET_FOLDERS) ==
         ('VNIR1','VNIR2','VNIR3','VNIR4','VNIR6','VNIR7','VNIR8','VNIR9'))
     if not (swir8 or a2b or b2a or vnir8):
-        raise RuntimeError('No configured line-aware Region for this split')
-    tag = 'vnir5' if vnir8 else ('swir5' if swir8 else ('swir6' if a2b else 'swir1'))
+        if __import__('os').environ.get('HSI_INPUT_LAYOUT') != 'folders':
+            raise RuntimeError('No configured line-aware Region for this split')
+        tag = str(config.TEST_DATASET_FOLDER).lower()
+    else:
+        tag = 'vnir5' if vnir8 else ('swir5' if swir8 else ('swir6' if a2b else 'swir1'))
     root = Path(config.MODELS_DIR) / 'tpssr' / TRIAL_NAME
     return (root / f'geometry_{tag}' / 'best_model.pt',
             root / f'topology_{tag}' / 'best_model.pt')

@@ -1,209 +1,190 @@
-# TPSSR: Hyperspectral Pixel Reconstruction
+# TPSSR — Hyperspectral Pixel Reconstruction
 
-**Missing-pixel reconstruction for hyperspectral sediment-core images.**
+**Recover missing and corrupted reflectance values in hyperspectral images.**
 
-TPSSR combines three reconstruction experts with a learned, pixel-level expert
-router to recover missing or corrupted reflectance values while preserving
-sedimentary structures.
+TPSSR (Texture-Preserving Spatio-Spectral Reconstruction) combines spectral interpolation, learned neighbor fusion, and geometry/topology-guided region reconstruction. A **learned router** selects the reconstruction expert for each target pixel.
 
-The three experts are **Spectral Interpolation**, **Learned Neighbor Fusion**, and
-**Geometry/Topology-guided Region Reconstruction**. A learned RankCV router
-selects among them. The framework supports VNIR and SWIR imagery, including
-missing detector lines and large spatial–spectral defects.
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue) ![PyTorch](https://img.shields.io/badge/PyTorch-CUDA-orange) ![License](https://img.shields.io/badge/License-MIT-green)
 
-## Features
+## ✨ Features
 
-- Ten synthetic corruption scenarios at five severity levels.
-- Split-aware training and evaluation with 200 test masks per experiment.
-- SWIR and VNIR experiments, including cross-region transfer.
-- Comparison with Spectral, Spatial, Spatio-Spectral, PCA, multiscale RF, DDS2M and PFGIN.
-- Visual reconstruction of selected regions and real missing SWIR detector lines.
+- Three complementary reconstruction experts with a trained, pixel-level router.
+- Ten synthetic corruption patterns, each with five severity levels.
 - RMSE, MAE, R² and spectral angle (SAM) evaluation.
 
-## Project structure
+## 🖼️ Example: Missing Pixels and Reconstruction
+
+These are cropped panels from a SWIR image reconstruction example.
+
+| Corrupted input | TPSSR reconstruction |
+|:--:|:--:|
+| ![Corrupted hyperspectral band](assets/masked_input.png) | ![TPSSR reconstructed band](assets/reconstruction.png) |
+
+## 📁 Project Structure
 
 ```text
 TPSSR-HSI-Pixel-Reconstruction/
-├── tpssr.py                    # Main command-line entry point
-├── train.py                    # TPSSR training stages
-├── train_region_lineaware.py   # Geometry/topology expert training
-├── test.py                     # Evaluation on fixed synthetic masks
-├── prepare_dataset.py         # Reflectance calibration and mask generation
-├── evaluate.py                 # Results aggregation and optional figures
-├── benchmarks.py              # Five classical/reference benchmarks
-├── external_methods.py        # PFGIN and DDS2M adapters
-├── preflight.py                # Data and checkpoint checks
-├── experiment_config.py       # Data splits
-├── training/                    # Spectral, fusion and router training
-├── core/                        # Reconstruction models and evaluation code
-├── tools/                       # Figures, ROI and real-line reconstruction
-├── tests/                       # CPU-only regression tests
-├── docs/                        # Method and dependency notes
-├── external/                    # Cloned upstream methods (not tracked)
-├── input_raw/                   # Your source acquisitions (not tracked)
-├── processed_data/              # Prepared arrays (not tracked)
-├── trained_models/              # Checkpoints (not tracked)
-└── results/                     # Evaluation outputs (not tracked)
+├── tpssr.py              
+├── experiment_config.py  
+├── prepare_dataset.py     
+├── train.py               
+├── train_region_lineaware.py
+├── test.py               
+├── evaluate.py           
+├── benchmarks.py         
+├── external_methods.py    
+├── core/                  
+├── training/             
+├── tools/                 
+├── tests/                 
+├── assets/                
+├── input_raw/
+│   ├── train/
+│   │   ├── SWIR1/
+│   │   ├── SWIR2/
+│   │   ├── SWIR3/
+│   │   └── SWIR4/
+│   └── test/
+│       └── SWIR5/
+├── external/
+│   ├── DDS2M/              # Created by setup-external (not tracked)
+│   └── PFGIN/              # Created by setup-external (not tracked)
+├── external_source_lock.json # Original project source fingerprints
+├── requirements.txt
+└── LICENSE
 ```
 
-## Installation
-
-Designed for Linux, Python 3.10+ and CUDA-capable PyTorch.
-Install the PyTorch build compatible with your GPU, then:
+## 🚀 Installation
 
 ```bash
-python -m venv .venv
+git clone https://github.com/Abolfazlmsl/TPSSR-HSI-Pixel-Reconstruction.git
+cd TPSSR-HSI-Pixel-Reconstruction
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-For the regression tests:
+Install a PyTorch/CUDA build compatible with your system if needed. To run the CPU regression tests:
 
 ```bash
 pip install -r requirements-dev.txt
 pytest -q
 ```
 
-No data or trained TPSSR checkpoints are included in the source release.
+## 📥 Dataset Preparation
 
-## Prepare the data
+Place **each acquisition in a separate subfolder** named `SWIRn` or `VNIRn`, where `n` is a positive number. Put training acquisitions under `input_raw/train/` and completely held-out acquisitions under `input_raw/test/`.
 
-Put the raw acquisitions under `input_raw/SWIR1`, ..., `input_raw/SWIR10`
-(and/or `VNIR1`, ..., `VNIR10`). Each acquisition needs the original ENVI data
-and its corresponding white and dark reference files. The loader discovers
-matching `.hdr` files; consult `core/src/envi_io.py` for the supported layout.
+For example:
 
-Prepare the main SWIR experiment:
+```text
+input_raw/
+├── train/
+│   ├── SWIR1/
+│   │   ├── sample.hdr
+│   │   ├── sample.raw
+│   │   ├── WHITEREF.hdr
+│   │   ├── WHITEREF.raw
+│   │   ├── DARKREF.hdr
+│   │   └── DARKREF.raw
+│   ├── SWIR2/
+│   ├── SWIR3/
+│   └── SWIR4/
+└── test/
+    ├── SWIR5/
+    └── SWIR6/
+```
+
+## 🔧 Training Overview
+
+### 1. Prepare reflectance cubes and evaluation masks
+
+```bash
+python tpssr.py prepare --from-folders
+python tpssr.py preflight --from-folders --data-only
+```
+
+### 2. Train TPSSR
+
+```bash
+python tpssr.py train --from-folders --stage all
+python tpssr.py train-region --from-folders
+python tpssr.py train --from-folders --stage fusion
+python tpssr.py train --from-folders --stage router3_lineaware
+python tpssr.py train --from-folders --stage router3_lineaware_rankcv
+```
+
+### 3. Test and evaluate
+
+```bash
+python tpssr.py preflight --from-folders
+python tpssr.py test --from-folders
+python tpssr.py evaluate --from-folders
+```
+
+## 🔍 Reconstruction Methods
+
+| Component | Function |
+|---|---|
+| Spectral Interpolation | Estimates missing bands from a valid spectrum at the same pixel |
+| Learned Neighbor Fusion | Uses spatially neighboring spectra to supplement local spectral trends |
+| Geometry/Topology Region | Restores spatial structures and continuity where local information is insufficient |
+| Learned Router | Selects a suitable expert for target pixels from learned reconstruction-quality estimates |
+
+## 📊 Benchmarking and Visualization
+
+```bash
+python tpssr.py benchmarks --from-folders --method all
+```
+
+### Install DDS2M and PFGIN (once)
+
+```bash
+python tpssr.py setup-external
+```
+
+### Run external benchmarks
+
+```bash
+# Train PFGIN on the training acquisitions, then evaluate it on the test acquisitions.
+python tpssr.py external --from-folders --method pfgin --stage both
+
+# DDS2M is self-supervised and does not need a separate training stage.
+python tpssr.py external --from-folders --method dds2m --stage test
+```
+
+To run both in sequence:
+
+```bash
+python tpssr.py external --from-folders --method all --stage both
+```
+
+## 🧪 Reproduce the Original Evaluation Protocols
+
+Predefined experiments remain available for reproducing the original paper splits and checkpoint names, independently of the new folder-based mode:
 
 ```bash
 python tpssr.py prepare --preset swir_8x2
-python tpssr.py preflight --preset swir_8x2 --data-only
-```
-
-The preparation step writes `calibrated_reflectance.npy`, `invalid_mask.npy`
-and `wavelengths_nm.npy` under each `processed_data/<dataset>/`, and writes
-reproducible benchmark masks under `simulated_saturation/`.
-
-## Train TPSSR
-
-For a new experiment, train its components in sequence:
-
-```bash
-python tpssr.py train --preset swir_8x2 --stage all
-python tpssr.py train-region --preset swir_8x2
-python tpssr.py train --preset swir_8x2 --stage fusion
-python tpssr.py train --preset swir_8x2 --stage router3_lineaware
-python tpssr.py train --preset swir_8x2 --stage router3_lineaware_rankcv
-```
-
-The RankCV stage uses **source-only calibration labels** generated during the
-preceding router-training stage. Do not fit a router with held-out test data.
-Accepted checkpoints are reused rather than silently overwritten. The main
-training path uses **two GPUs**; training a model from scratch is substantial.
-
-If you already have the correctly trained models, restore the corresponding
-`trained_models/<experiment>/` folders and skip training.
-
-## Test and evaluate
-
-```bash
-python tpssr.py preflight --preset swir_8x2
 python tpssr.py test --preset swir_8x2
-python tpssr.py evaluate --preset swir_8x2 --visuals 0
+python tpssr.py evaluate --preset swir_8x2
 ```
 
-`test` uses the final learned RankCV router, robust neighbor matching,
-hybrid-gap policy (10 percentage points), a 10% two-expert threshold, and
-lazy expert caching. It evaluates **200 masks in total**, shared across the
-held-out images. Use `--gpus 2` for the default two-GPU workflow.
+Other built-in presets are `swir_region_a_to_b`, `swir_region_b_to_a` and `vnir_8x2`.
 
-The evaluation command reads the corresponding final result folder, including
-its routing-policy suffix. It aggregates metrics without regenerating images by
-default (`--visuals 0`); use the ROI tools for publication figures.
+## 💾 Outputs and Checkpoints
 
-## Other experiments
+| Directory | Contents |
+|---|---|
+| `processed_data/` | Calibrated reflectance cubes and validity masks |
+| `simulated_saturation/` | Reproducible artificial damage masks |
+| `trained_models/` | Learned experts and router checkpoints |
+| `results/` | Prediction metrics and coverage |
+| `figures/` | Generated visualizations |
 
-| Preset | Training images | Held-out test images |
-|---|---|---|
-| `swir_8x2` | SWIR1–4, SWIR6–9 | SWIR5, SWIR10 |
-| `swir_region_a_to_b` | SWIR1–5 | SWIR6–10 |
-| `swir_region_b_to_a` | SWIR6–10 | SWIR1–5 |
-| `vnir_8x2` | VNIR1–4, VNIR6–9 | VNIR5, VNIR10 |
+## 📜 License
 
-Replace the preset in the commands above to run another experiment. The same
-trained model is shared across the held-out acquisitions in a given split.
+This project is released under the MIT License.
 
-## Benchmark methods
+You may freely use and adapt the code for research and educational purposes.
 
-Five non-deep-learning baselines are included. `RF` is the multiscale
-spatio-spectral Random Forest, while `PCA` uses spectral PCA only.
-
-```bash
-python tpssr.py benchmarks --preset swir_8x2 --method all --stage both --max-masks 200
-```
-
-PFGIN and DDS2M are optional and computationally expensive. Install the
-upstream repositories before running them:
-
-```bash
-python core/reconstruction_methods/pfgin/setup_official.py
-python core/reconstruction_methods/dds2m/setup_official.py
-python tpssr.py external --preset swir_8x2 --method all --stage both --max-masks 200
-```
-
-Read [Third-party methods](docs/THIRD_PARTY.md) for sources and licensing.
-
-## Figures and real missing lines
-
-To compare reconstructed ROIs in the benchmark:
-
-```bash
-python tpssr.py roi --preset swir_8x2 --dataset SWIR5 \
-  --scenario whole_spectrum_pixels --severity 5 --methods all --gpus 2
-```
-
-For a candidate list of genuine missing SWIR lines:
-
-```bash
-python tpssr.py real-lines --list-only
-```
-
-To reconstruct two selected lines and save full-band before/after images:
-
-```bash
-python tpssr.py real-lines --datasets SWIR5 SWIR10 \
-  --band-swir5 141 --line-x-swir5 141 \
-  --band-swir10 35 --line-x-swir10 183 --gpus 2 --dpi 400
-```
-
-The line tool preserves observed pixels and uses the same display settings
-for each before/after pair. It saves separate two-dimensional PNG/TIFF files.
-Real missing pixels have no ground truth, so no RMSE is reported for them.
-
-Other tools in `tools/` export hyperspectral cube figures, scenario boxplots
-and consolidated results. For example:
-
-```bash
-python tpssr.py boxplots --excel TPSSR_FINAL_ALL_RESULTS.xlsx \
-  --split SWIR_8x2 --outdir figures/scenario_boxplots --dpi 400
-```
-
-## Outputs and reproducibility
-
-`results/<experiment>/<test-image>/` stores reconstruction metrics. Published
-comparisons should distinguish per-method valid coverage from the shared-mask
-subset. The project reports RMSE, MAE, R² and SAM; SSIM is not used in the
-main numerical results.
-
-The scripts use the original image split and fixed synthetic-mask protocol.
-Default values are set in `core/config.py` and `experiment_config.py`.
-Because model weights and raw acquisitions are not distributed here, numeric
-paper results cannot be reproduced from this source archive alone.
-
-## License and citation
-
-Original TPSSR code is released under the [MIT License](LICENSE).
-For PFGIN and DDS2M, follow their upstream licenses and citation requirements.
-
-If you use this repository in research, please cite the associated TPSSR paper
-when it becomes available. Publication metadata can be added here after release.
+See the [License](LICENSE) file for full details.

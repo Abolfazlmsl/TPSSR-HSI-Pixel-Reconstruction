@@ -14,4 +14,4 @@ scikit-image
 pillow
 opencv-python
 lpips
-# DDS2M also ships its original requirements file under external/DDS2M/requirements.txt.
+# DDS2M upstream requirements become available after setup-external.

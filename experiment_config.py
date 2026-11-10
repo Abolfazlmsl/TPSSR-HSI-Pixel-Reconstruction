@@ -3,14 +3,44 @@ from __future__ import annotations
 from dataclasses import dataclass
 import argparse
 import os
+import re
+from pathlib import Path
 from typing import Iterable
 
+DATASET_PATTERN = re.compile(r"^(SWIR|VNIR)[1-9][0-9]*$")
 SUPPORTED_DATASETS = [
     *(f"SWIR{i}" for i in range(1, 11)),
     *(f"VNIR{i}" for i in range(1, 11)),
 ]
 
+
+def discover_folder_split(root: Path | None = None) -> tuple[list[str], list[str]]:
+    root = root or Path(__file__).resolve().parent / "input_raw"
+    groups = []
+    for role in ("train", "test"):
+        folder = root / role
+        if not folder.is_dir():
+            raise ValueError(f"Missing data directory: {folder}")
+        names = sorted((p.name.upper() for p in folder.iterdir() if p.is_dir()),
+                       key=lambda x: (x[:4], int(re.search(r"[0-9]+$", x).group()) if DATASET_PATTERN.fullmatch(x) else 0))
+        invalid = [name for name in names if not DATASET_PATTERN.fullmatch(name)]
+        if invalid:
+            raise ValueError(f"Invalid acquisition names in {folder}: {', '.join(invalid)}")
+        if not names:
+            raise ValueError(f"No acquisitions found in {folder}")
+        groups.append(names)
+    train, tests = groups
+    overlap = set(train) & set(tests)
+    if overlap:
+        raise ValueError("Acquisitions in both train and test: " + ", ".join(sorted(overlap)))
+    if len(train) < 4:
+        raise ValueError("TPSSR training requires at least four training acquisitions: two for model fitting and two for source-only validation.")
+    if len({name[:4] for name in train + tests}) != 1:
+        raise ValueError("Train and test must use the same sensor (SWIR or VNIR).")
+    return train, tests
+
 PRESETS = {
+    "custom": {"description": "Discover acquisitions from input_raw/train and input_raw/test"},
     "swir_8x2": {
         "tests": ["SWIR5", "SWIR10"],
         "description": "8 SWIR train + 2 SWIR test (one from each 5-core region)",
@@ -70,12 +100,12 @@ def sensor_universe(sensor: str) -> list[str]:
 
 
 def _validate_dataset_names(values: list[str]) -> None:
-    bad = [x for x in values if x not in SUPPORTED_DATASETS]
+    bad = [x for x in values if not DATASET_PATTERN.fullmatch(x)]
     if bad:
         raise ValueError(
             "Unsupported dataset(s): "
             + ", ".join(bad)
-            + ". Supported names are SWIR1..SWIR10 and VNIR1..VNIR10."
+            + ". Acquisition names must follow SWIRn or VNIRn."
         )
 
 
@@ -86,6 +116,7 @@ class ExperimentSpec:
     active_test: str
     experiment_name: str
     sensor: str
+    folder_mode: bool = False
 
     @property
     def primary_test(self) -> str:
@@ -110,6 +141,7 @@ class ExperimentSpec:
             active_test=dataset,
             experiment_name=self.experiment_name,
             sensor=self.sensor,
+            folder_mode=self.folder_mode,
         )
 
 
@@ -136,7 +168,8 @@ def _spec_from_environment(active_override: str | None = None) -> ExperimentSpec
         "HSI_EXPERIMENT_NAME",
         default_experiment_name(train, tests),
     )
-    return _finalize_spec(train, tests, active, name)
+    return _finalize_spec(train, tests, active, name,
+                          folder_mode=os.environ.get("HSI_INPUT_LAYOUT") == "folders")
 
 
 def _finalize_spec(
@@ -144,6 +177,7 @@ def _finalize_spec(
     tests: list[str],
     active_test: str | None,
     experiment_name: str | None,
+    folder_mode: bool = False,
 ) -> ExperimentSpec:
     train = _unique(train)
     tests = _unique(tests)
@@ -178,6 +212,7 @@ def _finalize_spec(
         active_test=active,
         experiment_name=name,
         sensor=sensor,
+        folder_mode=folder_mode,
     )
 
 
@@ -190,9 +225,20 @@ def resolve_experiment(args, *, allow_legacy_dataset: bool = True) -> Experiment
     legacy_dataset = getattr(args, "dataset", None)
     explicit_name = getattr(args, "experiment_name", None)
 
+    from_folders = getattr(args, "from_folders", False)
+    folder_root = Path(__file__).resolve().parent / "input_raw"
+    if from_folders:
+        if any((explicit_train, explicit_tests, legacy_dataset, preset not in (None, "custom"))):
+            raise ValueError("--from-folders cannot be combined with explicit dataset lists or a preset.")
+        train, tests = discover_folder_split(folder_root)
+        return _finalize_spec(train, tests, getattr(args, "active_test", None), explicit_name, folder_mode=True)
+
     if not any((explicit_train, explicit_tests, preset, legacy_dataset, explicit_name)):
         if env_spec is not None:
             return env_spec
+        if (folder_root / "train").is_dir() and (folder_root / "test").is_dir():
+            train, tests = discover_folder_split(folder_root)
+            return _finalize_spec(train, tests, getattr(args, "active_test", None), None, folder_mode=True)
 
     train: list[str] = []
     tests: list[str] = []
@@ -239,6 +285,8 @@ def resolve_experiment(args, *, allow_legacy_dataset: bool = True) -> Experiment
 
     if not train and not tests and env_spec is not None:
         return env_spec
+    if preset == "custom" and not train and not tests:
+        train, tests = discover_folder_split(folder_root)
 
     if not train or not tests:
         raise ValueError(
@@ -250,6 +298,7 @@ def resolve_experiment(args, *, allow_legacy_dataset: bool = True) -> Experiment
         tests,
         getattr(args, "active_test", None),
         explicit_name,
+        folder_mode=(preset == "custom" or os.environ.get("HSI_INPUT_LAYOUT") == "folders"),
     )
 
 
@@ -258,13 +307,17 @@ def add_experiment_args(
     *,
     include_legacy_dataset: bool = True,
 ) -> None:
+    parser.add_argument(
+        "--from-folders", action="store_true",
+        help="Read acquisition names from input_raw/train and input_raw/test.",
+    )
     if include_legacy_dataset:
         parser.add_argument(
             "--dataset",
             default=None,
             help=(
-                "Backward-compatible single held-out dataset. "
-                "For new 10-acquisition experiments prefer --preset or --test-datasets."
+                "Backward-compatible held-out acquisition selector. "
+                "For new datasets use --from-folders."
             ),
         )
     parser.add_argument(
@@ -284,8 +337,7 @@ def add_experiment_args(
         nargs="+",
         default=None,
         help=(
-            "Explicit held-out acquisitions. If --train-datasets is omitted, "
-            "training is automatically the complement within SWIR1..10 or VNIR1..10."
+            "Explicit held-out acquisitions. For automatic discovery use --from-folders."
         ),
     )
     parser.add_argument(
@@ -338,9 +390,11 @@ def spectral_validation_cores(spec: ExperimentSpec) -> tuple[str, str]:
         ("VNIR5", "VNIR10"): ("VNIR4", "VNIR9"),
     }
     names = choices.get(tuple(spec.tests))
-    if names is None or not set(names).issubset(set(spec.train)):
-        raise ValueError(f"No predeclared spectral validation split for {spec.experiment_name}")
-    return names
+    if not spec.folder_mode and names is not None and set(names).issubset(set(spec.train)):
+        return names
+    if len(spec.train) < 4:
+        raise ValueError("At least four training acquisitions are needed for source-only validation.")
+    return tuple(spec.train[-2:])
 
 
 def selected_lineaware_region(spec: ExperimentSpec, router: str) -> bool:
@@ -352,7 +406,10 @@ def selected_lineaware_region(spec: ExperimentSpec, router: str) -> bool:
             ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR5'): ('SWIR6','SWIR7','SWIR8','SWIR9','SWIR10'),
             ('VNIR5','VNIR10'): ('VNIR1','VNIR2','VNIR3','VNIR4','VNIR6','VNIR7','VNIR8','VNIR9'),
         }
-        return spec.train == allowed.get(spec.tests)
+        if spec.folder_mode:
+            return len(spec.train) >= 4
+        known = allowed.get(spec.tests)
+        return spec.train == known if known is not None else len(spec.train) >= 4
     if router != 'learned_router3_aligned':
         return False
     swir8 = (spec.train == ('SWIR1','SWIR2','SWIR3','SWIR4','SWIR6','SWIR7','SWIR8','SWIR9')

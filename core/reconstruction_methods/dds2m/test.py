@@ -43,8 +43,8 @@ def require_official_repo():
     missing = [p for p in required if not p.exists()]
     if missing:
         raise FileNotFoundError(
-            "Official DDS2M was not found. Run this first:\n"
-            "python reconstruction_methods/dds2m/setup_official.py\n\n"
+            "DDS2M is not installed under external/DDS2M. "
+            "Run: python tpssr.py setup-external\n\n"
             + "\n".join(str(p) for p in missing)
         )
     return repo

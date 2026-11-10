@@ -508,7 +508,9 @@ class DatasetInfo:
 
 def load_dataset_info(name: str) -> DatasetInfo:
     print(f"\nPreparing diagnostics for {name}")
-    folder = INPUT_ROOT / name
+    folder = next((p for p in (INPUT_ROOT / "test" / name,
+                                INPUT_ROOT / "train" / name,
+                                INPUT_ROOT / name) if p.is_dir()), INPUT_ROOT / name)
     main_hdr, white_hdr, dark_hdr = find_headers_in_folder(folder)
 
     main = EnviCube(main_hdr)
@@ -1651,7 +1653,8 @@ def write_scenario_outputs(
 # ============================================================
 def discover_datasets() -> list[str]:
     if PROCESS_ALL_SWIR_DATASETS:
-        names = sorted(p.name for p in INPUT_ROOT.glob("SWIR*") if p.is_dir())
+        names = sorted({p.name for folder in (INPUT_ROOT / "train", INPUT_ROOT / "test", INPUT_ROOT)
+                        for p in folder.glob("SWIR*") if p.is_dir()})
         if not names:
             raise FileNotFoundError(f"No SWIR* folders found under:\n{INPUT_ROOT}")
         return names

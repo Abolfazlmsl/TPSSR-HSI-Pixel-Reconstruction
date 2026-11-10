@@ -152,6 +152,8 @@ def main():
     ap.add_argument('--topology-val-samples', type=int, default=900)
     args = ap.parse_args()
     spec = resolve_experiment(args)
+    if getattr(args, "from_folders", False) or (args.preset is None and not args.train_datasets and not args.test_datasets and not args.dataset):
+        args.preset = "custom"
     from experiment_config import spectral_validation_cores
     val_cores = spectral_validation_cores(spec) if args.stage != 'region' else ()
     if args.router3_samples_per_case < 2:

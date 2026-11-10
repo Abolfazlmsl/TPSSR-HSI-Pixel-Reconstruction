@@ -8,7 +8,7 @@ from _launcher_common import CORE, run
 from experiment_config import add_experiment_args, describe, resolve_experiment
 
 p = argparse.ArgumentParser(
-    description="Prepare TPSSR data for an arbitrary 10-acquisition train/test split."
+    description="Prepare TPSSR data for a folder-based or predefined train/test split."
 )
 add_experiment_args(p)
 a = p.parse_args()

@@ -194,7 +194,10 @@ def load_front_override(args, cube_shape) -> np.ndarray | None:
         root = args.raw_dir or (args.project_root / "input_raw")
         if not root.is_dir() and args.raw_dir is None:
             root = args.project_root / "Input_raw"
-        return load_exporter_style_front(root / args.dataset, cube_shape, args)
+        dataset_dir = next((p for p in (root / "test" / args.dataset,
+                                        root / "train" / args.dataset,
+                                        root / args.dataset) if p.is_dir()), root / args.dataset)
+        return load_exporter_style_front(dataset_dir, cube_shape, args)
     if args.front_source == "png":
         if args.front_png is None:
             raise ValueError("--front-source png requires --front-png PATH")

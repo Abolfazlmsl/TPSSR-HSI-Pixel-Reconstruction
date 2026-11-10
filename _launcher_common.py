@@ -28,6 +28,10 @@ def env_for(spec: ExperimentSpec, active_test: str | None = None):
     # Evaluation/preparation may move across several held-out acquisitions.
     env["HSI_ACTIVE_TEST_DATASET"] = active
     env["HSI_EXPERIMENT_NAME"] = spec.experiment_name
+    if spec.folder_mode:
+        env["HSI_INPUT_LAYOUT"] = "folders"
+    else:
+        env.pop("HSI_INPUT_LAYOUT", None)
     return env
 
 

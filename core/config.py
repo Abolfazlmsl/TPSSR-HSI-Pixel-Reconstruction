@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import re
 
 # Root visible to the user. Internal code lives under core/.
 PROJECT_DIR = Path(
@@ -9,10 +10,7 @@ PROJECT_DIR = Path(
     )
 ).resolve()
 
-SUPPORTED_DATASETS = [
-    *(f"SWIR{i}" for i in range(1, 11)),
-    *(f"VNIR{i}" for i in range(1, 11)),
-]
+SUPPORTED_DATASET_PATTERN = re.compile(r"^(SWIR|VNIR)[1-9][0-9]*$")
 
 
 def _parse_dataset_env(name, default=None):
@@ -49,7 +47,7 @@ ACTIVE_TEST_DATASET = os.environ.get(
 ).upper()
 
 for _name in [*TEST_DATASET_FOLDERS, ACTIVE_TEST_DATASET]:
-    if _name not in SUPPORTED_DATASETS:
+    if not SUPPORTED_DATASET_PATTERN.fullmatch(_name):
         raise ValueError(
             f"Unsupported dataset {_name!r}. Choose SWIR1..SWIR10 or VNIR1..VNIR10."
         )
@@ -69,7 +67,7 @@ if not TRAIN_DATASET_FOLDERS:
     ]
 
 for _name in TRAIN_DATASET_FOLDERS:
-    if _name not in SUPPORTED_DATASETS:
+    if not SUPPORTED_DATASET_PATTERN.fullmatch(_name):
         raise ValueError(f"Unsupported training dataset {_name!r}.")
     if ("SWIR" if _name.startswith("SWIR") else "VNIR") != SENSOR:
         raise ValueError("One experiment cannot mix SWIR and VNIR training acquisitions.")
@@ -103,7 +101,27 @@ EXPERIMENT_NAME = os.environ.get(
 INPUT_ROOT = PROJECT_DIR / "input_raw"
 PROCESSED_DATA_ROOT = PROJECT_DIR / "processed_data"
 DATASET_FOLDER = ACTIVE_TEST_DATASET
-INPUT_DIR = INPUT_ROOT / ACTIVE_TEST_DATASET
+
+
+def input_dir_for(dataset_name):
+    name = str(dataset_name).upper()
+    if name in TRAIN_DATASET_FOLDERS:
+        candidate = INPUT_ROOT / "train" / name
+    elif name in TEST_DATASET_FOLDERS:
+        candidate = INPUT_ROOT / "test" / name
+    else:
+        raise ValueError(f"Acquisition {name} is not in the current split")
+    if candidate.is_dir():
+        return candidate
+    # Cross-validation may temporarily mark a source acquisition as held-out.
+    alternate = INPUT_ROOT / ("test" if name in TRAIN_DATASET_FOLDERS else "train") / name
+    if alternate.is_dir():
+        return alternate
+    legacy = INPUT_ROOT / name
+    return legacy if legacy.is_dir() else candidate
+
+
+INPUT_DIR = input_dir_for(ACTIVE_TEST_DATASET)
 PROCESSED_DATA_DIR = PROCESSED_DATA_ROOT / ACTIVE_TEST_DATASET
 BASE_DATASET_DIR = PROCESSED_DATA_DIR
 
@@ -123,7 +141,7 @@ TRAIN_IMAGE_VAL_FRACTION = 0.20
 # The held-out acquisition is never used for training.
 # Only its final block is used for the fixed 200-mask benchmark so the
 # computational scale remains comparable with the previous experiment.
-HELD_OUT_TEST_FRACTION = 0.20
+HELD_OUT_TEST_FRACTION = 1.0 if os.environ.get("HSI_INPUT_LAYOUT") == "folders" else 0.20
 
 # Kept for backward compatibility with utilities that may inspect them.
 TRAIN_FRACTION = TRAIN_IMAGE_TRAIN_FRACTION

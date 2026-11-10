@@ -332,10 +332,7 @@ def write_split_info(
 def ensure_calibrated_dataset(
     dataset_name,
 ):
-    input_dir = (
-        config.INPUT_ROOT
-        / dataset_name
-    )
+    input_dir = config.input_dir_for(dataset_name)
     output_dir = (
         config.PROCESSED_DATA_ROOT
         / dataset_name
@@ -478,8 +475,7 @@ def prepare_calibrated_datasets():
         name
         for name in config.PREPARE_DATASETS
         if not (
-            config.INPUT_ROOT
-            / name
+            config.input_dir_for(name)
         ).exists()
         and not (
             config.PROCESSED_DATA_ROOT
@@ -490,7 +486,7 @@ def prepare_calibrated_datasets():
 
     if missing_folders:
         raise FileNotFoundError(
-            "The following dataset folders are missing from input_raw:\n"
+            "The following acquisition folders are missing from input_raw/train or input_raw/test:\n"
             + "\n".join(
                 missing_folders
             )
